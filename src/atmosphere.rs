@@ -57,6 +57,55 @@ pub struct AerosolOptics {
 }
 
 #[derive(Clone, Debug)]
+pub struct MajorantGrid {
+    pub top_altitude_km: f32,
+    pub layer_count: usize,
+    pub band_count: usize,
+    pub values_km_inv: Vec<f32>,
+}
+
+impl MajorantGrid {
+    pub fn new(top_altitude_km: f32, layer_count: usize, band_count: usize) -> Self {
+        Self {
+            top_altitude_km,
+            layer_count,
+            band_count,
+            values_km_inv: vec![0.0; layer_count * band_count],
+        }
+    }
+
+    pub fn layer_thickness_km(&self) -> f32 {
+        self.top_altitude_km / self.layer_count as f32
+    }
+
+    pub fn layer_for_altitude(&self, altitude_km: f32) -> usize {
+        ((altitude_km.clamp(0.0, self.top_altitude_km - f32::EPSILON) / self.top_altitude_km)
+            * self.layer_count as f32)
+            .floor()
+            .clamp(0.0, (self.layer_count - 1) as f32) as usize
+    }
+
+    pub fn layer_bounds_km(&self, layer: usize) -> (f32, f32) {
+        let dz = self.layer_thickness_km();
+        (layer as f32 * dz, (layer + 1) as f32 * dz)
+    }
+
+    pub fn get(&self, band_index: usize, layer: usize) -> f32 {
+        self.values_km_inv[band_index * self.layer_count + layer]
+    }
+
+    pub fn set(&mut self, band_index: usize, layer: usize, value: f32) {
+        self.values_km_inv[band_index * self.layer_count + layer] = value;
+    }
+
+    pub fn global_for_band(&self, band_index: usize) -> f32 {
+        (0..self.layer_count)
+            .map(|layer| self.get(band_index, layer))
+            .fold(0.0, f32::max)
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct SceneData {
     pub planet: Planet,
     pub sun: Sun,
@@ -66,6 +115,7 @@ pub struct SceneData {
     pub aerosol_optics: Vec<[AerosolOptics; SPECIES_COUNT]>,
     pub phase_table: MiePhaseTable,
     pub majorants_km_inv: Vec<f32>,
+    pub majorant_grid: MajorantGrid,
 }
 
 impl SceneData {

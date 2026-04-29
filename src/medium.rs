@@ -1,3 +1,4 @@
+use crate::atmosphere::MajorantGrid;
 use crate::atmosphere::{AerosolProfilePoint, AtmosphericProfilePoint, SPECIES_COUNT, SceneData};
 use crate::geometry::altitude_km;
 use crate::math::Vec3;
@@ -56,21 +57,45 @@ pub fn coefficients_at(scene: &SceneData, position: Vec3, band_index: usize) -> 
 }
 
 pub fn compute_majorants(scene: &SceneData) -> Vec<f32> {
+    (0..scene.bands.len())
+        .map(|band| scene.majorant_grid.global_for_band(band).max(1.0e-6))
+        .collect()
+}
+
+pub fn compute_majorant_grid(scene: &SceneData, layer_count: usize) -> MajorantGrid {
     let top = scene.planet.atmosphere_radius_km - scene.planet.ground_radius_km;
-    scene
-        .bands
-        .iter()
-        .enumerate()
-        .map(|(band_index, _)| {
+    let mut grid = MajorantGrid::new(top, layer_count, scene.bands.len());
+    for band_index in 0..scene.bands.len() {
+        for layer in 0..layer_count {
+            let (lo, hi) = grid.layer_bounds_km(layer);
             let mut max_ext: f32 = 0.0;
-            for i in 0..=512 {
-                let altitude = top * i as f32 / 512.0;
+            for altitude in majorant_probe_altitudes(scene, lo, hi) {
                 let pos = Vec3::new(0.0, scene.planet.ground_radius_km + altitude, 0.0);
                 max_ext = max_ext.max(coefficients_at(scene, pos, band_index).extinction_total());
             }
-            (max_ext * 1.25).max(1.0e-6)
-        })
-        .collect()
+            grid.set(band_index, layer, (max_ext * 1.01).max(1.0e-8));
+        }
+    }
+    grid
+}
+
+fn majorant_probe_altitudes(scene: &SceneData, lo: f32, hi: f32) -> Vec<f32> {
+    let mut probes = vec![lo, hi, 0.5 * (lo + hi)];
+    probes.extend(
+        scene
+            .atmospheric_profile
+            .iter()
+            .map(|p| p.altitude_km)
+            .filter(|z| *z > lo && *z < hi),
+    );
+    probes.extend(
+        scene
+            .aerosol_profile
+            .iter()
+            .map(|p| p.altitude_km)
+            .filter(|z| *z > lo && *z < hi),
+    );
+    probes
 }
 
 pub fn rayleigh_cross_section_m2(wavelength_nm: f32) -> f32 {
@@ -174,6 +199,7 @@ mod tests {
             aerosol_optics: optics,
             phase_table: MiePhaseTable::new(vec![1.0; SPECIES_COUNT * PHASE_BINS], 1),
             majorants_km_inv: vec![1.0],
+            majorant_grid: MajorantGrid::new(120.0, 1, 1),
         };
         let c = coefficients_at(&scene, Vec3::new(0.0, planet.ground_radius_km, 0.0), 0);
         assert!(c.rayleigh_scattering_km_inv > 0.0);

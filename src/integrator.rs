@@ -4,7 +4,8 @@ use crate::atmosphere::{GROUND_ALBEDO, SPECIES_COUNT, SceneData};
 use crate::config::RenderConfig;
 use crate::film::Film;
 use crate::geometry::{
-    BoundaryKind, RAY_EPSILON_KM, next_boundary, segment_to_sun_or_space, surface_normal,
+    BoundaryKind, RAY_EPSILON_KM, altitude_km, intersect_sphere, next_boundary,
+    segment_to_sun_or_space, surface_normal,
 };
 use crate::math::{INV_PI, Ray, TAU, Vec3};
 use crate::medium::{MediumCoefficients, coefficients_at};
@@ -139,8 +140,7 @@ pub fn trace_band(
             break;
         };
 
-        let majorant = scene.majorants_km_inv[band_index];
-        let sampled = sample_real_collision(scene, ray, boundary.t_km, band_index, majorant, rng);
+        let sampled = sample_real_collision(scene, ray, boundary.t_km, band_index, rng);
 
         match sampled {
             Some((t, coeffs)) => {
@@ -210,21 +210,29 @@ fn sample_real_collision(
     ray: Ray,
     t_max: f32,
     band_index: usize,
-    majorant: f32,
     rng: &mut SamplerState,
 ) -> Option<(f32, MediumCoefficients)> {
     let mut t = 0.0;
     while t < t_max {
-        let u = (1.0 - rng.next_f32()).max(1.0e-7);
-        t += -u.ln() / majorant;
-        if t >= t_max {
-            return None;
+        let segment_end = next_majorant_segment_end(scene, ray, t, t_max);
+        let majorant = segment_majorant(scene, ray, t, segment_end, band_index);
+        while t < segment_end {
+            let u = (1.0 - rng.next_f32()).max(1.0e-7);
+            t += -u.ln() / majorant;
+            if t >= segment_end {
+                break;
+            }
+            let coeffs = coefficients_at(scene, ray.at(t), band_index);
+            debug_assert!(
+                coeffs.extinction_total() <= majorant * 1.001,
+                "layer majorant underestimates extinction"
+            );
+            let accept = (coeffs.extinction_total() / majorant).clamp(0.0, 1.0);
+            if rng.next_f32() < accept {
+                return Some((t, coeffs));
+            }
         }
-        let coeffs = coefficients_at(scene, ray.at(t), band_index);
-        let accept = (coeffs.extinction_total() / majorant).clamp(0.0, 1.0);
-        if rng.next_f32() < accept {
-            return Some((t, coeffs));
-        }
+        t = segment_end;
     }
     None
 }
@@ -236,22 +244,82 @@ pub fn estimate_transmittance_ratio(
     band_index: usize,
     rng: &mut SamplerState,
 ) -> f32 {
-    let majorant = scene.majorants_km_inv[band_index];
     let mut t = 0.0;
     let mut weight = 1.0_f32;
     while t < t_max {
-        let u = (1.0 - rng.next_f32()).max(1.0e-7);
-        t += -u.ln() / majorant;
-        if t >= t_max {
-            break;
+        let segment_end = next_majorant_segment_end(scene, ray, t, t_max);
+        let majorant = segment_majorant(scene, ray, t, segment_end, band_index);
+        while t < segment_end {
+            let u = (1.0 - rng.next_f32()).max(1.0e-7);
+            t += -u.ln() / majorant;
+            if t >= segment_end {
+                break;
+            }
+            let coeffs = coefficients_at(scene, ray.at(t), band_index);
+            debug_assert!(
+                coeffs.extinction_total() <= majorant * 1.001,
+                "layer majorant underestimates extinction"
+            );
+            weight *= (1.0 - coeffs.extinction_total() / majorant).clamp(0.0, 1.0);
+            if weight <= 0.0 {
+                return 0.0;
+            }
         }
-        let coeffs = coefficients_at(scene, ray.at(t), band_index);
-        weight *= (1.0 - coeffs.extinction_total() / majorant).clamp(0.0, 1.0);
-        if weight <= 0.0 {
-            return 0.0;
-        }
+        t = segment_end;
     }
     weight.clamp(0.0, 1.0)
+}
+
+fn segment_majorant(scene: &SceneData, ray: Ray, t0: f32, t1: f32, band_index: usize) -> f32 {
+    let (min_altitude, max_altitude) = segment_altitude_range(scene, ray, t0, t1);
+    let min_layer = scene.majorant_grid.layer_for_altitude(min_altitude);
+    let max_layer = scene.majorant_grid.layer_for_altitude(max_altitude);
+    (min_layer..=max_layer)
+        .map(|layer| scene.majorant_grid.get(band_index, layer))
+        .fold(0.0, f32::max)
+        .max(1.0e-8)
+}
+
+fn next_majorant_segment_end(scene: &SceneData, ray: Ray, t: f32, t_max: f32) -> f32 {
+    let probe_t = (t + RAY_EPSILON_KM).min(t_max);
+    let altitude = altitude_km(scene.planet, ray.at(probe_t));
+    let layer = scene.majorant_grid.layer_for_altitude(altitude);
+    let (lo, hi) = scene.majorant_grid.layer_bounds_km(layer);
+    let mut next_t = t_max;
+
+    for altitude_boundary in [lo, hi] {
+        if altitude_boundary <= 0.0 || altitude_boundary >= scene.majorant_grid.top_altitude_km {
+            continue;
+        }
+        let radius = scene.planet.ground_radius_km + altitude_boundary;
+        if let Some((a, b)) = intersect_sphere(ray, radius) {
+            for root in [a, b] {
+                if root > t + RAY_EPSILON_KM && root < next_t {
+                    next_t = root;
+                }
+            }
+        }
+    }
+
+    next_t
+}
+
+fn segment_altitude_range(scene: &SceneData, ray: Ray, t0: f32, t1: f32) -> (f32, f32) {
+    let mut min_radius = ray.at(t0).length();
+    let mut max_radius = min_radius;
+    for t in [t1, closest_approach_t(ray).clamp(t0, t1)] {
+        let radius = ray.at(t).length();
+        min_radius = min_radius.min(radius);
+        max_radius = max_radius.max(radius);
+    }
+    (
+        min_radius - scene.planet.ground_radius_km,
+        max_radius - scene.planet.ground_radius_km,
+    )
+}
+
+fn closest_approach_t(ray: Ray) -> f32 {
+    -ray.origin.dot(ray.dir)
 }
 
 fn direct_sun_at_scatter(

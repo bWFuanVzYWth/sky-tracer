@@ -8,6 +8,7 @@ use crate::atmosphere::{
     SPECIES_NAMES, SceneData, Sun,
 };
 use crate::geometry::Planet;
+use crate::medium::compute_majorant_grid;
 use crate::medium::compute_majorants;
 use crate::phase::MiePhaseTable;
 use crate::spectrum::{BAND_COUNT, SpectralBand};
@@ -32,7 +33,9 @@ pub fn load_scene_data(
         aerosol_optics,
         phase_table,
         majorants_km_inv: Vec::new(),
+        majorant_grid: crate::atmosphere::MajorantGrid::new(120.0, 1, 1),
     };
+    scene.majorant_grid = compute_majorant_grid(&scene, 96);
     scene.majorants_km_inv = compute_majorants(&scene);
     Ok(scene)
 }
@@ -200,6 +203,8 @@ mod tests {
                 .iter()
                 .all(|x| x.is_finite() && *x > 0.0)
         );
+        assert_eq!(scene.majorant_grid.band_count, BAND_COUNT);
+        assert!(scene.majorant_grid.layer_count > 1);
     }
 
     #[test]
@@ -231,5 +236,25 @@ mod tests {
     fn cube_mu(i: usize) -> f32 {
         let u = (i as f32 + 0.5) / PHASE_BINS as f32;
         1.0 - 2.0 * u * u * u
+    }
+
+    #[test]
+    fn layered_majorants_dominate_extinction_samples() {
+        let scene = load_scene_data(Path::new("data"), 0.0, 0.0).expect("data should load");
+        for band in 0..BAND_COUNT {
+            for i in 0..=240 {
+                let altitude = scene.majorant_grid.top_altitude_km * i as f32 / 240.0;
+                let pos =
+                    crate::math::Vec3::new(0.0, scene.planet.ground_radius_km + altitude, 0.0);
+                let extinction =
+                    crate::medium::coefficients_at(&scene, pos, band).extinction_total();
+                let layer = scene.majorant_grid.layer_for_altitude(altitude);
+                let majorant = scene.majorant_grid.get(band, layer);
+                assert!(
+                    extinction <= majorant * 1.001,
+                    "band={band} altitude={altitude} extinction={extinction} majorant={majorant}"
+                );
+            }
+        }
     }
 }
