@@ -19,6 +19,9 @@ use crate::spectrum::BAND_COUNT;
 
 type PixelSpectrum = [f32; BAND_COUNT];
 
+const SCATTER_LIGHT_STREAM: u64 = 0x51C4_77E2_0D1A_1137;
+const GROUND_LIGHT_STREAM: u64 = 0x9A6C_63D5_3B8F_4A11;
+
 pub fn render(scene: &SceneData, config: &RenderConfig) -> Film {
     assert_eq!(scene.bands.len(), BAND_COUNT);
     if can_use_azimuth_symmetry(config) {
@@ -167,8 +170,17 @@ pub fn trace_band(
                 }
 
                 let mode = choose_scattering_mode(coeffs, rng);
+                let mut light_rng = rng.fork(depth_stream(SCATTER_LIGHT_STREAM, depth));
                 radiance += throughput
-                    * direct_sun_at_scatter(scene, config, pos, ray.dir, band_index, mode, rng);
+                    * direct_sun_at_scatter(
+                        scene,
+                        config,
+                        pos,
+                        ray.dir,
+                        band_index,
+                        mode,
+                        &mut light_rng,
+                    );
 
                 let (new_dir, pdf) =
                     sample_scattering_direction(scene, mode, ray.dir, band_index, rng);
@@ -200,7 +212,9 @@ pub fn trace_band(
                 }
                 BoundaryKind::Ground => {
                     let pos = ray.at(boundary.t_km);
-                    radiance += throughput * ground_radiance(scene, config, pos, band_index, rng);
+                    let mut light_rng = rng.fork(depth_stream(GROUND_LIGHT_STREAM, depth));
+                    radiance += throughput
+                        * ground_radiance(scene, config, pos, band_index, &mut light_rng);
                     break;
                 }
             },
@@ -212,6 +226,10 @@ pub fn trace_band(
     }
 
     radiance.max(0.0)
+}
+
+fn depth_stream(tag: u64, depth: usize) -> u64 {
+    tag ^ (depth as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
 fn survive_collision(
@@ -607,6 +625,22 @@ mod tests {
         assert_ne!(
             band_stream(SpectralCorrelation::Independent, 7, 0),
             band_stream(SpectralCorrelation::Independent, 7, 3)
+        );
+    }
+
+    #[test]
+    fn depth_streams_are_stable_and_distinct() {
+        assert_eq!(
+            depth_stream(SCATTER_LIGHT_STREAM, 2),
+            depth_stream(SCATTER_LIGHT_STREAM, 2)
+        );
+        assert_ne!(
+            depth_stream(SCATTER_LIGHT_STREAM, 2),
+            depth_stream(SCATTER_LIGHT_STREAM, 3)
+        );
+        assert_ne!(
+            depth_stream(SCATTER_LIGHT_STREAM, 2),
+            depth_stream(GROUND_LIGHT_STREAM, 2)
         );
     }
 }
