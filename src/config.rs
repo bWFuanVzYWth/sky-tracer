@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use crate::sampling::SamplerKind;
+
 #[derive(Clone, Debug)]
 pub struct RenderConfig {
     pub width: usize,
@@ -12,6 +14,7 @@ pub struct RenderConfig {
     pub sun_azimuth_deg: f32,
     pub observer_altitude_km: f32,
     pub use_azimuth_symmetry: bool,
+    pub sampler: SamplerKind,
     pub max_depth: usize,
     pub png_exposure: f32,
 }
@@ -29,6 +32,7 @@ impl Default for RenderConfig {
             sun_azimuth_deg: 0.0,
             observer_altitude_km: 0.2,
             use_azimuth_symmetry: true,
+            sampler: SamplerKind::RandomizedQmc,
             max_depth: 16,
             png_exposure: 0.01,
         }

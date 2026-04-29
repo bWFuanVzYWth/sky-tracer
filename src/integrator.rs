@@ -73,9 +73,10 @@ fn render_pixel(scene: &SceneData, config: &RenderConfig, x: usize, y: usize) ->
     let pixel_seed = config.seed
         ^ ((x as u64).wrapping_mul(0x9E37_79B9))
         ^ ((y as u64).wrapping_mul(0xD1B5_4A32));
-    let mut rng = SamplerState::new(pixel_seed);
 
     for sample in 0..config.spp {
+        let mut rng =
+            SamplerState::for_sample(config.seed, sample as u64, pixel_seed, config.sampler);
         let u = (x as f32 + rng.next_f32()) / config.width as f32;
         let v = (y as f32 + rng.next_f32()) / config.height as f32;
         let ray = camera_ray(scene, config, u, v);

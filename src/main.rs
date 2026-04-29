@@ -6,6 +6,7 @@ use clap::Parser;
 use sky_tracer::config::RenderConfig;
 use sky_tracer::data::load_scene_data;
 use sky_tracer::integrator::render;
+use sky_tracer::sampling::SamplerKind;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Offline spectral OPAC atmosphere path tracer")]
@@ -30,6 +31,8 @@ struct Cli {
     observer_altitude_km: f32,
     #[arg(long)]
     disable_symmetry: bool,
+    #[arg(long, default_value = "rqmc")]
+    sampler: SamplerKind,
     #[arg(long, default_value_t = 16)]
     max_depth: usize,
     #[arg(long, default_value_t = 0.01)]
@@ -50,6 +53,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         sun_azimuth_deg: cli.sun_azimuth_deg,
         observer_altitude_km: cli.observer_altitude_km,
         use_azimuth_symmetry: !cli.disable_symmetry,
+        sampler: cli.sampler,
         max_depth: cli.max_depth,
         png_exposure: cli.png_exposure,
     };
