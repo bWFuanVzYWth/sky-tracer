@@ -132,6 +132,7 @@ pub fn trace_band(
     let mut ray = initial_ray;
     let mut throughput = 1.0_f32;
     let mut radiance = 0.0_f32;
+    let mut had_scatter = false;
 
     for depth in 0..config.max_depth {
         let Some(boundary) = next_boundary(ray, scene.planet) else {
@@ -157,6 +158,7 @@ pub fn trace_band(
                 let mode = choose_scattering_mode(coeffs, rng);
                 radiance +=
                     throughput * direct_sun_at_scatter(scene, pos, ray.dir, band_index, mode, rng);
+                had_scatter = true;
 
                 let (new_dir, pdf) =
                     sample_scattering_direction(scene, mode, ray.dir, band_index, rng);
@@ -176,7 +178,12 @@ pub fn trace_band(
             }
             None => match boundary.kind {
                 BoundaryKind::AtmosphereExit => {
-                    if direction_in_cone(ray.dir, scene.sun.direction, scene.sun.angular_radius_rad)
+                    if !had_scatter
+                        && direction_in_cone(
+                            ray.dir,
+                            scene.sun.direction,
+                            scene.sun.angular_radius_rad,
+                        )
                     {
                         radiance += throughput * scene.solar_radiance_w_m2_sr(band_index);
                     }
@@ -278,24 +285,23 @@ fn direct_sun_at_scatter(
 
 fn ground_radiance(scene: &SceneData, pos: Vec3, band_index: usize, rng: &mut SamplerState) -> f32 {
     let n = surface_normal(pos);
-    let cos_sun = n.dot(scene.sun.direction).max(0.0);
+    let (sun_dir, pdf) =
+        sample_uniform_cone(scene.sun.direction, scene.sun.angular_radius_rad, rng);
+    let cos_sun = n.dot(sun_dir).max(0.0);
     if cos_sun <= 0.0 {
         return 0.0;
     }
-    let Some(t_sun) = segment_to_sun_or_space(pos, scene.sun.direction, scene.planet) else {
+    let Some(t_sun) = segment_to_sun_or_space(pos, sun_dir, scene.planet) else {
         return 0.0;
     };
     let trans = estimate_transmittance_ratio(
         scene,
-        Ray::new(
-            pos + scene.sun.direction * RAY_EPSILON_KM,
-            scene.sun.direction,
-        ),
+        Ray::new(pos + sun_dir * RAY_EPSILON_KM, sun_dir),
         t_sun,
         band_index,
         rng,
     );
-    GROUND_ALBEDO * INV_PI * scene.bands[band_index].solar_irradiance_w_m2 * trans * cos_sun
+    GROUND_ALBEDO * INV_PI * scene.solar_radiance_w_m2_sr(band_index) * trans * cos_sun / pdf
 }
 
 fn choose_scattering_mode(coeffs: MediumCoefficients, rng: &mut SamplerState) -> ScatteringMode {

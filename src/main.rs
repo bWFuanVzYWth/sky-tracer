@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use sky_tracer::config::RenderConfig;
@@ -36,6 +37,7 @@ struct Cli {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let total_start = Instant::now();
     let cli = Cli::parse();
     let config = RenderConfig {
         width: cli.width,
@@ -52,13 +54,22 @@ fn main() -> Result<(), Box<dyn Error>> {
         png_exposure: cli.png_exposure,
     };
 
+    let load_start = Instant::now();
     let scene = load_scene_data(
         &config.data_dir,
         config.sun_elevation_deg,
         config.sun_azimuth_deg,
     )?;
+    let load_elapsed = load_start.elapsed();
+
+    let render_start = Instant::now();
     let film = render(&scene, &config);
+    let render_elapsed = render_start.elapsed();
+
+    let output_start = Instant::now();
     film.write_outputs(&config.out_dir, &scene.bands, config.png_exposure)?;
+    let output_elapsed = output_start.elapsed();
+    let total_elapsed = total_start.elapsed();
 
     println!(
         "wrote {}x{} panorama with {} spp to {}",
@@ -67,5 +78,25 @@ fn main() -> Result<(), Box<dyn Error>> {
         config.spp,
         config.out_dir.display()
     );
+    println!(
+        "timing: load={} render={} output={} total={}",
+        format_duration(load_elapsed),
+        format_duration(render_elapsed),
+        format_duration(output_elapsed),
+        format_duration(total_elapsed)
+    );
     Ok(())
+}
+
+fn format_duration(duration: Duration) -> String {
+    let secs = duration.as_secs_f64();
+    if secs < 1.0 {
+        format!("{:.1}ms", secs * 1000.0)
+    } else if secs < 60.0 {
+        format!("{secs:.2}s")
+    } else {
+        let minutes = (secs / 60.0).floor();
+        let seconds = secs - minutes * 60.0;
+        format!("{minutes:.0}m{seconds:.1}s")
+    }
 }
