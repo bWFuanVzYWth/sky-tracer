@@ -213,7 +213,12 @@ pub fn trace_band(
                     {
                         let weight = last_direction_pdf
                             .map(|direction_pdf| {
-                                balance_heuristic(direction_pdf, sun_light_pdf(scene))
+                                mis_weight(
+                                    direction_pdf,
+                                    1,
+                                    sun_light_pdf(scene),
+                                    config.direct_light_samples.max(1),
+                                )
                             })
                             .unwrap_or(1.0);
                         radiance += throughput * scene.solar_radiance_w_m2_sr(band_index) * weight;
@@ -484,6 +489,7 @@ fn direct_sun_at_scatter(
     coeffs: MediumCoefficients,
     rng: &mut SamplerState,
 ) -> f32 {
+    let light_sample_count = config.direct_light_samples.max(1);
     average_sun_samples(scene, config, rng, |sun_dir, pdf, rng| {
         let Some(t_sun) = segment_to_sun_or_space(pos, sun_dir, scene.planet) else {
             return 0.0;
@@ -499,7 +505,7 @@ fn direct_sun_at_scatter(
         let mu = view_dir.dot(sun_dir).clamp(-1.0, 1.0);
         let phase = mixed_phase_value(scene, coeffs, band_index, mu);
         let phase_pdf = mixed_phase_sampling_pdf(scene, coeffs, band_index, mu);
-        let weight = balance_heuristic(pdf, phase_pdf);
+        let weight = mis_weight(pdf, light_sample_count, phase_pdf, 1);
         scene.solar_radiance_w_m2_sr(band_index) * trans * phase * weight / pdf
     })
 }
@@ -570,6 +576,7 @@ fn ground_radiance(
     rng: &mut SamplerState,
 ) -> f32 {
     let n = surface_normal(pos);
+    let light_sample_count = config.direct_light_samples.max(1);
     average_sun_samples(scene, config, rng, |sun_dir, pdf, rng| {
         let cos_sun = n.dot(sun_dir).max(0.0);
         if cos_sun <= 0.0 {
@@ -589,7 +596,7 @@ fn ground_radiance(
         let bsdf_pdf = cosine_hemisphere_pdf(n, sun_dir);
         let weight = match config.ground_estimator {
             GroundEstimator::DirectOnly => 1.0,
-            GroundEstimator::LambertPath => balance_heuristic(pdf, bsdf_pdf),
+            GroundEstimator::LambertPath => mis_weight(pdf, light_sample_count, bsdf_pdf, 1),
         };
         GROUND_ALBEDO * INV_PI * scene.solar_radiance_w_m2_sr(band_index) * trans * cos_sun * weight
             / pdf
@@ -711,6 +718,10 @@ fn balance_heuristic(pdf_a: f32, pdf_b: f32) -> f32 {
     if denom > 0.0 { pdf_a / denom } else { 0.0 }
 }
 
+fn mis_weight(pdf_a: f32, samples_a: usize, pdf_b: f32, samples_b: usize) -> f32 {
+    balance_heuristic(pdf_a * samples_a as f32, pdf_b * samples_b as f32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -740,6 +751,15 @@ mod tests {
     fn balance_heuristic_splits_equal_pdfs() {
         assert!((balance_heuristic(2.0, 2.0) - 0.5).abs() < 1.0e-6);
         assert_eq!(balance_heuristic(0.0, 2.0), 0.0);
+    }
+
+    #[test]
+    fn mis_weight_accounts_for_sample_counts() {
+        assert!((mis_weight(2.0, 1, 2.0, 1) - 0.5).abs() < 1.0e-6);
+        assert!((mis_weight(2.0, 2, 2.0, 1) - 2.0 / 3.0).abs() < 1.0e-6);
+        let a = mis_weight(3.0, 2, 5.0, 1);
+        let b = mis_weight(5.0, 1, 3.0, 2);
+        assert!((a + b - 1.0).abs() < 1.0e-6);
     }
 
     #[test]
