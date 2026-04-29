@@ -8,8 +8,7 @@ use crate::atmosphere::{
     SPECIES_NAMES, SceneData, Sun,
 };
 use crate::geometry::Planet;
-use crate::medium::compute_majorant_grid;
-use crate::medium::compute_majorants;
+use crate::medium::{compute_majorant_grid, compute_majorants, rayleigh_cross_section_m2};
 use crate::phase::MiePhaseTable;
 use crate::spectrum::{BAND_COUNT, SpectralBand};
 
@@ -23,11 +22,22 @@ pub fn load_scene_data(
     let aerosol_profile = load_aerosol_profile(&data_dir.join("aerosol_profile.csv"))?;
     let aerosol_optics = load_aerosol_optics(&data_dir.join("aerosol_optics.csv"), bands.len())?;
     let phase_table = load_mie_phase(&data_dir.join("mie_phase.csv"), bands.len())?;
+    let sun = Sun::from_degrees(sun_elevation_deg, sun_azimuth_deg);
+    let rayleigh_cross_sections_m2 = bands
+        .iter()
+        .map(|band| rayleigh_cross_section_m2(band.center_nm))
+        .collect();
+    let solar_radiance_w_m2_sr = bands
+        .iter()
+        .map(|band| band.solar_irradiance_w_m2 / sun.solid_angle_sr)
+        .collect();
 
     let mut scene = SceneData {
         planet: Planet::earth_reference(),
-        sun: Sun::from_degrees(sun_elevation_deg, sun_azimuth_deg),
+        sun,
         bands,
+        rayleigh_cross_sections_m2,
+        solar_radiance_w_m2_sr,
         atmospheric_profile,
         aerosol_profile,
         aerosol_optics,
@@ -195,6 +205,8 @@ mod tests {
     fn repository_data_loads() {
         let scene = load_scene_data(Path::new("data"), 0.0, 0.0).expect("data should load");
         assert_eq!(scene.bands.len(), BAND_COUNT);
+        assert_eq!(scene.rayleigh_cross_sections_m2.len(), BAND_COUNT);
+        assert_eq!(scene.solar_radiance_w_m2_sr.len(), BAND_COUNT);
         assert_eq!(scene.phase_table.band_count(), BAND_COUNT);
         assert_eq!(scene.majorants_km_inv.len(), BAND_COUNT);
         assert!(

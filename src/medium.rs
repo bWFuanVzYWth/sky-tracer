@@ -35,10 +35,8 @@ pub fn coefficients_at(scene: &SceneData, position: Vec3, band_index: usize) -> 
 
     let atm = interpolate_atmosphere(&scene.atmospheric_profile, altitude);
     let aerosol = interpolate_aerosol(&scene.aerosol_profile, altitude);
-    let band = scene.bands[band_index];
-
-    let rayleigh = atm.air_cm3 * rayleigh_cross_section_m2(band.center_nm) * 1.0e9;
-    let ozone = atm.ozone_cm3 * band.ozone_cross_section_cm2 * 1.0e5;
+    let rayleigh = atm.air_cm3 * scene.rayleigh_cross_sections_m2[band_index] * 1.0e9;
+    let ozone = atm.ozone_cm3 * scene.bands[band_index].ozone_cross_section_cm2 * 1.0e5;
 
     let mut aerosol_sca = [0.0; SPECIES_COUNT];
     let mut aerosol_abs = [0.0; SPECIES_COUNT];
@@ -187,10 +185,13 @@ mod tests {
                 absorption_km_inv_per_g_m3: 0.5,
             }; SPECIES_COUNT],
         ];
+        let sun = Sun::from_degrees(0.0, 0.0);
         let scene = SceneData {
             planet,
-            sun: Sun::from_degrees(0.0, 0.0),
+            sun,
             bands,
+            rayleigh_cross_sections_m2: vec![rayleigh_cross_section_m2(550.0)],
+            solar_radiance_w_m2_sr: vec![1.0 / sun.solid_angle_sr],
             atmospheric_profile: vec![AtmosphericProfilePoint {
                 altitude_km: 0.0,
                 temperature_k: 288.0,

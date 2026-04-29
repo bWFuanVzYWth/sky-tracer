@@ -122,6 +122,8 @@ pub struct SceneData {
     pub planet: Planet,
     pub sun: Sun,
     pub bands: Vec<SpectralBand>,
+    pub rayleigh_cross_sections_m2: Vec<f32>,
+    pub solar_radiance_w_m2_sr: Vec<f32>,
     pub atmospheric_profile: Vec<AtmosphericProfilePoint>,
     pub aerosol_profile: Vec<AerosolProfilePoint>,
     pub aerosol_optics: Vec<[AerosolOptics; SPECIES_COUNT]>,
@@ -132,6 +134,6 @@ pub struct SceneData {
 
 impl SceneData {
     pub fn solar_radiance_w_m2_sr(&self, band_index: usize) -> f32 {
-        self.bands[band_index].solar_irradiance_w_m2 / self.sun.solid_angle_sr
+        self.solar_radiance_w_m2_sr[band_index]
     }
 }
