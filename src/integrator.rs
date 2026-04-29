@@ -133,7 +133,7 @@ pub fn trace_band(
     let mut ray = initial_ray;
     let mut throughput = 1.0_f32;
     let mut radiance = 0.0_f32;
-    let mut had_scatter = false;
+    let mut last_phase_pdf: Option<f32> = None;
 
     for depth in 0..config.max_depth {
         let Some(boundary) = next_boundary(ray, scene.planet) else {
@@ -158,13 +158,13 @@ pub fn trace_band(
                 let mode = choose_scattering_mode(coeffs, rng);
                 radiance +=
                     throughput * direct_sun_at_scatter(scene, pos, ray.dir, band_index, mode, rng);
-                had_scatter = true;
 
                 let (new_dir, pdf) =
                     sample_scattering_direction(scene, mode, ray.dir, band_index, rng);
                 let mu = ray.dir.dot(new_dir).clamp(-1.0, 1.0);
                 let phase = phase_value(scene, mode, band_index, mu);
                 throughput *= phase / pdf;
+                last_phase_pdf = Some(pdf);
 
                 if depth > 3 {
                     let q = throughput.clamp(0.05, 0.95);
@@ -178,14 +178,12 @@ pub fn trace_band(
             }
             None => match boundary.kind {
                 BoundaryKind::AtmosphereExit => {
-                    if !had_scatter
-                        && direction_in_cone(
-                            ray.dir,
-                            scene.sun.direction,
-                            scene.sun.angular_radius_rad,
-                        )
+                    if direction_in_cone(ray.dir, scene.sun.direction, scene.sun.angular_radius_rad)
                     {
-                        radiance += throughput * scene.solar_radiance_w_m2_sr(band_index);
+                        let weight = last_phase_pdf
+                            .map(|phase_pdf| balance_heuristic(phase_pdf, sun_light_pdf(scene)))
+                            .unwrap_or(1.0);
+                        radiance += throughput * scene.solar_radiance_w_m2_sr(band_index) * weight;
                     }
                     break;
                 }
@@ -342,13 +340,11 @@ fn direct_sun_at_scatter(
         band_index,
         rng,
     );
-    let phase = phase_value(
-        scene,
-        mode,
-        band_index,
-        view_dir.dot(sun_dir).clamp(-1.0, 1.0),
-    );
-    scene.solar_radiance_w_m2_sr(band_index) * trans * phase / pdf
+    let mu = view_dir.dot(sun_dir).clamp(-1.0, 1.0);
+    let phase = phase_value(scene, mode, band_index, mu);
+    let phase_pdf = phase_sampling_pdf(scene, mode, band_index, mu);
+    let weight = balance_heuristic(pdf, phase_pdf);
+    scene.solar_radiance_w_m2_sr(band_index) * trans * phase * weight / pdf
 }
 
 fn ground_radiance(scene: &SceneData, pos: Vec3, band_index: usize, rng: &mut SamplerState) -> f32 {
@@ -416,6 +412,26 @@ fn phase_value(scene: &SceneData, mode: ScatteringMode, band_index: usize, mu: f
     }
 }
 
+fn phase_sampling_pdf(scene: &SceneData, mode: ScatteringMode, band_index: usize, mu: f32) -> f32 {
+    match mode {
+        ScatteringMode::Rayleigh => rayleigh_phase(mu),
+        ScatteringMode::Aerosol { species_index } => {
+            scene
+                .phase_table
+                .sampling_pdf(species_index, band_index, mu)
+        }
+    }
+}
+
+fn sun_light_pdf(scene: &SceneData) -> f32 {
+    1.0 / scene.sun.solid_angle_sr
+}
+
+fn balance_heuristic(pdf_a: f32, pdf_b: f32) -> f32 {
+    let denom = pdf_a + pdf_b;
+    if denom > 0.0 { pdf_a / denom } else { 0.0 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,5 +455,11 @@ mod tests {
             use_azimuth_symmetry: false,
             ..RenderConfig::default()
         }));
+    }
+
+    #[test]
+    fn balance_heuristic_splits_equal_pdfs() {
+        assert!((balance_heuristic(2.0, 2.0) - 0.5).abs() < 1.0e-6);
+        assert_eq!(balance_heuristic(0.0, 2.0), 0.0);
     }
 }

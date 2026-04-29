@@ -68,6 +68,12 @@ impl MiePhaseTable {
         (mu, self.bin_pdf[base + bin].max(1.0e-12))
     }
 
+    pub fn sampling_pdf(&self, species_index: usize, band_index: usize, mu: f32) -> f32 {
+        let base = (species_index * self.band_count + band_index) * PHASE_BINS;
+        let bin = mu_to_bin(mu);
+        self.bin_pdf[base + bin].max(1.0e-12)
+    }
+
     pub fn band_count(&self) -> usize {
         self.band_count
     }
@@ -129,6 +135,11 @@ fn mu_edge(bin_edge: usize) -> f32 {
     1.0 - 2.0 * u * u * u
 }
 
+fn mu_to_bin(mu: f32) -> usize {
+    let u = ((1.0 - mu.clamp(-1.0, 1.0)) * 0.5).cbrt();
+    ((u * PHASE_BINS as f32).floor() as usize).min(PHASE_BINS - 1)
+}
+
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a * (1.0 - t) + b * t
 }
@@ -150,5 +161,6 @@ mod tests {
         let (mu, pdf) = table.sample_mu_pdf(0, 0, 0.5);
         assert!((-1.0..=1.0).contains(&mu));
         assert!((pdf - 1.0 / (4.0 * PI)).abs() < 1.0e-3);
+        assert!((table.sampling_pdf(0, 0, mu) - pdf).abs() < 1.0e-6);
     }
 }
