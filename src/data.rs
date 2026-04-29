@@ -45,7 +45,7 @@ pub fn load_scene_data(
         majorants_km_inv: Vec::new(),
         majorant_grid: crate::atmosphere::MajorantGrid::new(120.0, 1, 1),
     };
-    scene.majorant_grid = compute_majorant_grid(&scene, 96);
+    scene.majorant_grid = compute_majorant_grid(&scene, 64);
     scene.majorants_km_inv = compute_majorants(&scene);
     Ok(scene)
 }
