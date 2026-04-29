@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use sky_tracer::config::RenderConfig;
+use sky_tracer::config::{RenderConfig, TransmittanceEstimator};
 use sky_tracer::data::load_scene_data;
-use sky_tracer::integrator::render;
+use sky_tracer::integrator::{can_use_azimuth_symmetry, render};
 use sky_tracer::sampling::SamplerKind;
 
 #[derive(Parser, Debug)]
@@ -33,6 +33,8 @@ struct Cli {
     disable_symmetry: bool,
     #[arg(long, default_value = "rqmc")]
     sampler: SamplerKind,
+    #[arg(long, default_value = "residual")]
+    transmittance_estimator: TransmittanceEstimator,
     #[arg(long, default_value_t = 16)]
     max_depth: usize,
     #[arg(long, default_value_t = 0.01)]
@@ -54,6 +56,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         observer_altitude_km: cli.observer_altitude_km,
         use_azimuth_symmetry: !cli.disable_symmetry,
         sampler: cli.sampler,
+        transmittance_estimator: cli.transmittance_estimator,
         max_depth: cli.max_depth,
         png_exposure: cli.png_exposure,
     };
@@ -65,6 +68,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         config.sun_azimuth_deg,
     )?;
     let load_elapsed = load_start.elapsed();
+
+    println!(
+        "config: sampler={} transmittance={} symmetry={}",
+        config.sampler,
+        config.transmittance_estimator,
+        can_use_azimuth_symmetry(&config)
+    );
 
     let render_start = Instant::now();
     let film = render(&scene, &config);

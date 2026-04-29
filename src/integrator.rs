@@ -1,7 +1,7 @@
 use rayon::prelude::*;
 
 use crate::atmosphere::{GROUND_ALBEDO, SPECIES_COUNT, SceneData};
-use crate::config::RenderConfig;
+use crate::config::{RenderConfig, TransmittanceEstimator};
 use crate::film::Film;
 use crate::geometry::{
     BoundaryKind, RAY_EPSILON_KM, altitude_km, intersect_sphere, next_boundary,
@@ -157,8 +157,8 @@ pub fn trace_band(
                 }
 
                 let mode = choose_scattering_mode(coeffs, rng);
-                radiance +=
-                    throughput * direct_sun_at_scatter(scene, pos, ray.dir, band_index, mode, rng);
+                radiance += throughput
+                    * direct_sun_at_scatter(scene, config, pos, ray.dir, band_index, mode, rng);
 
                 let (new_dir, pdf) =
                     sample_scattering_direction(scene, mode, ray.dir, band_index, rng);
@@ -190,7 +190,7 @@ pub fn trace_band(
                 }
                 BoundaryKind::Ground => {
                     let pos = ray.at(boundary.t_km);
-                    radiance += throughput * ground_radiance(scene, pos, band_index, rng);
+                    radiance += throughput * ground_radiance(scene, config, pos, band_index, rng);
                     break;
                 }
             },
@@ -236,7 +236,58 @@ fn sample_real_collision(
     None
 }
 
+pub fn estimate_transmittance(
+    scene: &SceneData,
+    ray: Ray,
+    t_max: f32,
+    band_index: usize,
+    rng: &mut SamplerState,
+    estimator: TransmittanceEstimator,
+) -> f32 {
+    match estimator {
+        TransmittanceEstimator::Ratio => {
+            estimate_transmittance_ratio(scene, ray, t_max, band_index, rng)
+        }
+        TransmittanceEstimator::ResidualRatio => {
+            estimate_transmittance_residual_ratio(scene, ray, t_max, band_index, rng)
+        }
+    }
+}
+
 pub fn estimate_transmittance_ratio(
+    scene: &SceneData,
+    ray: Ray,
+    t_max: f32,
+    band_index: usize,
+    rng: &mut SamplerState,
+) -> f32 {
+    let mut t = 0.0;
+    let mut weight = 1.0_f32;
+    while t < t_max {
+        let segment_end = next_majorant_segment_end(scene, ray, t, t_max);
+        let majorant = segment_majorant(scene, ray, t, segment_end, band_index);
+        while t < segment_end {
+            let u = (1.0 - rng.next_f32()).max(1.0e-7);
+            t += -u.ln() / majorant;
+            if t >= segment_end {
+                break;
+            }
+            let coeffs = coefficients_at(scene, ray.at(t), band_index);
+            debug_assert!(
+                coeffs.extinction_total() <= majorant * 1.001,
+                "layer majorant underestimates extinction"
+            );
+            weight *= (1.0 - coeffs.extinction_total() / majorant).clamp(0.0, 1.0);
+            if weight <= 0.0 {
+                return 0.0;
+            }
+        }
+        t = segment_end;
+    }
+    weight.clamp(0.0, 1.0)
+}
+
+pub fn estimate_transmittance_residual_ratio(
     scene: &SceneData,
     ray: Ray,
     t_max: f32,
@@ -352,6 +403,7 @@ fn closest_approach_t(ray: Ray) -> f32 {
 
 fn direct_sun_at_scatter(
     scene: &SceneData,
+    config: &RenderConfig,
     pos: Vec3,
     view_dir: Vec3,
     band_index: usize,
@@ -363,12 +415,13 @@ fn direct_sun_at_scatter(
     let Some(t_sun) = segment_to_sun_or_space(pos, sun_dir, scene.planet) else {
         return 0.0;
     };
-    let trans = estimate_transmittance_ratio(
+    let trans = estimate_transmittance(
         scene,
         Ray::new(pos + sun_dir * RAY_EPSILON_KM, sun_dir),
         t_sun,
         band_index,
         rng,
+        config.transmittance_estimator,
     );
     let mu = view_dir.dot(sun_dir).clamp(-1.0, 1.0);
     let phase = phase_value(scene, mode, band_index, mu);
@@ -377,7 +430,13 @@ fn direct_sun_at_scatter(
     scene.solar_radiance_w_m2_sr(band_index) * trans * phase * weight / pdf
 }
 
-fn ground_radiance(scene: &SceneData, pos: Vec3, band_index: usize, rng: &mut SamplerState) -> f32 {
+fn ground_radiance(
+    scene: &SceneData,
+    config: &RenderConfig,
+    pos: Vec3,
+    band_index: usize,
+    rng: &mut SamplerState,
+) -> f32 {
     let n = surface_normal(pos);
     let (sun_dir, pdf) =
         sample_uniform_cone(scene.sun.direction, scene.sun.angular_radius_rad, rng);
@@ -388,12 +447,13 @@ fn ground_radiance(scene: &SceneData, pos: Vec3, band_index: usize, rng: &mut Sa
     let Some(t_sun) = segment_to_sun_or_space(pos, sun_dir, scene.planet) else {
         return 0.0;
     };
-    let trans = estimate_transmittance_ratio(
+    let trans = estimate_transmittance(
         scene,
         Ray::new(pos + sun_dir * RAY_EPSILON_KM, sun_dir),
         t_sun,
         band_index,
         rng,
+        config.transmittance_estimator,
     );
     GROUND_ALBEDO * INV_PI * scene.solar_radiance_w_m2_sr(band_index) * trans * cos_sun / pdf
 }
