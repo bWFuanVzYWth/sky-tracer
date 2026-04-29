@@ -178,7 +178,7 @@ pub fn trace_band(
                         pos,
                         ray.dir,
                         band_index,
-                        mode,
+                        coeffs,
                         &mut light_rng,
                     );
 
@@ -450,7 +450,7 @@ fn direct_sun_at_scatter(
     pos: Vec3,
     view_dir: Vec3,
     band_index: usize,
-    mode: ScatteringMode,
+    coeffs: MediumCoefficients,
     rng: &mut SamplerState,
 ) -> f32 {
     let (sun_dir, pdf) =
@@ -467,10 +467,41 @@ fn direct_sun_at_scatter(
         config.transmittance_estimator,
     );
     let mu = view_dir.dot(sun_dir).clamp(-1.0, 1.0);
-    let phase = phase_value(scene, mode, band_index, mu);
-    let phase_pdf = phase_sampling_pdf(scene, mode, band_index, mu);
-    let weight = balance_heuristic(pdf, phase_pdf);
-    scene.solar_radiance_w_m2_sr(band_index) * trans * phase * weight / pdf
+    let phase = direct_scattering_phase(scene, coeffs, band_index, mu, pdf);
+    scene.solar_radiance_w_m2_sr(band_index) * trans * phase / pdf
+}
+
+fn direct_scattering_phase(
+    scene: &SceneData,
+    coeffs: MediumCoefficients,
+    band_index: usize,
+    mu: f32,
+    light_pdf: f32,
+) -> f32 {
+    let scattering = coeffs.scattering_total();
+    if scattering <= 0.0 {
+        return 0.0;
+    }
+
+    let mut phase = 0.0;
+    let rayleigh_weight = coeffs.rayleigh_scattering_km_inv / scattering;
+    if rayleigh_weight > 0.0 {
+        let rayleigh = rayleigh_phase(mu);
+        phase += rayleigh_weight * rayleigh * balance_heuristic(light_pdf, rayleigh);
+    }
+
+    for species_index in 0..SPECIES_COUNT {
+        let species_weight = coeffs.aerosol_scattering_km_inv[species_index] / scattering;
+        if species_weight <= 0.0 {
+            continue;
+        }
+        let mode = ScatteringMode::Aerosol { species_index };
+        let component_phase = phase_value(scene, mode, band_index, mu);
+        let component_pdf = phase_sampling_pdf(scene, mode, band_index, mu);
+        phase += species_weight * component_phase * balance_heuristic(light_pdf, component_pdf);
+    }
+
+    phase
 }
 
 fn ground_radiance(
@@ -642,5 +673,28 @@ mod tests {
             depth_stream(SCATTER_LIGHT_STREAM, 2),
             depth_stream(GROUND_LIGHT_STREAM, 2)
         );
+    }
+
+    #[test]
+    fn direct_scattering_phase_sums_all_components() {
+        let scene =
+            crate::data::load_scene_data(std::path::Path::new("data"), 0.0, 0.0).expect("scene");
+        let mut coeffs = MediumCoefficients {
+            rayleigh_scattering_km_inv: 1.0,
+            ..MediumCoefficients::default()
+        };
+        coeffs.aerosol_scattering_km_inv[0] = 3.0;
+
+        let mu = 0.35;
+        let light_pdf = 5.0;
+        let rayleigh = rayleigh_phase(mu);
+        let aerosol_mode = ScatteringMode::Aerosol { species_index: 0 };
+        let aerosol = phase_value(&scene, aerosol_mode, 0, mu);
+        let aerosol_pdf = phase_sampling_pdf(&scene, aerosol_mode, 0, mu);
+        let expected = 0.25 * rayleigh * balance_heuristic(light_pdf, rayleigh)
+            + 0.75 * aerosol * balance_heuristic(light_pdf, aerosol_pdf);
+
+        let actual = direct_scattering_phase(&scene, coeffs, 0, mu, light_pdf);
+        assert!((actual - expected).abs() < 1.0e-6);
     }
 }
