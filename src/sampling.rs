@@ -142,6 +142,21 @@ pub fn sample_uniform_cone(axis: Vec3, angular_radius: f32, rng: &mut SamplerSta
     (local.normalized(), pdf)
 }
 
+pub fn sample_cosine_hemisphere(axis: Vec3, rng: &mut SamplerState) -> (Vec3, f32) {
+    let u = rng.next_f32();
+    let r = u.sqrt();
+    let phi = TAU * rng.next_f32();
+    let cos_theta = (1.0 - u).max(0.0).sqrt();
+    let (t, b) = orthonormal_basis(axis);
+    let dir =
+        (t * (r * phi.cos()) + b * (r * phi.sin()) + axis.normalized() * cos_theta).normalized();
+    (dir, cosine_hemisphere_pdf(axis, dir))
+}
+
+pub fn cosine_hemisphere_pdf(axis: Vec3, dir: Vec3) -> f32 {
+    axis.normalized().dot(dir.normalized()).max(0.0) / PI
+}
+
 pub fn direction_in_cone(dir: Vec3, axis: Vec3, angular_radius: f32) -> bool {
     dir.normalized().dot(axis.normalized()) >= angular_radius.cos()
 }
@@ -209,6 +224,15 @@ mod tests {
         let (dir, pdf) = sample_uniform_cone(axis, 0.01, &mut rng);
         assert!(direction_in_cone(dir, axis, 0.01));
         assert!(pdf.is_finite() && pdf > 0.0);
+    }
+
+    #[test]
+    fn cosine_hemisphere_sample_is_above_surface() {
+        let mut rng = SamplerState::new(13);
+        let axis = Vec3::Y;
+        let (dir, pdf) = sample_cosine_hemisphere(axis, &mut rng);
+        assert!(axis.dot(dir) > 0.0);
+        assert!((pdf - cosine_hemisphere_pdf(axis, dir)).abs() < 1.0e-6);
     }
 
     #[test]

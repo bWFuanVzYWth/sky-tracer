@@ -91,6 +91,35 @@ impl FromStr for SpectralCorrelation {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GroundEstimator {
+    DirectOnly,
+    LambertPath,
+}
+
+impl Display for GroundEstimator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DirectOnly => write!(f, "direct"),
+            Self::LambertPath => write!(f, "path"),
+        }
+    }
+}
+
+impl FromStr for GroundEstimator {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "direct" | "direct-only" => Ok(Self::DirectOnly),
+            "path" | "lambert-path" | "bounce" => Ok(Self::LambertPath),
+            _ => Err(format!(
+                "unknown ground estimator `{s}`; expected `path` or `direct`"
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RenderConfig {
     pub width: usize,
@@ -107,6 +136,8 @@ pub struct RenderConfig {
     pub transmittance_estimator: TransmittanceEstimator,
     pub collision_estimator: CollisionEstimator,
     pub spectral_correlation: SpectralCorrelation,
+    pub ground_estimator: GroundEstimator,
+    pub direct_light_samples: usize,
     pub max_depth: usize,
     pub png_exposure: f32,
 }
@@ -128,6 +159,8 @@ impl Default for RenderConfig {
             transmittance_estimator: TransmittanceEstimator::ResidualRatio,
             collision_estimator: CollisionEstimator::Weighted,
             spectral_correlation: SpectralCorrelation::Common,
+            ground_estimator: GroundEstimator::DirectOnly,
+            direct_light_samples: 2,
             max_depth: 16,
             png_exposure: 0.01,
         }
@@ -175,5 +208,18 @@ mod tests {
             SpectralCorrelation::Independent
         );
         assert!("bad".parse::<SpectralCorrelation>().is_err());
+    }
+
+    #[test]
+    fn ground_estimator_parses_cli_names() {
+        assert_eq!(
+            "path".parse::<GroundEstimator>().unwrap(),
+            GroundEstimator::LambertPath
+        );
+        assert_eq!(
+            "direct".parse::<GroundEstimator>().unwrap(),
+            GroundEstimator::DirectOnly
+        );
+        assert!("bad".parse::<GroundEstimator>().is_err());
     }
 }

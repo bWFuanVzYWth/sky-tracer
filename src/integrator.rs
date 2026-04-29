@@ -2,7 +2,7 @@ use rayon::prelude::*;
 
 use crate::atmosphere::{GROUND_ALBEDO, SPECIES_COUNT, SceneData};
 use crate::config::{
-    CollisionEstimator, RenderConfig, SpectralCorrelation, TransmittanceEstimator,
+    CollisionEstimator, GroundEstimator, RenderConfig, SpectralCorrelation, TransmittanceEstimator,
 };
 use crate::film::Film;
 use crate::geometry::{
@@ -13,7 +13,8 @@ use crate::math::{INV_PI, Ray, TAU, Vec3};
 use crate::medium::{MediumCoefficients, coefficients_at};
 use crate::phase::{PhaseFrame, ScalarPhase, ScatteringMode, rayleigh_phase};
 use crate::sampling::{
-    SamplerState, direction_in_cone, sample_mie_phase, sample_rayleigh_phase, sample_uniform_cone,
+    SamplerState, cosine_hemisphere_pdf, direction_in_cone, sample_cosine_hemisphere,
+    sample_mie_phase, sample_rayleigh_phase, sample_uniform_cone,
 };
 use crate::spectrum::BAND_COUNT;
 
@@ -146,7 +147,7 @@ pub fn trace_band(
     let mut ray = initial_ray;
     let mut throughput = 1.0_f32;
     let mut radiance = 0.0_f32;
-    let mut last_phase_pdf: Option<f32> = None;
+    let mut last_direction_pdf: Option<f32> = None;
 
     for depth in 0..config.max_depth {
         let Some(boundary) = next_boundary(ray, scene.planet) else {
@@ -187,7 +188,7 @@ pub fn trace_band(
                 let mu = ray.dir.dot(new_dir).clamp(-1.0, 1.0);
                 let phase = phase_value(scene, mode, band_index, mu);
                 throughput *= phase / pdf;
-                last_phase_pdf = Some(pdf);
+                last_direction_pdf = Some(pdf);
 
                 if depth > 3 {
                     let q = throughput.clamp(0.05, 0.95);
@@ -203,8 +204,10 @@ pub fn trace_band(
                 BoundaryKind::AtmosphereExit => {
                     if direction_in_cone(ray.dir, scene.sun.direction, scene.sun.angular_radius_rad)
                     {
-                        let weight = last_phase_pdf
-                            .map(|phase_pdf| balance_heuristic(phase_pdf, sun_light_pdf(scene)))
+                        let weight = last_direction_pdf
+                            .map(|direction_pdf| {
+                                balance_heuristic(direction_pdf, sun_light_pdf(scene))
+                            })
                             .unwrap_or(1.0);
                         radiance += throughput * scene.solar_radiance_w_m2_sr(band_index) * weight;
                     }
@@ -215,7 +218,28 @@ pub fn trace_band(
                     let mut light_rng = rng.fork(depth_stream(GROUND_LIGHT_STREAM, depth));
                     radiance += throughput
                         * ground_radiance(scene, config, pos, band_index, &mut light_rng);
-                    break;
+                    if config.ground_estimator == GroundEstimator::DirectOnly {
+                        break;
+                    }
+
+                    let normal = surface_normal(pos);
+                    let (new_dir, pdf) = sample_cosine_hemisphere(normal, rng);
+                    let cos_out = normal.dot(new_dir).max(0.0);
+                    if pdf <= 0.0 || cos_out <= 0.0 {
+                        break;
+                    }
+                    throughput *= GROUND_ALBEDO * INV_PI * cos_out / pdf;
+                    last_direction_pdf = Some(pdf);
+
+                    if depth > 3 {
+                        let q = throughput.clamp(0.05, 0.95);
+                        if rng.next_f32() > q {
+                            break;
+                        }
+                        throughput /= q;
+                    }
+
+                    ray = Ray::new(pos + new_dir * RAY_EPSILON_KM, new_dir);
                 }
             },
         }
@@ -453,22 +477,27 @@ fn direct_sun_at_scatter(
     coeffs: MediumCoefficients,
     rng: &mut SamplerState,
 ) -> f32 {
-    let (sun_dir, pdf) =
-        sample_uniform_cone(scene.sun.direction, scene.sun.angular_radius_rad, rng);
-    let Some(t_sun) = segment_to_sun_or_space(pos, sun_dir, scene.planet) else {
-        return 0.0;
-    };
-    let trans = estimate_transmittance(
-        scene,
-        Ray::new(pos + sun_dir * RAY_EPSILON_KM, sun_dir),
-        t_sun,
-        band_index,
-        rng,
-        config.transmittance_estimator,
-    );
-    let mu = view_dir.dot(sun_dir).clamp(-1.0, 1.0);
-    let phase = direct_scattering_phase(scene, coeffs, band_index, mu, pdf);
-    scene.solar_radiance_w_m2_sr(band_index) * trans * phase / pdf
+    let sample_count = config.direct_light_samples.max(1);
+    let mut sum = 0.0;
+    for _ in 0..sample_count {
+        let (sun_dir, pdf) =
+            sample_uniform_cone(scene.sun.direction, scene.sun.angular_radius_rad, rng);
+        let Some(t_sun) = segment_to_sun_or_space(pos, sun_dir, scene.planet) else {
+            continue;
+        };
+        let trans = estimate_transmittance(
+            scene,
+            Ray::new(pos + sun_dir * RAY_EPSILON_KM, sun_dir),
+            t_sun,
+            band_index,
+            rng,
+            config.transmittance_estimator,
+        );
+        let mu = view_dir.dot(sun_dir).clamp(-1.0, 1.0);
+        let phase = direct_scattering_phase(scene, coeffs, band_index, mu, pdf);
+        sum += scene.solar_radiance_w_m2_sr(band_index) * trans * phase / pdf;
+    }
+    sum / sample_count as f32
 }
 
 fn direct_scattering_phase(
@@ -512,24 +541,40 @@ fn ground_radiance(
     rng: &mut SamplerState,
 ) -> f32 {
     let n = surface_normal(pos);
-    let (sun_dir, pdf) =
-        sample_uniform_cone(scene.sun.direction, scene.sun.angular_radius_rad, rng);
-    let cos_sun = n.dot(sun_dir).max(0.0);
-    if cos_sun <= 0.0 {
-        return 0.0;
+    let sample_count = config.direct_light_samples.max(1);
+    let mut sum = 0.0;
+    for _ in 0..sample_count {
+        let (sun_dir, pdf) =
+            sample_uniform_cone(scene.sun.direction, scene.sun.angular_radius_rad, rng);
+        let cos_sun = n.dot(sun_dir).max(0.0);
+        if cos_sun <= 0.0 {
+            continue;
+        }
+        let Some(t_sun) = segment_to_sun_or_space(pos, sun_dir, scene.planet) else {
+            continue;
+        };
+        let trans = estimate_transmittance(
+            scene,
+            Ray::new(pos + sun_dir * RAY_EPSILON_KM, sun_dir),
+            t_sun,
+            band_index,
+            rng,
+            config.transmittance_estimator,
+        );
+        let bsdf_pdf = cosine_hemisphere_pdf(n, sun_dir);
+        let weight = match config.ground_estimator {
+            GroundEstimator::DirectOnly => 1.0,
+            GroundEstimator::LambertPath => balance_heuristic(pdf, bsdf_pdf),
+        };
+        sum += GROUND_ALBEDO
+            * INV_PI
+            * scene.solar_radiance_w_m2_sr(band_index)
+            * trans
+            * cos_sun
+            * weight
+            / pdf;
     }
-    let Some(t_sun) = segment_to_sun_or_space(pos, sun_dir, scene.planet) else {
-        return 0.0;
-    };
-    let trans = estimate_transmittance(
-        scene,
-        Ray::new(pos + sun_dir * RAY_EPSILON_KM, sun_dir),
-        t_sun,
-        band_index,
-        rng,
-        config.transmittance_estimator,
-    );
-    GROUND_ALBEDO * INV_PI * scene.solar_radiance_w_m2_sr(band_index) * trans * cos_sun / pdf
+    sum / sample_count as f32
 }
 
 fn choose_scattering_mode(coeffs: MediumCoefficients, rng: &mut SamplerState) -> ScatteringMode {
