@@ -9,7 +9,9 @@ use crate::geometry::{
 use crate::math::{INV_PI, Ray, TAU, Vec3};
 use crate::medium::{MediumCoefficients, coefficients_at};
 use crate::phase::{PhaseFrame, ScalarPhase, ScatteringMode, rayleigh_phase};
-use crate::sampling::{SamplerState, direction_in_cone, sample_isotropic, sample_uniform_cone};
+use crate::sampling::{
+    SamplerState, direction_in_cone, sample_mie_phase, sample_rayleigh_phase, sample_uniform_cone,
+};
 use crate::spectrum::BAND_COUNT;
 
 type PixelSpectrum = [f32; BAND_COUNT];
@@ -156,7 +158,8 @@ pub fn trace_band(
                 radiance +=
                     throughput * direct_sun_at_scatter(scene, pos, ray.dir, band_index, mode, rng);
 
-                let (new_dir, pdf) = sample_isotropic(rng);
+                let (new_dir, pdf) =
+                    sample_scattering_direction(scene, mode, ray.dir, band_index, rng);
                 let mu = ray.dir.dot(new_dir).clamp(-1.0, 1.0);
                 let phase = phase_value(scene, mode, band_index, mu);
                 throughput *= phase / pdf;
@@ -311,6 +314,21 @@ fn choose_scattering_mode(coeffs: MediumCoefficients, rng: &mut SamplerState) ->
         xi -= coeffs.aerosol_scattering_km_inv[species];
     }
     ScatteringMode::Rayleigh
+}
+
+fn sample_scattering_direction(
+    scene: &SceneData,
+    mode: ScatteringMode,
+    axis: Vec3,
+    band_index: usize,
+    rng: &mut SamplerState,
+) -> (Vec3, f32) {
+    match mode {
+        ScatteringMode::Rayleigh => sample_rayleigh_phase(axis, rng),
+        ScatteringMode::Aerosol { species_index } => {
+            sample_mie_phase(axis, &scene.phase_table, species_index, band_index, rng)
+        }
+    }
 }
 
 fn phase_value(scene: &SceneData, mode: ScatteringMode, band_index: usize, mu: f32) -> f32 {
