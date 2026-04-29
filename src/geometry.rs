@@ -37,8 +37,8 @@ pub fn surface_normal(position: Vec3) -> Vec3 {
     position.normalized()
 }
 
-pub fn observer_position(planet: Planet) -> Vec3 {
-    Vec3::new(0.0, planet.ground_radius_km + 0.001, 0.0)
+pub fn observer_position(planet: Planet, altitude_km: f32) -> Vec3 {
+    Vec3::new(0.0, planet.ground_radius_km + altitude_km.max(0.0), 0.0)
 }
 
 pub fn intersect_sphere(ray: Ray, radius: f32) -> Option<(f32, f32)> {
@@ -101,18 +101,18 @@ mod tests {
     #[test]
     fn upward_ray_exits_atmosphere() {
         let planet = Planet::earth_reference();
-        let ray = Ray::new(observer_position(planet), Vec3::Y);
+        let ray = Ray::new(observer_position(planet, 0.2), Vec3::Y);
         let hit = next_boundary(ray, planet).unwrap();
         assert_eq!(hit.kind, BoundaryKind::AtmosphereExit);
-        assert!((hit.t_km - 119.999).abs() < 0.01);
+        assert!((hit.t_km - 119.8).abs() < 0.01);
     }
 
     #[test]
     fn downward_ray_hits_ground() {
         let planet = Planet::earth_reference();
-        let ray = Ray::new(observer_position(planet), -Vec3::Y);
+        let ray = Ray::new(observer_position(planet, 0.2), -Vec3::Y);
         let hit = next_boundary(ray, planet).unwrap();
         assert_eq!(hit.kind, BoundaryKind::Ground);
-        assert!(hit.t_km < 0.01);
+        assert!((hit.t_km - 0.2).abs() < 0.01);
     }
 }

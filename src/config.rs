@@ -10,6 +10,8 @@ pub struct RenderConfig {
     pub data_dir: PathBuf,
     pub sun_elevation_deg: f32,
     pub sun_azimuth_deg: f32,
+    pub observer_altitude_km: f32,
+    pub use_azimuth_symmetry: bool,
     pub max_depth: usize,
     pub png_exposure: f32,
 }
@@ -25,6 +27,8 @@ impl Default for RenderConfig {
             data_dir: PathBuf::from("data"),
             sun_elevation_deg: 0.0,
             sun_azimuth_deg: 0.0,
+            observer_altitude_km: 0.2,
+            use_azimuth_symmetry: true,
             max_depth: 16,
             png_exposure: 0.01,
         }

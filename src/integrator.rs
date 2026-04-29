@@ -10,9 +10,21 @@ use crate::math::{INV_PI, Ray, TAU, Vec3};
 use crate::medium::{MediumCoefficients, coefficients_at};
 use crate::phase::{PhaseFrame, ScalarPhase, ScatteringMode, rayleigh_phase};
 use crate::sampling::{SamplerState, direction_in_cone, sample_isotropic, sample_uniform_cone};
+use crate::spectrum::BAND_COUNT;
+
+type PixelSpectrum = [f32; BAND_COUNT];
 
 pub fn render(scene: &SceneData, config: &RenderConfig) -> Film {
-    let pixels: Vec<Vec<f32>> = (0..config.width * config.height)
+    assert_eq!(scene.bands.len(), BAND_COUNT);
+    if can_use_azimuth_symmetry(config) {
+        render_with_azimuth_symmetry(scene, config)
+    } else {
+        render_full(scene, config)
+    }
+}
+
+fn render_full(scene: &SceneData, config: &RenderConfig) -> Film {
+    let pixels: Vec<PixelSpectrum> = (0..config.width * config.height)
         .into_par_iter()
         .map(|pixel| {
             let x = pixel % config.width;
@@ -28,8 +40,33 @@ pub fn render(scene: &SceneData, config: &RenderConfig) -> Film {
     film
 }
 
-fn render_pixel(scene: &SceneData, config: &RenderConfig, x: usize, y: usize) -> Vec<f32> {
-    let mut sum = vec![0.0; scene.bands.len()];
+fn render_with_azimuth_symmetry(scene: &SceneData, config: &RenderConfig) -> Film {
+    let representative_width = config.width.div_ceil(2);
+
+    let pixels: Vec<(usize, usize, PixelSpectrum)> = (0..representative_width * config.height)
+        .into_par_iter()
+        .map(|representative| {
+            let x = representative % representative_width;
+            let y = representative / representative_width;
+            let mirror_x = mirror_azimuth_x(config.width, x);
+            let pixel = y * config.width + x;
+            let mirror_pixel = y * config.width + mirror_x;
+            (pixel, mirror_pixel, render_pixel(scene, config, x, y))
+        })
+        .collect();
+
+    let mut film = Film::new(config.width, config.height, scene.bands.len());
+    for (pixel, mirror_pixel, spectrum) in pixels {
+        film.set_pixel_spectrum(pixel, &spectrum);
+        if mirror_pixel != pixel {
+            film.set_pixel_spectrum(mirror_pixel, &spectrum);
+        }
+    }
+    film
+}
+
+fn render_pixel(scene: &SceneData, config: &RenderConfig, x: usize, y: usize) -> PixelSpectrum {
+    let mut sum = [0.0; BAND_COUNT];
     let pixel_seed = config.seed
         ^ ((x as u64).wrapping_mul(0x9E37_79B9))
         ^ ((y as u64).wrapping_mul(0xD1B5_4A32));
@@ -38,7 +75,7 @@ fn render_pixel(scene: &SceneData, config: &RenderConfig, x: usize, y: usize) ->
     for sample in 0..config.spp {
         let u = (x as f32 + rng.next_f32()) / config.width as f32;
         let v = (y as f32 + rng.next_f32()) / config.height as f32;
-        let ray = camera_ray(scene, u, v);
+        let ray = camera_ray(scene, config, u, v);
         for (band, value) in sum.iter_mut().enumerate() {
             let mut band_rng = rng.fork((sample as u64) << 32 ^ band as u64);
             *value += trace_band(scene, config, ray, band, &mut band_rng);
@@ -52,7 +89,7 @@ fn render_pixel(scene: &SceneData, config: &RenderConfig, x: usize, y: usize) ->
     sum
 }
 
-pub fn camera_ray(scene: &SceneData, u: f32, v: f32) -> Ray {
+pub fn camera_ray(scene: &SceneData, config: &RenderConfig, u: f32, v: f32) -> Ray {
     let azimuth = (u - 0.5) * TAU;
     let elevation = (0.5 - v) * std::f32::consts::PI;
     let cos_e = elevation.cos();
@@ -62,9 +99,25 @@ pub fn camera_ray(scene: &SceneData, u: f32, v: f32) -> Ray {
         cos_e * azimuth.cos(),
     );
     Ray::new(
-        crate::geometry::observer_position(scene.planet),
+        crate::geometry::observer_position(scene.planet, config.observer_altitude_km),
         dir.normalized(),
     )
+}
+
+pub fn can_use_azimuth_symmetry(config: &RenderConfig) -> bool {
+    if !config.use_azimuth_symmetry {
+        return false;
+    }
+
+    // The x <-> width-1-x mirror is exactly unbiased only when the sun lies in
+    // the panorama's x=0 vertical plane. Other azimuths need a shifted mirror
+    // mapping or full rendering to preserve the per-pixel integration domain.
+    let azimuth_rad = config.sun_azimuth_deg.to_radians();
+    azimuth_rad.sin().abs() < 1.0e-6
+}
+
+fn mirror_azimuth_x(width: usize, x: usize) -> usize {
+    width - 1 - x
 }
 
 pub fn trace_band(
@@ -268,5 +321,31 @@ fn phase_value(scene: &SceneData, mode: ScatteringMode, band_index: usize, mu: f
             band_index,
             mode,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn azimuth_symmetry_is_enabled_only_for_exact_mirror_plane() {
+        assert!(can_use_azimuth_symmetry(&RenderConfig {
+            sun_azimuth_deg: 0.0,
+            ..RenderConfig::default()
+        }));
+        assert!(can_use_azimuth_symmetry(&RenderConfig {
+            sun_azimuth_deg: 180.0,
+            ..RenderConfig::default()
+        }));
+        assert!(!can_use_azimuth_symmetry(&RenderConfig {
+            sun_azimuth_deg: 90.0,
+            ..RenderConfig::default()
+        }));
+        assert!(!can_use_azimuth_symmetry(&RenderConfig {
+            sun_azimuth_deg: 0.0,
+            use_azimuth_symmetry: false,
+            ..RenderConfig::default()
+        }));
     }
 }

@@ -21,6 +21,7 @@ fn tiny_render_writes_all_outputs_and_is_finite() {
     let scene = load_scene_data(&config.data_dir, 0.0, 0.0).expect("scene data");
     let film = render(&scene, &config);
     assert!(film.values().iter().all(|x| x.is_finite() && *x >= 0.0));
+    assert_mirrored_pixels_match(&film, scene.bands.len());
     film.write_outputs(&config.out_dir, &scene.bands, config.png_exposure)
         .expect("write outputs");
 
@@ -33,5 +34,20 @@ fn tiny_render_writes_all_outputs_and_is_finite() {
                 .join(format!("sky_{:03.0}nm.exr", band.center_nm))
                 .exists()
         );
+    }
+}
+
+fn assert_mirrored_pixels_match(film: &sky_tracer::film::Film, band_count: usize) {
+    for y in 0..film.height() {
+        for x in 0..film.width() {
+            let mirror_x = film.width() - 1 - x;
+            let pixel = y * film.width() + x;
+            let mirror_pixel = y * film.width() + mirror_x;
+            for band in 0..band_count {
+                let a = film.pixel_spectrum(pixel)[band];
+                let b = film.pixel_spectrum(mirror_pixel)[band];
+                assert_eq!(a, b);
+            }
+        }
     }
 }

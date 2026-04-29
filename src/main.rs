@@ -25,6 +25,10 @@ struct Cli {
     sun_elevation_deg: f32,
     #[arg(long, default_value_t = 0.0)]
     sun_azimuth_deg: f32,
+    #[arg(long, default_value_t = 0.2)]
+    observer_altitude_km: f32,
+    #[arg(long)]
+    disable_symmetry: bool,
     #[arg(long, default_value_t = 16)]
     max_depth: usize,
     #[arg(long, default_value_t = 0.01)]
@@ -42,6 +46,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         data_dir: cli.data_dir,
         sun_elevation_deg: cli.sun_elevation_deg,
         sun_azimuth_deg: cli.sun_azimuth_deg,
+        observer_altitude_km: cli.observer_altitude_km,
+        use_azimuth_symmetry: !cli.disable_symmetry,
         max_depth: cli.max_depth,
         png_exposure: cli.png_exposure,
     };

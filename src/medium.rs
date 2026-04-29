@@ -104,21 +104,26 @@ fn interpolate_aerosol(profile: &[AerosolProfilePoint], altitude_km: f32) -> Aer
 
 fn bracket<T: Copy>(items: &[T], x: f32, key: impl Fn(T) -> f32) -> (T, T, f32) {
     assert!(!items.is_empty());
-    if x <= key(items[0]) {
+    let hi_idx = items.partition_point(|item| key(*item) < x);
+
+    if hi_idx == 0 {
         return (items[0], items[0], 0.0);
     }
-    for pair in items.windows(2) {
-        let a = pair[0];
-        let b = pair[1];
-        let ka = key(a);
-        let kb = key(b);
-        if x <= kb {
-            let t = if kb > ka { (x - ka) / (kb - ka) } else { 0.0 };
-            return (a, b, t.clamp(0.0, 1.0));
-        }
+    if hi_idx >= items.len() {
+        let last = items[items.len() - 1];
+        return (last, last, 0.0);
     }
-    let last = items[items.len() - 1];
-    (last, last, 0.0)
+
+    let lo = items[hi_idx - 1];
+    let hi = items[hi_idx];
+    let klo = key(lo);
+    let khi = key(hi);
+    let t = if khi > klo {
+        (x - klo) / (khi - klo)
+    } else {
+        0.0
+    };
+    (lo, hi, t.clamp(0.0, 1.0))
 }
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
