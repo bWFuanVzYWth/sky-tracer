@@ -14,7 +14,7 @@ use crate::medium::{MediumCoefficients, coefficients_at};
 use crate::phase::{PhaseFrame, ScalarPhase, ScatteringMode, rayleigh_phase};
 use crate::sampling::{
     SamplerState, cosine_hemisphere_pdf, direction_in_cone, sample_cosine_hemisphere,
-    sample_mie_phase, sample_rayleigh_phase, sample_uniform_cone,
+    sample_mie_phase, sample_rayleigh_phase, sample_uniform_cone, sample_uniform_cone_from,
 };
 use crate::spectrum::BAND_COUNT;
 
@@ -477,13 +477,9 @@ fn direct_sun_at_scatter(
     coeffs: MediumCoefficients,
     rng: &mut SamplerState,
 ) -> f32 {
-    let sample_count = config.direct_light_samples.max(1);
-    let mut sum = 0.0;
-    for _ in 0..sample_count {
-        let (sun_dir, pdf) =
-            sample_uniform_cone(scene.sun.direction, scene.sun.angular_radius_rad, rng);
+    average_sun_samples(scene, config, rng, |sun_dir, pdf, rng| {
         let Some(t_sun) = segment_to_sun_or_space(pos, sun_dir, scene.planet) else {
-            continue;
+            return 0.0;
         };
         let trans = estimate_transmittance(
             scene,
@@ -495,9 +491,8 @@ fn direct_sun_at_scatter(
         );
         let mu = view_dir.dot(sun_dir).clamp(-1.0, 1.0);
         let phase = direct_scattering_phase(scene, coeffs, band_index, mu, pdf);
-        sum += scene.solar_radiance_w_m2_sr(band_index) * trans * phase / pdf;
-    }
-    sum / sample_count as f32
+        scene.solar_radiance_w_m2_sr(band_index) * trans * phase / pdf
+    })
 }
 
 fn direct_scattering_phase(
@@ -541,17 +536,13 @@ fn ground_radiance(
     rng: &mut SamplerState,
 ) -> f32 {
     let n = surface_normal(pos);
-    let sample_count = config.direct_light_samples.max(1);
-    let mut sum = 0.0;
-    for _ in 0..sample_count {
-        let (sun_dir, pdf) =
-            sample_uniform_cone(scene.sun.direction, scene.sun.angular_radius_rad, rng);
+    average_sun_samples(scene, config, rng, |sun_dir, pdf, rng| {
         let cos_sun = n.dot(sun_dir).max(0.0);
         if cos_sun <= 0.0 {
-            continue;
+            return 0.0;
         }
         let Some(t_sun) = segment_to_sun_or_space(pos, sun_dir, scene.planet) else {
-            continue;
+            return 0.0;
         };
         let trans = estimate_transmittance(
             scene,
@@ -566,15 +557,53 @@ fn ground_radiance(
             GroundEstimator::DirectOnly => 1.0,
             GroundEstimator::LambertPath => balance_heuristic(pdf, bsdf_pdf),
         };
-        sum += GROUND_ALBEDO
-            * INV_PI
-            * scene.solar_radiance_w_m2_sr(band_index)
-            * trans
-            * cos_sun
-            * weight
-            / pdf;
+        GROUND_ALBEDO * INV_PI * scene.solar_radiance_w_m2_sr(band_index) * trans * cos_sun * weight
+            / pdf
+    })
+}
+
+fn average_sun_samples(
+    scene: &SceneData,
+    config: &RenderConfig,
+    rng: &mut SamplerState,
+    mut evaluate: impl FnMut(Vec3, f32, &mut SamplerState) -> f32,
+) -> f32 {
+    let sample_count = config.direct_light_samples.max(1);
+    let mut sum = 0.0;
+    let mut sample = 0;
+
+    while sample + 1 < sample_count {
+        let xi_theta = rng.next_f32();
+        let xi_phi = rng.next_f32();
+        let (sun_dir, pdf) = sample_uniform_cone_from(
+            scene.sun.direction,
+            scene.sun.angular_radius_rad,
+            xi_theta,
+            xi_phi,
+        );
+        sum += evaluate(sun_dir, pdf, rng);
+
+        let (sun_dir, pdf) = sample_uniform_cone_from(
+            scene.sun.direction,
+            scene.sun.angular_radius_rad,
+            1.0 - xi_theta,
+            fract01(xi_phi + 0.5),
+        );
+        sum += evaluate(sun_dir, pdf, rng);
+        sample += 2;
     }
+
+    if sample < sample_count {
+        let (sun_dir, pdf) =
+            sample_uniform_cone(scene.sun.direction, scene.sun.angular_radius_rad, rng);
+        sum += evaluate(sun_dir, pdf, rng);
+    }
+
     sum / sample_count as f32
+}
+
+fn fract01(x: f32) -> f32 {
+    x - x.floor()
 }
 
 fn choose_scattering_mode(coeffs: MediumCoefficients, rng: &mut SamplerState) -> ScatteringMode {

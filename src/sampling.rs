@@ -132,10 +132,19 @@ pub fn sample_mie_phase(
 }
 
 pub fn sample_uniform_cone(axis: Vec3, angular_radius: f32, rng: &mut SamplerState) -> (Vec3, f32) {
+    sample_uniform_cone_from(axis, angular_radius, rng.next_f32(), rng.next_f32())
+}
+
+pub fn sample_uniform_cone_from(
+    axis: Vec3,
+    angular_radius: f32,
+    xi_theta: f32,
+    xi_phi: f32,
+) -> (Vec3, f32) {
     let cos_max = angular_radius.cos();
-    let cos_theta = 1.0 - rng.next_f32() * (1.0 - cos_max);
+    let cos_theta = 1.0 - xi_theta.clamp(0.0, 1.0 - f32::EPSILON) * (1.0 - cos_max);
     let sin_theta = (1.0 - cos_theta * cos_theta).max(0.0).sqrt();
-    let phi = TAU * rng.next_f32();
+    let phi = TAU * fract01(xi_phi);
     let (t, b) = orthonormal_basis(axis);
     let local = t * (sin_theta * phi.cos()) + b * (sin_theta * phi.sin()) + axis * cos_theta;
     let pdf = 1.0 / (TAU * (1.0 - cos_max));
@@ -201,6 +210,11 @@ fn fract(x: f32) -> f32 {
     x - x.floor()
 }
 
+fn fract01(x: f32) -> f32 {
+    let f = x - x.floor();
+    if f >= 1.0 { 0.0 } else { f }
+}
+
 fn hash_to_unit_float(x: u64) -> f32 {
     ((x >> 40) as u32 as f32) * (1.0 / 16_777_216.0)
 }
@@ -222,6 +236,14 @@ mod tests {
         let mut rng = SamplerState::new(7);
         let axis = Vec3::Z;
         let (dir, pdf) = sample_uniform_cone(axis, 0.01, &mut rng);
+        assert!(direction_in_cone(dir, axis, 0.01));
+        assert!(pdf.is_finite() && pdf > 0.0);
+    }
+
+    #[test]
+    fn sun_cone_from_unit_square_contains_sampled_direction() {
+        let axis = Vec3::Z;
+        let (dir, pdf) = sample_uniform_cone_from(axis, 0.01, 0.25, 0.75);
         assert!(direction_in_cone(dir, axis, 0.01));
         assert!(pdf.is_finite() && pdf > 0.0);
     }
