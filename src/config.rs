@@ -33,6 +33,35 @@ impl FromStr for TransmittanceEstimator {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CollisionEstimator {
+    Analog,
+    Weighted,
+}
+
+impl Display for CollisionEstimator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Analog => write!(f, "analog"),
+            Self::Weighted => write!(f, "weighted"),
+        }
+    }
+}
+
+impl FromStr for CollisionEstimator {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "analog" | "roulette" | "absorption-roulette" => Ok(Self::Analog),
+            "weighted" | "weighted-absorption" | "survival-biasing" => Ok(Self::Weighted),
+            _ => Err(format!(
+                "unknown collision estimator `{s}`; expected `weighted` or `analog`"
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RenderConfig {
     pub width: usize,
@@ -47,6 +76,7 @@ pub struct RenderConfig {
     pub use_azimuth_symmetry: bool,
     pub sampler: SamplerKind,
     pub transmittance_estimator: TransmittanceEstimator,
+    pub collision_estimator: CollisionEstimator,
     pub max_depth: usize,
     pub png_exposure: f32,
 }
@@ -66,6 +96,7 @@ impl Default for RenderConfig {
             use_azimuth_symmetry: true,
             sampler: SamplerKind::RandomizedQmc,
             transmittance_estimator: TransmittanceEstimator::ResidualRatio,
+            collision_estimator: CollisionEstimator::Weighted,
             max_depth: 16,
             png_exposure: 0.01,
         }
@@ -87,5 +118,18 @@ mod tests {
             TransmittanceEstimator::Ratio
         );
         assert!("bad".parse::<TransmittanceEstimator>().is_err());
+    }
+
+    #[test]
+    fn collision_estimator_parses_cli_names() {
+        assert_eq!(
+            "weighted".parse::<CollisionEstimator>().unwrap(),
+            CollisionEstimator::Weighted
+        );
+        assert_eq!(
+            "analog".parse::<CollisionEstimator>().unwrap(),
+            CollisionEstimator::Analog
+        );
+        assert!("bad".parse::<CollisionEstimator>().is_err());
     }
 }

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use sky_tracer::config::{RenderConfig, TransmittanceEstimator};
+use sky_tracer::config::{CollisionEstimator, RenderConfig, TransmittanceEstimator};
 use sky_tracer::data::load_scene_data;
 use sky_tracer::integrator::{can_use_azimuth_symmetry, render};
 use sky_tracer::sampling::SamplerKind;
@@ -35,6 +35,8 @@ struct Cli {
     sampler: SamplerKind,
     #[arg(long, default_value = "residual")]
     transmittance_estimator: TransmittanceEstimator,
+    #[arg(long, default_value = "weighted")]
+    collision_estimator: CollisionEstimator,
     #[arg(long, default_value_t = 16)]
     max_depth: usize,
     #[arg(long, default_value_t = 0.01)]
@@ -57,6 +59,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         use_azimuth_symmetry: !cli.disable_symmetry,
         sampler: cli.sampler,
         transmittance_estimator: cli.transmittance_estimator,
+        collision_estimator: cli.collision_estimator,
         max_depth: cli.max_depth,
         png_exposure: cli.png_exposure,
     };
@@ -70,9 +73,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let load_elapsed = load_start.elapsed();
 
     println!(
-        "config: sampler={} transmittance={} symmetry={}",
+        "config: sampler={} transmittance={} collision={} symmetry={}",
         config.sampler,
         config.transmittance_estimator,
+        config.collision_estimator,
         can_use_azimuth_symmetry(&config)
     );
 

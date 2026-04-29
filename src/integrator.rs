@@ -1,7 +1,7 @@
 use rayon::prelude::*;
 
 use crate::atmosphere::{GROUND_ALBEDO, SPECIES_COUNT, SceneData};
-use crate::config::{RenderConfig, TransmittanceEstimator};
+use crate::config::{CollisionEstimator, RenderConfig, TransmittanceEstimator};
 use crate::film::Film;
 use crate::geometry::{
     BoundaryKind, RAY_EPSILON_KM, altitude_km, intersect_sphere, next_boundary,
@@ -152,7 +152,8 @@ pub fn trace_band(
                     break;
                 }
 
-                if rng.next_f32() > scattering / extinction {
+                let albedo = (scattering / extinction).clamp(0.0, 1.0);
+                if !survive_collision(config.collision_estimator, albedo, &mut throughput, rng) {
                     break;
                 }
 
@@ -202,6 +203,21 @@ pub fn trace_band(
     }
 
     radiance.max(0.0)
+}
+
+fn survive_collision(
+    estimator: CollisionEstimator,
+    albedo: f32,
+    throughput: &mut f32,
+    rng: &mut SamplerState,
+) -> bool {
+    match estimator {
+        CollisionEstimator::Analog => rng.next_f32() <= albedo,
+        CollisionEstimator::Weighted => {
+            *throughput *= albedo;
+            *throughput > 0.0
+        }
+    }
 }
 
 fn sample_real_collision(
@@ -551,5 +567,25 @@ mod tests {
     fn balance_heuristic_splits_equal_pdfs() {
         assert!((balance_heuristic(2.0, 2.0) - 0.5).abs() < 1.0e-6);
         assert_eq!(balance_heuristic(0.0, 2.0), 0.0);
+    }
+
+    #[test]
+    fn weighted_collision_uses_albedo_as_throughput() {
+        let mut rng = SamplerState::new(3);
+        let mut throughput = 2.0;
+        assert!(survive_collision(
+            CollisionEstimator::Weighted,
+            0.25,
+            &mut throughput,
+            &mut rng
+        ));
+        assert!((throughput - 0.5).abs() < 1.0e-6);
+
+        assert!(!survive_collision(
+            CollisionEstimator::Analog,
+            0.0,
+            &mut throughput,
+            &mut rng
+        ));
     }
 }
