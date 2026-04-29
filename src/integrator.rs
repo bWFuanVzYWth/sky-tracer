@@ -1,7 +1,9 @@
 use rayon::prelude::*;
 
 use crate::atmosphere::{GROUND_ALBEDO, SPECIES_COUNT, SceneData};
-use crate::config::{CollisionEstimator, RenderConfig, TransmittanceEstimator};
+use crate::config::{
+    CollisionEstimator, RenderConfig, SpectralCorrelation, TransmittanceEstimator,
+};
 use crate::film::Film;
 use crate::geometry::{
     BoundaryKind, RAY_EPSILON_KM, altitude_km, intersect_sphere, next_boundary,
@@ -81,7 +83,7 @@ fn render_pixel(scene: &SceneData, config: &RenderConfig, x: usize, y: usize) ->
         let v = (y as f32 + rng.next_f32()) / config.height as f32;
         let ray = camera_ray(scene, config, u, v);
         for (band, value) in sum.iter_mut().enumerate() {
-            let mut band_rng = rng.fork((sample as u64) << 32 ^ band as u64);
+            let mut band_rng = rng.fork(band_stream(config.spectral_correlation, sample, band));
             *value += trace_band(scene, config, ray, band, &mut band_rng);
         }
     }
@@ -91,6 +93,13 @@ fn render_pixel(scene: &SceneData, config: &RenderConfig, x: usize, y: usize) ->
         *value = (*value * inv_spp).max(0.0);
     }
     sum
+}
+
+fn band_stream(correlation: SpectralCorrelation, sample: usize, band: usize) -> u64 {
+    match correlation {
+        SpectralCorrelation::Common => (sample as u64) << 32,
+        SpectralCorrelation::Independent => ((sample as u64) << 32) ^ band as u64,
+    }
 }
 
 pub fn camera_ray(scene: &SceneData, config: &RenderConfig, u: f32, v: f32) -> Ray {
@@ -587,5 +596,17 @@ mod tests {
             &mut throughput,
             &mut rng
         ));
+    }
+
+    #[test]
+    fn spectral_band_streams_can_share_random_numbers() {
+        assert_eq!(
+            band_stream(SpectralCorrelation::Common, 7, 0),
+            band_stream(SpectralCorrelation::Common, 7, 3)
+        );
+        assert_ne!(
+            band_stream(SpectralCorrelation::Independent, 7, 0),
+            band_stream(SpectralCorrelation::Independent, 7, 3)
+        );
     }
 }

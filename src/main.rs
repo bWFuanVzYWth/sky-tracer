@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use sky_tracer::config::{CollisionEstimator, RenderConfig, TransmittanceEstimator};
+use sky_tracer::config::{
+    CollisionEstimator, RenderConfig, SpectralCorrelation, TransmittanceEstimator,
+};
 use sky_tracer::data::load_scene_data;
 use sky_tracer::integrator::{can_use_azimuth_symmetry, render};
 use sky_tracer::sampling::SamplerKind;
@@ -37,6 +39,8 @@ struct Cli {
     transmittance_estimator: TransmittanceEstimator,
     #[arg(long, default_value = "weighted")]
     collision_estimator: CollisionEstimator,
+    #[arg(long, default_value = "common")]
+    spectral_correlation: SpectralCorrelation,
     #[arg(long, default_value_t = 16)]
     max_depth: usize,
     #[arg(long, default_value_t = 0.01)]
@@ -60,6 +64,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         sampler: cli.sampler,
         transmittance_estimator: cli.transmittance_estimator,
         collision_estimator: cli.collision_estimator,
+        spectral_correlation: cli.spectral_correlation,
         max_depth: cli.max_depth,
         png_exposure: cli.png_exposure,
     };
@@ -73,10 +78,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let load_elapsed = load_start.elapsed();
 
     println!(
-        "config: sampler={} transmittance={} collision={} symmetry={}",
+        "config: sampler={} transmittance={} collision={} spectral-correlation={} symmetry={}",
         config.sampler,
         config.transmittance_estimator,
         config.collision_estimator,
+        config.spectral_correlation,
         can_use_azimuth_symmetry(&config)
     );
 

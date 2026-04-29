@@ -62,6 +62,35 @@ impl FromStr for CollisionEstimator {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpectralCorrelation {
+    Common,
+    Independent,
+}
+
+impl Display for SpectralCorrelation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Common => write!(f, "common"),
+            Self::Independent => write!(f, "independent"),
+        }
+    }
+}
+
+impl FromStr for SpectralCorrelation {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "common" | "crn" | "common-random" | "common-random-numbers" => Ok(Self::Common),
+            "independent" | "decorrelated" => Ok(Self::Independent),
+            _ => Err(format!(
+                "unknown spectral correlation `{s}`; expected `common` or `independent`"
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RenderConfig {
     pub width: usize,
@@ -77,6 +106,7 @@ pub struct RenderConfig {
     pub sampler: SamplerKind,
     pub transmittance_estimator: TransmittanceEstimator,
     pub collision_estimator: CollisionEstimator,
+    pub spectral_correlation: SpectralCorrelation,
     pub max_depth: usize,
     pub png_exposure: f32,
 }
@@ -97,6 +127,7 @@ impl Default for RenderConfig {
             sampler: SamplerKind::RandomizedQmc,
             transmittance_estimator: TransmittanceEstimator::ResidualRatio,
             collision_estimator: CollisionEstimator::Weighted,
+            spectral_correlation: SpectralCorrelation::Common,
             max_depth: 16,
             png_exposure: 0.01,
         }
@@ -131,5 +162,18 @@ mod tests {
             CollisionEstimator::Analog
         );
         assert!("bad".parse::<CollisionEstimator>().is_err());
+    }
+
+    #[test]
+    fn spectral_correlation_parses_cli_names() {
+        assert_eq!(
+            "common".parse::<SpectralCorrelation>().unwrap(),
+            SpectralCorrelation::Common
+        );
+        assert_eq!(
+            "independent".parse::<SpectralCorrelation>().unwrap(),
+            SpectralCorrelation::Independent
+        );
+        assert!("bad".parse::<SpectralCorrelation>().is_err());
     }
 }
