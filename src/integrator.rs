@@ -246,22 +246,36 @@ pub fn estimate_transmittance_ratio(
     let mut t = 0.0;
     let mut weight = 1.0_f32;
     while t < t_max {
+        let segment_start = t;
         let segment_end = next_majorant_segment_end(scene, ray, t, t_max);
-        let majorant = segment_majorant(scene, ray, t, segment_end, band_index);
-        while t < segment_end {
-            let u = (1.0 - rng.next_f32()).max(1.0e-7);
-            t += -u.ln() / majorant;
-            if t >= segment_end {
-                break;
-            }
-            let coeffs = coefficients_at(scene, ray.at(t), band_index);
-            debug_assert!(
-                coeffs.extinction_total() <= majorant * 1.001,
-                "layer majorant underestimates extinction"
-            );
-            weight *= (1.0 - coeffs.extinction_total() / majorant).clamp(0.0, 1.0);
-            if weight <= 0.0 {
-                return 0.0;
+        let (minorant, majorant) =
+            segment_extinction_bounds(scene, ray, t, segment_end, band_index);
+        let control = minorant.min(majorant);
+        weight *= (-control * (segment_end - segment_start)).exp();
+
+        let residual_majorant = (majorant - control).max(0.0);
+        if residual_majorant > 1.0e-8 {
+            while t < segment_end {
+                let u = (1.0 - rng.next_f32()).max(1.0e-7);
+                t += -u.ln() / residual_majorant;
+                if t >= segment_end {
+                    break;
+                }
+                let coeffs = coefficients_at(scene, ray.at(t), band_index);
+                let extinction = coeffs.extinction_total();
+                debug_assert!(
+                    extinction <= majorant * 1.001,
+                    "layer majorant underestimates extinction"
+                );
+                debug_assert!(
+                    extinction + 1.0e-7 >= control,
+                    "layer minorant overestimates extinction"
+                );
+                let residual_extinction = (extinction - control).clamp(0.0, residual_majorant);
+                weight *= (1.0 - residual_extinction / residual_majorant).clamp(0.0, 1.0);
+                if weight <= 0.0 {
+                    return 0.0;
+                }
             }
         }
         t = segment_end;
@@ -270,13 +284,28 @@ pub fn estimate_transmittance_ratio(
 }
 
 fn segment_majorant(scene: &SceneData, ray: Ray, t0: f32, t1: f32, band_index: usize) -> f32 {
+    segment_extinction_bounds(scene, ray, t0, t1, band_index).1
+}
+
+fn segment_extinction_bounds(
+    scene: &SceneData,
+    ray: Ray,
+    t0: f32,
+    t1: f32,
+    band_index: usize,
+) -> (f32, f32) {
     let (min_altitude, max_altitude) = segment_altitude_range(scene, ray, t0, t1);
     let min_layer = scene.majorant_grid.layer_for_altitude(min_altitude);
     let max_layer = scene.majorant_grid.layer_for_altitude(max_altitude);
-    (min_layer..=max_layer)
+    let minorant = (min_layer..=max_layer)
+        .map(|layer| scene.majorant_grid.minorant(band_index, layer))
+        .fold(f32::INFINITY, f32::min)
+        .max(0.0);
+    let majorant = (min_layer..=max_layer)
         .map(|layer| scene.majorant_grid.get(band_index, layer))
         .fold(0.0, f32::max)
-        .max(1.0e-8)
+        .max(1.0e-8);
+    (minorant.min(majorant), majorant)
 }
 
 fn next_majorant_segment_end(scene: &SceneData, ray: Ray, t: f32, t_max: f32) -> f32 {

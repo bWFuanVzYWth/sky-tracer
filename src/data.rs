@@ -250,9 +250,14 @@ mod tests {
                     crate::medium::coefficients_at(&scene, pos, band).extinction_total();
                 let layer = scene.majorant_grid.layer_for_altitude(altitude);
                 let majorant = scene.majorant_grid.get(band, layer);
+                let minorant = scene.majorant_grid.minorant(band, layer);
                 assert!(
                     extinction <= majorant * 1.001,
                     "band={band} altitude={altitude} extinction={extinction} majorant={majorant}"
+                );
+                assert!(
+                    minorant <= extinction * 1.001 + 1.0e-8,
+                    "band={band} altitude={altitude} extinction={extinction} minorant={minorant}"
                 );
             }
         }

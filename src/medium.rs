@@ -68,12 +68,17 @@ pub fn compute_majorant_grid(scene: &SceneData, layer_count: usize) -> MajorantG
     for band_index in 0..scene.bands.len() {
         for layer in 0..layer_count {
             let (lo, hi) = grid.layer_bounds_km(layer);
+            let mut min_ext = f32::INFINITY;
             let mut max_ext: f32 = 0.0;
             for altitude in majorant_probe_altitudes(scene, lo, hi) {
                 let pos = Vec3::new(0.0, scene.planet.ground_radius_km + altitude, 0.0);
-                max_ext = max_ext.max(coefficients_at(scene, pos, band_index).extinction_total());
+                let extinction = coefficients_at(scene, pos, band_index).extinction_total();
+                min_ext = min_ext.min(extinction);
+                max_ext = max_ext.max(extinction);
             }
-            grid.set(band_index, layer, (max_ext * 1.01).max(1.0e-8));
+            let majorant = (max_ext * 1.01).max(1.0e-8);
+            let minorant = (min_ext.max(0.0) * 0.99).min(majorant);
+            grid.set_bounds(band_index, layer, minorant, majorant);
         }
     }
     grid

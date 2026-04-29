@@ -62,6 +62,7 @@ pub struct MajorantGrid {
     pub layer_count: usize,
     pub band_count: usize,
     pub values_km_inv: Vec<f32>,
+    pub minorants_km_inv: Vec<f32>,
 }
 
 impl MajorantGrid {
@@ -71,6 +72,7 @@ impl MajorantGrid {
             layer_count,
             band_count,
             values_km_inv: vec![0.0; layer_count * band_count],
+            minorants_km_inv: vec![0.0; layer_count * band_count],
         }
     }
 
@@ -94,8 +96,18 @@ impl MajorantGrid {
         self.values_km_inv[band_index * self.layer_count + layer]
     }
 
+    pub fn minorant(&self, band_index: usize, layer: usize) -> f32 {
+        self.minorants_km_inv[band_index * self.layer_count + layer]
+    }
+
     pub fn set(&mut self, band_index: usize, layer: usize, value: f32) {
         self.values_km_inv[band_index * self.layer_count + layer] = value;
+    }
+
+    pub fn set_bounds(&mut self, band_index: usize, layer: usize, minorant: f32, majorant: f32) {
+        let idx = band_index * self.layer_count + layer;
+        self.minorants_km_inv[idx] = minorant.clamp(0.0, majorant.max(0.0));
+        self.values_km_inv[idx] = majorant.max(self.minorants_km_inv[idx]);
     }
 
     pub fn global_for_band(&self, band_index: usize) -> f32 {
