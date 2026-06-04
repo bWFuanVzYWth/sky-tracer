@@ -18,7 +18,8 @@ struct VertexOutput {
 
 const AP_SLICE_COUNT: f32 = 32.0;
 const AP_KM_PER_SLICE: f32 = 4.0;
-const AP_REC2020_WHITE_FROM_FLAT_SPECTRUM: vec3<f32> = vec3<f32>(121.2, 107.3, 141.3);
+const AP_REC2020_WHITE_FROM_FLAT_SPECTRUM: vec3<f32> =
+    vec3<f32>(128.416, 108.538, 131.305);
 
 @vertex
 fn vertex(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
@@ -38,7 +39,7 @@ fn linear_rec2020_from_spectral(l: vec4<f32>) -> vec3<f32> {
         vec3<f32>(-11.823, 29.205, 29.153),
         vec3<f32>(6.811, -8.283, 104.377),
     );
-    return (m * l) * vec3<f32>(0.9441, 0.9888, 1.0761);
+    return m * l;
 }
 
 fn rec2020_transmittance_from_spectral(t: vec4<f32>) -> vec3<f32> {

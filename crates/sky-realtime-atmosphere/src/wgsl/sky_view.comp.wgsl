@@ -36,7 +36,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         ray.dir,
         segment.t_max_km,
     );
-    let rec2020 = max(linear_rec2020_from_spectral(scatter.radiance), vec3<f32>(0.0));
+    let rec2020 = max(
+        white_balanced_linear_rec2020_from_spectral(scatter.radiance),
+        vec3<f32>(0.0),
+    );
     textureStore(
         sky_view_out,
         vec2<i32>(i32(gid.x), i32(gid.y)),

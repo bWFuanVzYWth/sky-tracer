@@ -370,6 +370,7 @@ const fn voxel_lighting_params(params: HillaireParamsGpu) -> VoxelAtmosphereLigh
         sun_dir: params.sun_dir,
         pad1: 0.0,
         sun_spectral_irradiance: params.sun_spectral_irradiance,
+        ground_albedo_spectral: params.ground_albedo_spectral,
     }
 }
 

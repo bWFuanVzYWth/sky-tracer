@@ -17,6 +17,8 @@ struct VertexOutput {
 @group(1) @binding(4) var<uniform> sun: CaSun;
 @group(1) @binding(5) var<uniform> atmosphere: VoxelAtmosphereLighting;
 
+const SKY_GROUND_INV_PI: f32 = 0.31830988618379067154;
+
 @vertex
 fn vertex(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     let u = f32((vertex_index << 1u) & 2u);
@@ -37,6 +39,70 @@ fn sky_view_radiance(dir: vec3<f32>) -> vec3<f32> {
 fn sky_ray_above_ground(dir: vec3<f32>) -> bool {
     let origin = vec3<f32>(0.0, ca_sky_view_height_km(sky_params), 0.0);
     return ca_sky_ray_sphere_intersection(origin, normalize(dir), sky_params.earth_radius_km) < 0.0;
+}
+
+fn ground_direct_radiance(dir_in: vec3<f32>) -> vec3<f32> {
+    let dir = normalize(dir_in);
+    let eye_radius_km = ca_sky_view_height_km(sky_params);
+    let eye_pos_km = vec3<f32>(0.0, eye_radius_km, 0.0);
+    let t_ground_km = ca_sky_ray_sphere_intersection(
+        eye_pos_km,
+        dir,
+        sky_params.earth_radius_km,
+    );
+    if (t_ground_km < 0.0) {
+        return vec3<f32>(0.0);
+    }
+
+    let ground_pos_km = eye_pos_km + dir * t_ground_km;
+    let ground_normal = normalize(ground_pos_km);
+    let sun_cos = max(dot(ground_normal, sky_params.sun_dir), 0.0);
+    let eye_cos = max(dot(ground_normal, -dir), 0.0);
+    if (sun_cos <= 0.0 || eye_cos <= 0.0) {
+        return vec3<f32>(0.0);
+    }
+
+    let eye_normalized_altitude = clamp(
+        sky_params.eye_altitude_km / sky_params.atmosphere_thickness_km,
+        0.0,
+        1.0,
+    );
+    let ground_to_top = ca_atmosphere_transmittance_from_lut(
+        transmittance_lut,
+        lut_sampler,
+        atmosphere,
+        eye_cos,
+        0.0,
+    );
+    let eye_to_top = ca_atmosphere_transmittance_from_lut(
+        transmittance_lut,
+        lut_sampler,
+        atmosphere,
+        max(-dir.y, 0.0),
+        eye_normalized_altitude,
+    );
+    let view_transmittance = clamp(
+        ground_to_top / max(eye_to_top, vec4<f32>(1.0e-6)),
+        vec4<f32>(0.0),
+        vec4<f32>(1.0),
+    );
+    let sun_transmittance = ca_atmosphere_transmittance_from_lut(
+        transmittance_lut,
+        lut_sampler,
+        atmosphere,
+        sun_cos,
+        0.0,
+    );
+    let ground_spectral = atmosphere.sun_spectral_irradiance
+        * sun_transmittance
+        * atmosphere.ground_albedo_spectral
+        * (sun_cos * SKY_GROUND_INV_PI);
+    return max(
+        ca_atmosphere_white_balanced_linear_rec2020_from_spectral(
+            ground_spectral * view_transmittance,
+        ),
+        vec3<f32>(0.0),
+    );
 }
 
 fn sun_transmittance_at_view(direction: vec3<f32>) -> vec3<f32> {
@@ -68,6 +134,8 @@ fn fragment(vertex_out: VertexOutput) -> @location(0) vec4<f32> {
     if (sky_ray_above_ground(world_dir)) {
         let transmittance = sun_transmittance_at_view(world_dir);
         rgb += ca_sun_disk_eval(sun, world_dir, transmittance);
+    } else {
+        rgb += ground_direct_radiance(world_dir);
     }
 
     return vec4<f32>(rgb, 1.0);

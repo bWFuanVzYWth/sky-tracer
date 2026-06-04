@@ -6,6 +6,7 @@ struct VoxelAtmosphereLighting {
     sun_dir: vec3<f32>,
     _pad1: f32,
     sun_spectral_irradiance: vec4<f32>,
+    ground_albedo_spectral: vec4<f32>,
 }
 
 fn ca_atmosphere_linear_rec2020_from_spectral(l: vec4<f32>) -> vec3<f32> {
@@ -15,7 +16,17 @@ fn ca_atmosphere_linear_rec2020_from_spectral(l: vec4<f32>) -> vec3<f32> {
         vec3<f32>(-11.823, 29.205, 29.153),
         vec3<f32>(6.811, -8.283, 104.377),
     );
-    return (m * l) * vec3<f32>(0.9441, 0.9888, 1.0761);
+    return m * l;
+}
+
+fn ca_atmosphere_white_balance_rec2020(rgb: vec3<f32>) -> vec3<f32> {
+    return rgb * vec3<f32>(0.9441, 0.9888, 1.0761);
+}
+
+fn ca_atmosphere_white_balanced_linear_rec2020_from_spectral(l: vec4<f32>) -> vec3<f32> {
+    return ca_atmosphere_white_balance_rec2020(
+        ca_atmosphere_linear_rec2020_from_spectral(l),
+    );
 }
 
 fn ca_atmosphere_transmittance_uv(

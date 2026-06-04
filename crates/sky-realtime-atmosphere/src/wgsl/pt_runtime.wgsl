@@ -17,7 +17,7 @@ const PT_AP_SLICE_COUNT: f32 = 32.0;
 const PT_AP_KM_PER_SLICE: f32 = 4.0;
 const PT_M_TO_KM: f32 = 1.0e-3;
 const PT_AP_REC2020_WHITE_FROM_FLAT_SPECTRUM: vec3<f32> =
-    vec3<f32>(121.2, 107.3, 141.3);
+    vec3<f32>(128.416, 108.538, 131.305);
 
 fn pt_rec2020_transmittance_from_spectral(t: vec4<f32>) -> vec3<f32> {
     let rgb = linear_rec2020_from_spectral(t);
@@ -101,7 +101,7 @@ fn sky_radiance_at(origin: AtmPoint, dir: vec3<f32>) -> vec3<f32> {
         ray.dir,
         segment.t_max_km,
     );
-    let rgb = linear_rec2020_from_spectral(scatter.radiance);
+    let rgb = white_balanced_linear_rec2020_from_spectral(scatter.radiance);
     return max(rgb, vec3<f32>(0.0));
 }
 

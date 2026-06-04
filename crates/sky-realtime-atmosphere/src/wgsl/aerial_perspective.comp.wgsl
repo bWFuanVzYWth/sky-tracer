@@ -32,7 +32,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let distance_km = slice * slice * 32.0 * AP_KM_PER_SLICE;
     let origin = vec3<f32>(0.0, hp.eye_distance_to_earth_center_km, 0.0);
     let result = compute_inscattering(transmittance_lut, lut_sampler, origin, world_dir, distance_km);
-    let inscatter_rgb = linear_rec2020_from_spectral(result.radiance);
+    let inscatter_rgb = white_balanced_linear_rec2020_from_spectral(result.radiance);
 
     textureStore(ap_inscatter_out, vec3<i32>(id), vec4<f32>(inscatter_rgb, 1.0));
     textureStore(ap_transmittance_out, vec3<i32>(id), clamp(result.transmittance, vec4<f32>(0.0), vec4<f32>(1.0)));

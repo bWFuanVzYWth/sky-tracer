@@ -29,6 +29,7 @@ pub struct VoxelAtmosphereLightingGpu {
     pub sun_dir: [f32; 3],
     pub pad1: f32,
     pub sun_spectral_irradiance: [f32; 4],
+    pub ground_albedo_spectral: [f32; 4],
 }
 
 impl VoxelAtmosphereLightingGpu {
@@ -94,4 +95,4 @@ pub fn voxel_atmosphere_lighting_bind_group_layout(device: &wgpu::Device) -> wgp
     })
 }
 
-const _: () = assert!(core::mem::size_of::<VoxelAtmosphereLightingGpu>() == 48);
+const _: () = assert!(core::mem::size_of::<VoxelAtmosphereLightingGpu>() == 64);

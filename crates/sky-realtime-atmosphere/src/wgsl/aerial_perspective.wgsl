@@ -2,7 +2,7 @@ const CA_AP_SLICE_COUNT: f32 = 32.0;
 const CA_AP_KM_PER_SLICE: f32 = 4.0;
 const CA_AP_M_TO_KM: f32 = 1.0e-3;
 const CA_AP_REC2020_WHITE_FROM_FLAT_SPECTRUM: vec3<f32> =
-    vec3<f32>(121.2, 107.3, 141.3);
+    vec3<f32>(128.416, 108.538, 131.305);
 
 fn ca_ap_rec2020_transmittance_from_spectral(t: vec4<f32>) -> vec3<f32> {
     let rgb = ca_atmosphere_linear_rec2020_from_spectral(t);

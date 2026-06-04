@@ -236,13 +236,14 @@ fn get_multiple_scattering_analytical(
     let t_to_ground = transmittance_from_lut(transmittance_lut, samp, cos_theta, 0.0);
     let t_ground_to_sample = ground_up_transmittance
         / max(transmittance_from_lut(transmittance_lut, samp, 1.0, normalized_height), vec4<f32>(1.0e-6));
+    let ground_sun_cos = max(cos_theta, 0.0);
 
     let l_ground = ATM_PHASE_ISOTROPIC
         * omega
         * (hp.ground_albedo_spectral * ATM_INV_PI)
         * t_to_ground
         * t_ground_to_sample
-        * cos_theta;
+        * ground_sun_cos;
     let l_ms = 0.02 * vec4<f32>(0.217, 0.347, 0.594, 1.0)
         * (1.0 / (1.0 + 5.0 * exp(-17.92 * cos_theta)));
 
@@ -274,7 +275,15 @@ fn linear_rec2020_from_spectral(l: vec4<f32>) -> vec3<f32> {
         vec3<f32>(-11.823, 29.205, 29.153),
         vec3<f32>(6.811, -8.283, 104.377),
     );
-    return (m * l) * vec3<f32>(0.9441, 0.9888, 1.0761);
+    return m * l;
+}
+
+fn white_balance_rec2020(rgb: vec3<f32>) -> vec3<f32> {
+    return rgb * vec3<f32>(0.9441, 0.9888, 1.0761);
+}
+
+fn white_balanced_linear_rec2020_from_spectral(l: vec4<f32>) -> vec3<f32> {
+    return white_balance_rec2020(linear_rec2020_from_spectral(l));
 }
 
 fn atm_from_unit_to_sub_uvs(u: f32, resolution: f32) -> f32 {
