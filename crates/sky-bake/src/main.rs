@@ -1,11 +1,14 @@
 use std::error::Error;
+use std::fs::File;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use sky_tracer::config::RenderConfig;
-use sky_tracer::data::load_scene_data;
-use sky_tracer::integrator::render;
+use sky_core::asset::{SpectralAssetFiles, SpectralAssetManifest};
+use sky_core::atmosphere::SceneData;
+use sky_core::data::load_scene_data;
+use sky_offline::config::RenderConfig;
+use sky_offline::integrator::render;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Offline spectral OPAC atmosphere path tracer")]
@@ -28,7 +31,7 @@ struct Cli {
     sun_azimuth_deg: f32,
     #[arg(long, default_value_t = 0.2)]
     observer_altitude_km: f32,
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, default_value_t = 1)]
     direct_light_samples: usize,
     #[arg(long, default_value_t = 0.01)]
     png_exposure: f32,
@@ -70,6 +73,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let output_start = Instant::now();
     film.write_outputs(&config.out_dir, &scene.bands, config.png_exposure)?;
+    write_asset_manifest(&config, &scene)?;
     let output_elapsed = output_start.elapsed();
     let total_elapsed = total_start.elapsed();
 
@@ -87,6 +91,33 @@ fn main() -> Result<(), Box<dyn Error>> {
         format_duration(output_elapsed),
         format_duration(total_elapsed)
     );
+    Ok(())
+}
+
+fn write_asset_manifest(config: &RenderConfig, scene: &SceneData) -> Result<(), Box<dyn Error>> {
+    let band_exrs = scene
+        .bands
+        .iter()
+        .map(|band| format!("bands/sky_{:03.0}nm.exr", band.center_nm))
+        .collect();
+    let files = SpectralAssetFiles {
+        rgb_exr: "sky_rgb.exr".to_owned(),
+        rgb_png: "sky_rgb.png".to_owned(),
+        band_exrs,
+    };
+    let manifest = SpectralAssetManifest::spectral_panorama(
+        [config.width, config.height],
+        config.spp,
+        config.seed,
+        config.sun_elevation_deg,
+        config.sun_azimuth_deg,
+        config.observer_altitude_km,
+        scene.bands.iter().map(|band| band.center_nm).collect(),
+        files,
+    );
+    let path = config.out_dir.join("asset.json");
+    let file = File::create(path)?;
+    serde_json::to_writer_pretty(file, &manifest)?;
     Ok(())
 }
 

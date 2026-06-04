@@ -1,0 +1,12 @@
+[package]
+name = "sky-offline"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bytemuck = { workspace = true }
+exr = { workspace = true }
+image = { workspace = true }
+pollster = { workspace = true }
+sky-core = { path = "../sky-core" }
+wgpu = { workspace = true }

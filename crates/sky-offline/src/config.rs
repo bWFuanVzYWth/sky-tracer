@@ -27,7 +27,7 @@ impl Default for RenderConfig {
             sun_elevation_deg: 0.0,
             sun_azimuth_deg: 0.0,
             observer_altitude_km: 0.2,
-            direct_light_samples: 2,
+            direct_light_samples: 1,
             png_exposure: 0.01,
         }
     }

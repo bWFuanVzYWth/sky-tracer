@@ -5,8 +5,8 @@ use std::path::Path;
 use exr::prelude::write_rgb_file;
 use image::{ImageBuffer, RgbImage};
 
-use crate::math::{Rgb, clamp01};
-use crate::spectrum::{SpectralBand, spectral_to_linear_srgb};
+use sky_core::math::{Rgb, clamp01};
+use sky_core::spectrum::{SpectralBand, spectral_to_linear_srgb};
 
 #[derive(Clone, Debug)]
 pub struct Film {
@@ -23,6 +23,16 @@ impl Film {
             height,
             band_count,
             values: vec![0.0; width * height * band_count],
+        }
+    }
+
+    pub fn from_values(width: usize, height: usize, band_count: usize, values: Vec<f32>) -> Self {
+        assert_eq!(values.len(), width * height * band_count);
+        Self {
+            width,
+            height,
+            band_count,
+            values,
         }
     }
 

@@ -16,8 +16,8 @@ struct Constants {
     direct_light_samples: u32,
     sample_offset: u32,
     samples_this_dispatch: u32,
-    tile_y: u32,
-    tile_height: u32,
+    _pad_tile0: u32,
+    _pad_tile1: u32,
     atmosphere_len: u32,
     aerosol_len: u32,
     majorant_layers: u32,
@@ -474,15 +474,18 @@ fn rayleigh_phase(mu: f32) -> f32 {
     return 3.0 / (16.0 * PI) * (1.0 + mu * mu);
 }
 
+fn phase_index(species: u32, band: u32, bin: u32) -> u32 {
+    return (species * BAND_COUNT + band) * constants.phase_bins + bin;
+}
+
 fn mie_phase(species: u32, band: u32, mu: f32) -> f32 {
     let u = pow((1.0 - clamp(mu, -1.0, 1.0)) * 0.5, 0.3333333333333333);
     let f = u * f32(constants.phase_bins) - 0.5;
     let i0 = min(u32(clamp(floor(f), 0.0, f32(constants.phase_bins - 1u))), constants.phase_bins - 1u);
     let i1 = min(i0 + 1u, constants.phase_bins - 1u);
     let t = clamp(f - f32(i0), 0.0, 1.0);
-    let base = (species * BAND_COUNT + band) * constants.phase_bins;
-    let p0 = phase_values[base + i0];
-    let p1 = phase_values[base + i1];
+    let p0 = phase_values[phase_index(species, band, i0)];
+    let p1 = phase_values[phase_index(species, band, i1)];
     return max(lerp(p0, p1, t), 0.0);
 }
 
@@ -703,9 +706,9 @@ fn trace_path(initial_ray: Ray, band: u32, rng: ptr<function, Rng>) -> TraceResu
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) id: vec3u) {
     let x = id.x;
-    let y = id.y + constants.tile_y;
+    let y = id.y;
     let band = id.z;
-    if x >= constants.width || id.y >= constants.tile_height || y >= constants.height || band >= BAND_COUNT {
+    if x >= constants.width || y >= constants.height || band >= BAND_COUNT {
         return;
     }
 

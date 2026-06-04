@@ -6,14 +6,14 @@ use std::sync::mpsc;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::atmosphere::{PHASE_BINS, SPECIES_COUNT, SceneData};
 use crate::config::RenderConfig;
 use crate::film::Film;
-use crate::spectrum::BAND_COUNT;
+use sky_core::atmosphere::{PHASE_BINS, SPECIES_COUNT, SceneData};
+use sky_core::spectrum::BAND_COUNT;
 
 const WATCHDOG_LIMIT: u32 = 1024;
-const SAMPLES_PER_DISPATCH: u32 = 1;
-const TILE_HEIGHT: usize = 32;
+const SAMPLES_PER_DISPATCH: u32 = 2;
+const SUBMITS_BEFORE_WAIT: u32 = 8;
 
 #[derive(Debug)]
 pub enum RenderError {
@@ -49,8 +49,8 @@ struct GpuConstants {
     direct_light_samples: u32,
     sample_offset: u32,
     samples_this_dispatch: u32,
-    tile_y: u32,
-    tile_height: u32,
+    _pad_tile0: u32,
+    _pad_tile1: u32,
     atmosphere_len: u32,
     aerosol_len: u32,
     majorant_layers: u32,
@@ -251,43 +251,39 @@ async fn render_async(scene: &SceneData, config: &RenderConfig) -> Result<Film, 
 
     let mut dispatched = 0_u32;
     let mut sample_offset = 0_u32;
+    let workgroups_x = config.width.div_ceil(8) as u32;
+    let workgroups_y = config.height.div_ceil(8) as u32;
     while sample_offset < config.spp as u32 {
         let samples_this_dispatch = SAMPLES_PER_DISPATCH.min(config.spp as u32 - sample_offset);
-        for tile_y in (0..config.height).step_by(TILE_HEIGHT) {
-            let tile_height = TILE_HEIGHT.min(config.height - tile_y);
-            let mut constants = packed.constants;
-            constants.sample_offset = sample_offset;
-            constants.samples_this_dispatch = samples_this_dispatch;
-            constants.tile_y = tile_y as u32;
-            constants.tile_height = tile_height as u32;
-            queue.write_buffer(&constants_buffer, 0, bytemuck::bytes_of(&constants));
+        let mut constants = packed.constants;
+        constants.sample_offset = sample_offset;
+        constants.samples_this_dispatch = samples_this_dispatch;
+        queue.write_buffer(&constants_buffer, 0, bytemuck::bytes_of(&constants));
 
-            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("sky_tracer_dispatch_encoder"),
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("sky_tracer_dispatch_encoder"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("sky_tracer_compute_pass"),
+                timestamp_writes: None,
             });
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("sky_tracer_compute_pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&pipeline);
-                pass.set_bind_group(0, &bind_group, &[]);
-                pass.dispatch_workgroups(
-                    config.width.div_ceil(8) as u32,
-                    tile_height.div_ceil(8) as u32,
-                    BAND_COUNT as u32,
-                );
-            }
-            queue.submit([encoder.finish()]);
-            dispatched += 1;
-            if dispatched % 64 == 0 {
-                device
-                    .poll(wgpu::PollType::Poll)
-                    .map_err(|err| RenderError::Poll(err.to_string()))?;
-            }
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(workgroups_x, workgroups_y, BAND_COUNT as u32);
+        }
+        queue.submit([encoder.finish()]);
+        dispatched += 1;
+        if dispatched % SUBMITS_BEFORE_WAIT == 0 {
+            device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .map_err(|err| RenderError::Poll(err.to_string()))?;
         }
         sample_offset += samples_this_dispatch;
     }
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(|err| RenderError::Poll(err.to_string()))?;
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("sky_tracer_readback_encoder"),
@@ -312,12 +308,12 @@ async fn render_async(scene: &SceneData, config: &RenderConfig) -> Result<Film, 
     for value in &mut values {
         *value = (*value * inv_spp).max(0.0);
     }
-    let mut film = Film::new(config.width, config.height, BAND_COUNT);
-    for pixel in 0..config.width * config.height {
-        let start = pixel * BAND_COUNT;
-        film.set_pixel_spectrum(pixel, &values[start..start + BAND_COUNT]);
-    }
-    Ok(film)
+    Ok(Film::from_values(
+        config.width,
+        config.height,
+        BAND_COUNT,
+        values,
+    ))
 }
 
 impl PackedScene {
@@ -329,8 +325,8 @@ impl PackedScene {
             direct_light_samples: config.direct_light_samples.max(1) as u32,
             sample_offset: 0,
             samples_this_dispatch: 0,
-            tile_y: 0,
-            tile_height: config.height as u32,
+            _pad_tile0: 0,
+            _pad_tile1: 0,
             atmosphere_len: scene.atmospheric_profile.len() as u32,
             aerosol_len: scene.aerosol_profile.len() as u32,
             majorant_layers: scene.majorant_grid.layer_count as u32,
@@ -409,7 +405,6 @@ impl PackedScene {
                 scene.majorant_grid.values_km_inv.len()
             )));
         }
-
         Ok(Self {
             constants,
             bands,
@@ -489,7 +484,7 @@ mod tests {
             ..RenderConfig::default()
         };
         let scene =
-            crate::data::load_scene_data(std::path::Path::new("data"), 0.0, 0.0).expect("scene");
+            sky_core::data::load_scene_data(&repository_data_dir(), 0.0, 0.0).expect("scene");
         let packed = PackedScene::new(&scene, &config).expect("packed scene");
 
         assert_eq!(packed.bands.len(), BAND_COUNT);
@@ -512,5 +507,12 @@ mod tests {
             packed.majorants[scene.majorant_grid.layer_count],
             scene.majorant_grid.values_km_inv[scene.majorant_grid.layer_count]
         );
+    }
+
+    fn repository_data_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("data")
     }
 }

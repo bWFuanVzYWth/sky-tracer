@@ -1,0 +1,10 @@
+[package]
+name = "sky-bake"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+clap = { workspace = true }
+serde_json = { workspace = true }
+sky-core = { path = "../sky-core" }
+sky-offline = { path = "../sky-offline" }

@@ -203,7 +203,7 @@ mod tests {
 
     #[test]
     fn repository_data_loads() {
-        let scene = load_scene_data(Path::new("data"), 0.0, 0.0).expect("data should load");
+        let scene = load_scene_data(&repository_data_dir(), 0.0, 0.0).expect("data should load");
         assert_eq!(scene.bands.len(), BAND_COUNT);
         assert_eq!(scene.rayleigh_cross_sections_m2.len(), BAND_COUNT);
         assert_eq!(scene.solar_radiance_w_m2_sr.len(), BAND_COUNT);
@@ -221,7 +221,7 @@ mod tests {
 
     #[test]
     fn baked_mie_phase_is_normalized() {
-        let scene = load_scene_data(Path::new("data"), 0.0, 0.0).expect("data should load");
+        let scene = load_scene_data(&repository_data_dir(), 0.0, 0.0).expect("data should load");
         for species in 0..SPECIES_COUNT {
             for band in 0..BAND_COUNT {
                 let integral = integrate_phase(&scene, species, band);
@@ -252,7 +252,7 @@ mod tests {
 
     #[test]
     fn layered_majorants_dominate_extinction_samples() {
-        let scene = load_scene_data(Path::new("data"), 0.0, 0.0).expect("data should load");
+        let scene = load_scene_data(&repository_data_dir(), 0.0, 0.0).expect("data should load");
         for band in 0..BAND_COUNT {
             for i in 0..=240 {
                 let altitude = scene.majorant_grid.top_altitude_km * i as f32 / 240.0;
@@ -273,5 +273,12 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn repository_data_dir() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("data")
     }
 }

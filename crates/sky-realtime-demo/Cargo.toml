@@ -1,0 +1,13 @@
+[package]
+name = "sky-realtime-demo"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bytemuck = { workspace = true }
+clap = { workspace = true }
+pollster = { workspace = true }
+serde_json = { workspace = true }
+sky-core = { path = "../sky-core" }
+wgpu = { workspace = true }
+winit = { workspace = true }

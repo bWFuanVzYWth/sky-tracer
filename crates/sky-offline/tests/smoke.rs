@@ -1,9 +1,9 @@
 use std::fs;
 use std::path::Path;
 
-use sky_tracer::config::RenderConfig;
-use sky_tracer::data::load_scene_data;
-use sky_tracer::integrator::{RenderError, render};
+use sky_core::data::load_scene_data;
+use sky_offline::config::RenderConfig;
+use sky_offline::integrator::{RenderError, render};
 
 #[test]
 fn tiny_render_writes_all_outputs_and_is_finite() -> Result<(), Box<dyn std::error::Error>> {
@@ -15,6 +15,7 @@ fn tiny_render_writes_all_outputs_and_is_finite() -> Result<(), Box<dyn std::err
         height: 16,
         spp: 2,
         out_dir: out_dir.to_owned(),
+        data_dir: repository_data_dir(),
         ..RenderConfig::default()
     };
     let scene = load_scene_data(&config.data_dir, 0.0, 0.0).expect("scene data");
@@ -39,4 +40,11 @@ fn tiny_render_writes_all_outputs_and_is_finite() -> Result<(), Box<dyn std::err
         );
     }
     Ok(())
+}
+
+fn repository_data_dir() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("data")
 }

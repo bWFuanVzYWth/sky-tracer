@@ -1,12 +1,23 @@
-[package]
-name = "sky_tracer"
+[workspace]
+members = [
+    "crates/sky-core",
+    "crates/sky-offline",
+    "crates/sky-bake",
+    "crates/sky-realtime-demo",
+]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
+[workspace.dependencies]
 bytemuck = { version = "1.25", features = ["derive"] }
 clap = { version = "4.5", features = ["derive"] }
 exr = "1.73"
 image = { version = "0.25", default-features = false, features = ["png"] }
 pollster = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 wgpu = "29.0.3"
+winit = "0.30"
