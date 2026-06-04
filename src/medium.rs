@@ -74,7 +74,7 @@ pub fn compute_majorant_grid(scene: &SceneData, layer_count: usize) -> MajorantG
                 min_ext = min_ext.min(extinction);
                 max_ext = max_ext.max(extinction);
             }
-            let majorant = (max_ext * 1.01).max(1.0e-8);
+            let majorant = (max_ext * 1.05).max(1.0e-8);
             let minorant = (min_ext.max(0.0) * 0.99).min(majorant);
             grid.set_bounds(band_index, layer, minorant, majorant);
         }

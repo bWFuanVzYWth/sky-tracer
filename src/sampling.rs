@@ -210,7 +210,7 @@ fn fract(x: f32) -> f32 {
     x - x.floor()
 }
 
-fn fract01(x: f32) -> f32 {
+pub(crate) fn fract01(x: f32) -> f32 {
     let f = x - x.floor();
     if f >= 1.0 { 0.0 } else { f }
 }

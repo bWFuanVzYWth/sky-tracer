@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bytemuck = { version = "1.25", features = ["derive"] }
 clap = { version = "4.5", features = ["derive"] }
 exr = "1.73"
 image = { version = "0.25", default-features = false, features = ["png"] }
-rayon = "1.10"
+pollster = "0.4"
+wgpu = "29.0.3"

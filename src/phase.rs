@@ -77,6 +77,10 @@ impl MiePhaseTable {
     pub fn band_count(&self) -> usize {
         self.band_count
     }
+
+    pub fn values(&self) -> &[f32] {
+        &self.values
+    }
 }
 
 pub trait ScalarPhase {

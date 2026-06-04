@@ -1,725 +1,479 @@
-use rayon::prelude::*;
+use std::error::Error;
+use std::fmt;
+use std::mem;
+use std::sync::mpsc;
 
-use crate::atmosphere::{GROUND_ALBEDO, SPECIES_COUNT, SceneData};
-use crate::config::{
-    CollisionEstimator, GroundEstimator, RenderConfig, SpectralCorrelation, TransmittanceEstimator,
-};
+use bytemuck::{Pod, Zeroable};
+use wgpu::util::DeviceExt;
+
+use crate::atmosphere::{PHASE_BINS, SPECIES_COUNT, SceneData};
+use crate::config::RenderConfig;
 use crate::film::Film;
-use crate::geometry::{
-    BoundaryKind, RAY_EPSILON_KM, altitude_km, intersect_sphere, next_boundary,
-    segment_to_sun_or_space, surface_normal,
-};
-use crate::math::{INV_PI, Ray, TAU, Vec3};
-use crate::medium::{MediumCoefficients, coefficients_at};
-use crate::phase::{PhaseFrame, ScalarPhase, ScatteringMode, rayleigh_phase};
-use crate::sampling::{
-    SamplerState, cosine_hemisphere_pdf, direction_in_cone, sample_cosine_hemisphere,
-    sample_mie_phase, sample_rayleigh_phase, sample_uniform_cone, sample_uniform_cone_from,
-};
 use crate::spectrum::BAND_COUNT;
 
-type PixelSpectrum = [f32; BAND_COUNT];
+const WATCHDOG_LIMIT: u32 = 1024;
+const SAMPLES_PER_DISPATCH: u32 = 1;
+const TILE_HEIGHT: usize = 32;
 
-const SCATTER_LIGHT_STREAM: u64 = 0x51C4_77E2_0D1A_1137;
-const GROUND_LIGHT_STREAM: u64 = 0x9A6C_63D5_3B8F_4A11;
-
-#[derive(Clone, Copy, Debug)]
-struct PhaseSample {
-    direction: Vec3,
-    phase: f32,
-    pdf: f32,
+#[derive(Debug)]
+pub enum RenderError {
+    InvalidConfig(String),
+    NoAdapter(String),
+    RequestDevice(String),
+    BufferMap(String),
+    Poll(String),
+    Watchdog,
 }
 
-pub fn render(scene: &SceneData, config: &RenderConfig) -> Film {
-    assert_eq!(scene.bands.len(), BAND_COUNT);
-    if can_use_azimuth_symmetry(config) {
-        render_with_azimuth_symmetry(scene, config)
-    } else {
-        render_full(scene, config)
-    }
-}
-
-fn render_full(scene: &SceneData, config: &RenderConfig) -> Film {
-    let pixels: Vec<PixelSpectrum> = (0..config.width * config.height)
-        .into_par_iter()
-        .map(|pixel| {
-            let x = pixel % config.width;
-            let y = pixel / config.width;
-            render_pixel(scene, config, x, y)
-        })
-        .collect();
-
-    let mut film = Film::new(config.width, config.height, scene.bands.len());
-    for (pixel, spectrum) in pixels.into_iter().enumerate() {
-        film.set_pixel_spectrum(pixel, &spectrum);
-    }
-    film
-}
-
-fn render_with_azimuth_symmetry(scene: &SceneData, config: &RenderConfig) -> Film {
-    let representative_width = config.width.div_ceil(2);
-
-    let pixels: Vec<(usize, usize, PixelSpectrum)> = (0..representative_width * config.height)
-        .into_par_iter()
-        .map(|representative| {
-            let x = representative % representative_width;
-            let y = representative / representative_width;
-            let mirror_x = mirror_azimuth_x(config.width, x);
-            let pixel = y * config.width + x;
-            let mirror_pixel = y * config.width + mirror_x;
-            (pixel, mirror_pixel, render_pixel(scene, config, x, y))
-        })
-        .collect();
-
-    let mut film = Film::new(config.width, config.height, scene.bands.len());
-    for (pixel, mirror_pixel, spectrum) in pixels {
-        film.set_pixel_spectrum(pixel, &spectrum);
-        if mirror_pixel != pixel {
-            film.set_pixel_spectrum(mirror_pixel, &spectrum);
+impl fmt::Display for RenderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidConfig(message) => write!(f, "invalid render config: {message}"),
+            Self::NoAdapter(message) => write!(f, "no usable wgpu adapter: {message}"),
+            Self::RequestDevice(message) => write!(f, "failed to request wgpu device: {message}"),
+            Self::BufferMap(message) => write!(f, "failed to map GPU readback buffer: {message}"),
+            Self::Poll(message) => write!(f, "failed while waiting for GPU work: {message}"),
+            Self::Watchdog => write!(f, "GPU path watchdog was reached"),
         }
     }
-    film
 }
 
-fn render_pixel(scene: &SceneData, config: &RenderConfig, x: usize, y: usize) -> PixelSpectrum {
-    let mut sum = [0.0; BAND_COUNT];
-    let pixel_seed = config.seed
-        ^ ((x as u64).wrapping_mul(0x9E37_79B9))
-        ^ ((y as u64).wrapping_mul(0xD1B5_4A32));
+impl Error for RenderError {}
 
-    for sample in 0..config.spp {
-        let mut rng =
-            SamplerState::for_sample(config.seed, sample as u64, pixel_seed, config.sampler);
-        let u = (x as f32 + rng.next_f32()) / config.width as f32;
-        let v = (y as f32 + rng.next_f32()) / config.height as f32;
-        let ray = camera_ray(scene, config, u, v);
-        for (band, value) in sum.iter_mut().enumerate() {
-            let mut band_rng = rng.fork(band_stream(config.spectral_correlation, sample, band));
-            *value += trace_band(scene, config, ray, band, &mut band_rng);
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct GpuConstants {
+    width: u32,
+    height: u32,
+    spp: u32,
+    direct_light_samples: u32,
+    sample_offset: u32,
+    samples_this_dispatch: u32,
+    tile_y: u32,
+    tile_height: u32,
+    atmosphere_len: u32,
+    aerosol_len: u32,
+    majorant_layers: u32,
+    phase_bins: u32,
+    seed_lo: u32,
+    seed_hi: u32,
+    watchdog_limit: u32,
+    _pad0: u32,
+    _pad1: u32,
+    observer_altitude_km: f32,
+    ground_radius_km: f32,
+    atmosphere_radius_km: f32,
+    top_altitude_km: f32,
+    sun_x: f32,
+    sun_y: f32,
+    sun_z: f32,
+    sun_angular_radius_rad: f32,
+    sun_solid_angle_sr: f32,
+    _pad2: f32,
+    _pad3: f32,
+    _pad4: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct GpuBand {
+    center_nm: f32,
+    lower_nm: f32,
+    upper_nm: f32,
+    ozone_cross_section_cm2: f32,
+    solar_radiance_w_m2_sr: f32,
+    rayleigh_cross_section_m2: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct GpuAtmospherePoint {
+    altitude_km: f32,
+    temperature_k: f32,
+    air_cm3: f32,
+    ozone_cm3: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct GpuAerosolPoint {
+    altitude_km: f32,
+    mass_g_m3: [f32; SPECIES_COUNT],
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct GpuAerosolOptics {
+    scattering_km_inv_per_g_m3: f32,
+    absorption_km_inv_per_g_m3: f32,
+}
+
+#[derive(Clone, Debug)]
+struct PackedScene {
+    constants: GpuConstants,
+    bands: Vec<GpuBand>,
+    atmosphere: Vec<GpuAtmospherePoint>,
+    aerosol: Vec<GpuAerosolPoint>,
+    aerosol_optics: Vec<GpuAerosolOptics>,
+    majorants: Vec<f32>,
+    phase_values: Vec<f32>,
+}
+
+pub fn render(scene: &SceneData, config: &RenderConfig) -> Result<Film, RenderError> {
+    validate_config(scene, config)?;
+    pollster::block_on(render_async(scene, config))
+}
+
+fn validate_config(scene: &SceneData, config: &RenderConfig) -> Result<(), RenderError> {
+    if scene.bands.len() != BAND_COUNT {
+        return Err(RenderError::InvalidConfig(format!(
+            "expected {BAND_COUNT} spectral bands, found {}",
+            scene.bands.len()
+        )));
+    }
+    if config.width == 0 || config.height == 0 || config.spp == 0 {
+        return Err(RenderError::InvalidConfig(
+            "width, height, and spp must be greater than zero".to_owned(),
+        ));
+    }
+    let pixel_count = config
+        .width
+        .checked_mul(config.height)
+        .and_then(|x| x.checked_mul(BAND_COUNT))
+        .ok_or_else(|| RenderError::InvalidConfig("film dimensions overflow".to_owned()))?;
+    if pixel_count > u32::MAX as usize {
+        return Err(RenderError::InvalidConfig(
+            "film is too large for the GPU shader index type".to_owned(),
+        ));
+    }
+    if scene.atmospheric_profile.is_empty() || scene.aerosol_profile.is_empty() {
+        return Err(RenderError::InvalidConfig(
+            "atmosphere and aerosol profiles must not be empty".to_owned(),
+        ));
+    }
+    if scene.majorant_grid.layer_count == 0 {
+        return Err(RenderError::InvalidConfig(
+            "majorant grid must contain at least one layer".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn render_async(scene: &SceneData, config: &RenderConfig) -> Result<Film, RenderError> {
+    let packed = PackedScene::new(scene, config)?;
+    let output_len = config.width * config.height * BAND_COUNT;
+    let output_size = byte_size::<f32>(output_len)?;
+    let diagnostic_size = byte_size::<u32>(1)?;
+
+    let instance = wgpu::Instance::default();
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+        })
+        .await
+        .map_err(|err| RenderError::NoAdapter(err.to_string()))?;
+
+    let (device, queue) = adapter
+        .request_device(&wgpu::DeviceDescriptor {
+            label: Some("sky_tracer_device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            ..Default::default()
+        })
+        .await
+        .map_err(|err| RenderError::RequestDevice(err.to_string()))?;
+
+    let constants_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("sky_tracer_constants"),
+        contents: bytemuck::bytes_of(&packed.constants),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+    let bands_buffer = storage_buffer(&device, "sky_tracer_bands", &packed.bands);
+    let atmosphere_buffer = storage_buffer(&device, "sky_tracer_atmosphere", &packed.atmosphere);
+    let aerosol_buffer = storage_buffer(&device, "sky_tracer_aerosol_profile", &packed.aerosol);
+    let aerosol_optics_buffer =
+        storage_buffer(&device, "sky_tracer_aerosol_optics", &packed.aerosol_optics);
+    let majorants_buffer = storage_buffer(&device, "sky_tracer_majorants", &packed.majorants);
+    let phase_values_buffer =
+        storage_buffer(&device, "sky_tracer_phase_values", &packed.phase_values);
+
+    let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("sky_tracer_spectral_film"),
+        size: output_size,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let diagnostic_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("sky_tracer_diagnostics"),
+        contents: bytemuck::cast_slice(&[0_u32]),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    });
+    let output_readback =
+        readback_buffer(&device, "sky_tracer_spectral_film_readback", output_size);
+    let diagnostic_readback =
+        readback_buffer(&device, "sky_tracer_diagnostics_readback", diagnostic_size);
+
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("sky_tracer_compute_shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("sky_trace.wgsl").into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("sky_tracer_compute_pipeline"),
+        layout: None,
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+
+    let bind_group_layout = pipeline.get_bind_group_layout(0);
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("sky_tracer_bind_group"),
+        layout: &bind_group_layout,
+        entries: &[
+            bind_entry(0, &constants_buffer),
+            bind_entry(1, &bands_buffer),
+            bind_entry(2, &atmosphere_buffer),
+            bind_entry(3, &aerosol_buffer),
+            bind_entry(4, &aerosol_optics_buffer),
+            bind_entry(5, &majorants_buffer),
+            bind_entry(6, &phase_values_buffer),
+            bind_entry(7, &output_buffer),
+            bind_entry(8, &diagnostic_buffer),
+        ],
+    });
+
+    let mut dispatched = 0_u32;
+    let mut sample_offset = 0_u32;
+    while sample_offset < config.spp as u32 {
+        let samples_this_dispatch = SAMPLES_PER_DISPATCH.min(config.spp as u32 - sample_offset);
+        for tile_y in (0..config.height).step_by(TILE_HEIGHT) {
+            let tile_height = TILE_HEIGHT.min(config.height - tile_y);
+            let mut constants = packed.constants;
+            constants.sample_offset = sample_offset;
+            constants.samples_this_dispatch = samples_this_dispatch;
+            constants.tile_y = tile_y as u32;
+            constants.tile_height = tile_height as u32;
+            queue.write_buffer(&constants_buffer, 0, bytemuck::bytes_of(&constants));
+
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("sky_tracer_dispatch_encoder"),
+            });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("sky_tracer_compute_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(
+                    config.width.div_ceil(8) as u32,
+                    tile_height.div_ceil(8) as u32,
+                    BAND_COUNT as u32,
+                );
+            }
+            queue.submit([encoder.finish()]);
+            dispatched += 1;
+            if dispatched % 64 == 0 {
+                device
+                    .poll(wgpu::PollType::Poll)
+                    .map_err(|err| RenderError::Poll(err.to_string()))?;
+            }
         }
+        sample_offset += samples_this_dispatch;
     }
 
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("sky_tracer_readback_encoder"),
+    });
+    encoder.copy_buffer_to_buffer(&output_buffer, 0, &output_readback, 0, output_size);
+    encoder.copy_buffer_to_buffer(
+        &diagnostic_buffer,
+        0,
+        &diagnostic_readback,
+        0,
+        diagnostic_size,
+    );
+    queue.submit([encoder.finish()]);
+
+    let diagnostics: Vec<u32> = read_buffer(&device, &diagnostic_readback)?;
+    if diagnostics.first().copied().unwrap_or(0) != 0 {
+        return Err(RenderError::Watchdog);
+    }
+
+    let mut values: Vec<f32> = read_buffer(&device, &output_readback)?;
     let inv_spp = 1.0 / config.spp as f32;
-    for value in &mut sum {
+    for value in &mut values {
         *value = (*value * inv_spp).max(0.0);
     }
-    sum
-}
-
-fn band_stream(correlation: SpectralCorrelation, sample: usize, band: usize) -> u64 {
-    match correlation {
-        SpectralCorrelation::Common => (sample as u64) << 32,
-        SpectralCorrelation::Independent => ((sample as u64) << 32) ^ band as u64,
+    let mut film = Film::new(config.width, config.height, BAND_COUNT);
+    for pixel in 0..config.width * config.height {
+        let start = pixel * BAND_COUNT;
+        film.set_pixel_spectrum(pixel, &values[start..start + BAND_COUNT]);
     }
+    Ok(film)
 }
 
-pub fn camera_ray(scene: &SceneData, config: &RenderConfig, u: f32, v: f32) -> Ray {
-    let azimuth = (u - 0.5) * TAU;
-    let elevation = (0.5 - v) * std::f32::consts::PI;
-    let cos_e = elevation.cos();
-    let dir = Vec3::new(
-        cos_e * azimuth.sin(),
-        elevation.sin(),
-        cos_e * azimuth.cos(),
-    );
-    Ray::new(
-        crate::geometry::observer_position(scene.planet, config.observer_altitude_km),
-        dir.normalized(),
-    )
-}
-
-pub fn can_use_azimuth_symmetry(config: &RenderConfig) -> bool {
-    if !config.use_azimuth_symmetry {
-        return false;
-    }
-
-    // The x <-> width-1-x mirror is exactly unbiased only when the sun lies in
-    // the panorama's x=0 vertical plane. Other azimuths need a shifted mirror
-    // mapping or full rendering to preserve the per-pixel integration domain.
-    let azimuth_rad = config.sun_azimuth_deg.to_radians();
-    azimuth_rad.sin().abs() < 1.0e-6
-}
-
-fn mirror_azimuth_x(width: usize, x: usize) -> usize {
-    width - 1 - x
-}
-
-pub fn trace_band(
-    scene: &SceneData,
-    config: &RenderConfig,
-    initial_ray: Ray,
-    band_index: usize,
-    rng: &mut SamplerState,
-) -> f32 {
-    let mut ray = initial_ray;
-    let mut throughput = 1.0_f32;
-    let mut radiance = 0.0_f32;
-    let mut last_direction_pdf: Option<f32> = None;
-
-    for depth in 0..config.max_depth {
-        let Some(boundary) = next_boundary(ray, scene.planet) else {
-            break;
+impl PackedScene {
+    fn new(scene: &SceneData, config: &RenderConfig) -> Result<Self, RenderError> {
+        let constants = GpuConstants {
+            width: config.width as u32,
+            height: config.height as u32,
+            spp: config.spp as u32,
+            direct_light_samples: config.direct_light_samples.max(1) as u32,
+            sample_offset: 0,
+            samples_this_dispatch: 0,
+            tile_y: 0,
+            tile_height: config.height as u32,
+            atmosphere_len: scene.atmospheric_profile.len() as u32,
+            aerosol_len: scene.aerosol_profile.len() as u32,
+            majorant_layers: scene.majorant_grid.layer_count as u32,
+            phase_bins: PHASE_BINS as u32,
+            seed_lo: config.seed as u32,
+            seed_hi: (config.seed >> 32) as u32,
+            watchdog_limit: WATCHDOG_LIMIT,
+            _pad0: 0,
+            _pad1: 0,
+            observer_altitude_km: config.observer_altitude_km,
+            ground_radius_km: scene.planet.ground_radius_km,
+            atmosphere_radius_km: scene.planet.atmosphere_radius_km,
+            top_altitude_km: scene.majorant_grid.top_altitude_km,
+            sun_x: scene.sun.direction.x,
+            sun_y: scene.sun.direction.y,
+            sun_z: scene.sun.direction.z,
+            sun_angular_radius_rad: scene.sun.angular_radius_rad,
+            sun_solid_angle_sr: scene.sun.solid_angle_sr,
+            _pad2: 0.0,
+            _pad3: 0.0,
+            _pad4: 0.0,
         };
 
-        let sampled = sample_real_collision(scene, ray, boundary.t_km, band_index, rng);
+        let bands = scene
+            .bands
+            .iter()
+            .enumerate()
+            .map(|(band, value)| GpuBand {
+                center_nm: value.center_nm,
+                lower_nm: value.lower_nm,
+                upper_nm: value.upper_nm,
+                ozone_cross_section_cm2: value.ozone_cross_section_cm2,
+                solar_radiance_w_m2_sr: scene.solar_radiance_w_m2_sr(band),
+                rayleigh_cross_section_m2: scene.rayleigh_cross_sections_m2[band],
+            })
+            .collect();
 
-        match sampled {
-            Some((t, coeffs)) => {
-                let pos = ray.at(t);
-                let scattering = coeffs.scattering_total();
-                let extinction = coeffs.extinction_total();
-                if extinction <= 0.0 || scattering <= 0.0 {
-                    break;
-                }
+        let atmosphere = scene
+            .atmospheric_profile
+            .iter()
+            .map(|point| GpuAtmospherePoint {
+                altitude_km: point.altitude_km,
+                temperature_k: point.temperature_k,
+                air_cm3: point.air_cm3,
+                ozone_cm3: point.ozone_cm3,
+            })
+            .collect();
 
-                let albedo = (scattering / extinction).clamp(0.0, 1.0);
-                if !survive_collision(config.collision_estimator, albedo, &mut throughput, rng) {
-                    break;
-                }
+        let aerosol = scene
+            .aerosol_profile
+            .iter()
+            .map(|point| GpuAerosolPoint {
+                altitude_km: point.altitude_km,
+                mass_g_m3: point.mass_g_m3,
+                _pad0: 0.0,
+                _pad1: 0.0,
+                _pad2: 0.0,
+            })
+            .collect();
 
-                let mut light_rng = rng.fork(depth_stream(SCATTER_LIGHT_STREAM, depth));
-                radiance += throughput
-                    * direct_sun_at_scatter(
-                        scene,
-                        config,
-                        pos,
-                        ray.dir,
-                        band_index,
-                        coeffs,
-                        &mut light_rng,
-                    );
+        let aerosol_optics = scene
+            .aerosol_optics
+            .iter()
+            .flat_map(|band| {
+                band.iter().map(|optics| GpuAerosolOptics {
+                    scattering_km_inv_per_g_m3: optics.scattering_km_inv_per_g_m3,
+                    absorption_km_inv_per_g_m3: optics.absorption_km_inv_per_g_m3,
+                })
+            })
+            .collect();
 
-                let phase_sample =
-                    sample_scattering_direction(scene, coeffs, ray.dir, band_index, rng);
-                throughput *= phase_sample.phase / phase_sample.pdf;
-                last_direction_pdf = Some(phase_sample.pdf);
-
-                if depth > 3 {
-                    let q = throughput.clamp(0.05, 0.95);
-                    if rng.next_f32() > q {
-                        break;
-                    }
-                    throughput /= q;
-                }
-
-                ray = Ray::new(
-                    pos + phase_sample.direction * RAY_EPSILON_KM,
-                    phase_sample.direction,
-                );
-            }
-            None => match boundary.kind {
-                BoundaryKind::AtmosphereExit => {
-                    if direction_in_cone(ray.dir, scene.sun.direction, scene.sun.angular_radius_rad)
-                    {
-                        let weight = last_direction_pdf
-                            .map(|direction_pdf| {
-                                mis_weight(
-                                    direction_pdf,
-                                    1,
-                                    sun_light_pdf(scene),
-                                    config.direct_light_samples.max(1),
-                                )
-                            })
-                            .unwrap_or(1.0);
-                        radiance += throughput * scene.solar_radiance_w_m2_sr(band_index) * weight;
-                    }
-                    break;
-                }
-                BoundaryKind::Ground => {
-                    let pos = ray.at(boundary.t_km);
-                    let mut light_rng = rng.fork(depth_stream(GROUND_LIGHT_STREAM, depth));
-                    radiance += throughput
-                        * ground_radiance(scene, config, pos, band_index, &mut light_rng);
-                    if config.ground_estimator == GroundEstimator::DirectOnly {
-                        break;
-                    }
-
-                    let normal = surface_normal(pos);
-                    let (new_dir, pdf) = sample_cosine_hemisphere(normal, rng);
-                    let cos_out = normal.dot(new_dir).max(0.0);
-                    if pdf <= 0.0 || cos_out <= 0.0 {
-                        break;
-                    }
-                    throughput *= GROUND_ALBEDO * INV_PI * cos_out / pdf;
-                    last_direction_pdf = Some(pdf);
-
-                    if depth > 3 {
-                        let q = throughput.clamp(0.05, 0.95);
-                        if rng.next_f32() > q {
-                            break;
-                        }
-                        throughput /= q;
-                    }
-
-                    ray = Ray::new(pos + new_dir * RAY_EPSILON_KM, new_dir);
-                }
-            },
+        let expected_majorants = BAND_COUNT * scene.majorant_grid.layer_count;
+        if scene.majorant_grid.values_km_inv.len() != expected_majorants {
+            return Err(RenderError::InvalidConfig(format!(
+                "majorant grid length mismatch: expected {expected_majorants}, found {}",
+                scene.majorant_grid.values_km_inv.len()
+            )));
         }
 
-        if !radiance.is_finite() || !throughput.is_finite() {
-            return 0.0;
-        }
-    }
-
-    radiance.max(0.0)
-}
-
-fn depth_stream(tag: u64, depth: usize) -> u64 {
-    tag ^ (depth as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-}
-
-fn survive_collision(
-    estimator: CollisionEstimator,
-    albedo: f32,
-    throughput: &mut f32,
-    rng: &mut SamplerState,
-) -> bool {
-    match estimator {
-        CollisionEstimator::Analog => rng.next_f32() <= albedo,
-        CollisionEstimator::Weighted => {
-            *throughput *= albedo;
-            *throughput > 0.0
-        }
+        Ok(Self {
+            constants,
+            bands,
+            atmosphere,
+            aerosol,
+            aerosol_optics,
+            majorants: scene.majorant_grid.values_km_inv.clone(),
+            phase_values: scene.phase_table.values().to_vec(),
+        })
     }
 }
 
-fn sample_real_collision(
-    scene: &SceneData,
-    ray: Ray,
-    t_max: f32,
-    band_index: usize,
-    rng: &mut SamplerState,
-) -> Option<(f32, MediumCoefficients)> {
-    let mut t = 0.0;
-    while t < t_max {
-        let segment_end = next_majorant_segment_end(scene, ray, t, t_max);
-        let majorant = segment_majorant(scene, ray, t, segment_end, band_index);
-        while t < segment_end {
-            let u = (1.0 - rng.next_f32()).max(1.0e-7);
-            t += -u.ln() / majorant;
-            if t >= segment_end {
-                break;
-            }
-            let coeffs = coefficients_at(scene, ray.at(t), band_index);
-            debug_assert!(
-                coeffs.extinction_total() <= majorant * 1.001,
-                "layer majorant underestimates extinction"
-            );
-            let accept = (coeffs.extinction_total() / majorant).clamp(0.0, 1.0);
-            if rng.next_f32() < accept {
-                return Some((t, coeffs));
-            }
-        }
-        t = segment_end;
-    }
-    None
-}
-
-pub fn estimate_transmittance(
-    scene: &SceneData,
-    ray: Ray,
-    t_max: f32,
-    band_index: usize,
-    rng: &mut SamplerState,
-    estimator: TransmittanceEstimator,
-) -> f32 {
-    match estimator {
-        TransmittanceEstimator::Ratio => {
-            estimate_transmittance_ratio(scene, ray, t_max, band_index, rng)
-        }
-        TransmittanceEstimator::ResidualRatio => {
-            estimate_transmittance_residual_ratio(scene, ray, t_max, band_index, rng)
-        }
-    }
-}
-
-pub fn estimate_transmittance_ratio(
-    scene: &SceneData,
-    ray: Ray,
-    t_max: f32,
-    band_index: usize,
-    rng: &mut SamplerState,
-) -> f32 {
-    let mut t = 0.0;
-    let mut weight = 1.0_f32;
-    while t < t_max {
-        let segment_end = next_majorant_segment_end(scene, ray, t, t_max);
-        let majorant = segment_majorant(scene, ray, t, segment_end, band_index);
-        while t < segment_end {
-            let u = (1.0 - rng.next_f32()).max(1.0e-7);
-            t += -u.ln() / majorant;
-            if t >= segment_end {
-                break;
-            }
-            let coeffs = coefficients_at(scene, ray.at(t), band_index);
-            debug_assert!(
-                coeffs.extinction_total() <= majorant * 1.001,
-                "layer majorant underestimates extinction"
-            );
-            weight *= (1.0 - coeffs.extinction_total() / majorant).clamp(0.0, 1.0);
-            if weight <= 0.0 {
-                return 0.0;
-            }
-        }
-        t = segment_end;
-    }
-    weight.clamp(0.0, 1.0)
-}
-
-pub fn estimate_transmittance_residual_ratio(
-    scene: &SceneData,
-    ray: Ray,
-    t_max: f32,
-    band_index: usize,
-    rng: &mut SamplerState,
-) -> f32 {
-    let mut t = 0.0;
-    let mut weight = 1.0_f32;
-    while t < t_max {
-        let segment_start = t;
-        let segment_end = next_majorant_segment_end(scene, ray, t, t_max);
-        let (minorant, majorant) =
-            segment_extinction_bounds(scene, ray, t, segment_end, band_index);
-        let control = minorant.min(majorant);
-        weight *= (-control * (segment_end - segment_start)).exp();
-
-        let residual_majorant = (majorant - control).max(0.0);
-        if residual_majorant > 1.0e-8 {
-            while t < segment_end {
-                let u = (1.0 - rng.next_f32()).max(1.0e-7);
-                t += -u.ln() / residual_majorant;
-                if t >= segment_end {
-                    break;
-                }
-                let coeffs = coefficients_at(scene, ray.at(t), band_index);
-                let extinction = coeffs.extinction_total();
-                debug_assert!(
-                    extinction <= majorant * 1.001,
-                    "layer majorant underestimates extinction"
-                );
-                debug_assert!(
-                    extinction + 1.0e-7 >= control,
-                    "layer minorant overestimates extinction"
-                );
-                let residual_extinction = (extinction - control).clamp(0.0, residual_majorant);
-                weight *= (1.0 - residual_extinction / residual_majorant).clamp(0.0, 1.0);
-                if weight <= 0.0 {
-                    return 0.0;
-                }
-            }
-        }
-        t = segment_end;
-    }
-    weight.clamp(0.0, 1.0)
-}
-
-fn segment_majorant(scene: &SceneData, ray: Ray, t0: f32, t1: f32, band_index: usize) -> f32 {
-    segment_extinction_bounds(scene, ray, t0, t1, band_index).1
-}
-
-fn segment_extinction_bounds(
-    scene: &SceneData,
-    ray: Ray,
-    t0: f32,
-    t1: f32,
-    band_index: usize,
-) -> (f32, f32) {
-    let (min_altitude, max_altitude) = segment_altitude_range(scene, ray, t0, t1);
-    let min_layer = scene.majorant_grid.layer_for_altitude(min_altitude);
-    let max_layer = scene.majorant_grid.layer_for_altitude(max_altitude);
-    let minorant = (min_layer..=max_layer)
-        .map(|layer| scene.majorant_grid.minorant(band_index, layer))
-        .fold(f32::INFINITY, f32::min)
-        .max(0.0);
-    let majorant = (min_layer..=max_layer)
-        .map(|layer| scene.majorant_grid.get(band_index, layer))
-        .fold(0.0, f32::max)
-        .max(1.0e-8);
-    (minorant.min(majorant), majorant)
-}
-
-fn next_majorant_segment_end(scene: &SceneData, ray: Ray, t: f32, t_max: f32) -> f32 {
-    let probe_t = (t + RAY_EPSILON_KM).min(t_max);
-    let altitude = altitude_km(scene.planet, ray.at(probe_t));
-    let layer = scene.majorant_grid.layer_for_altitude(altitude);
-    let (lo, hi) = scene.majorant_grid.layer_bounds_km(layer);
-    let mut next_t = t_max;
-
-    for altitude_boundary in [lo, hi] {
-        if altitude_boundary <= 0.0 || altitude_boundary >= scene.majorant_grid.top_altitude_km {
-            continue;
-        }
-        let radius = scene.planet.ground_radius_km + altitude_boundary;
-        if let Some((a, b)) = intersect_sphere(ray, radius) {
-            for root in [a, b] {
-                if root > t + RAY_EPSILON_KM && root < next_t {
-                    next_t = root;
-                }
-            }
-        }
-    }
-
-    next_t
-}
-
-fn segment_altitude_range(scene: &SceneData, ray: Ray, t0: f32, t1: f32) -> (f32, f32) {
-    let mut min_radius = ray.at(t0).length();
-    let mut max_radius = min_radius;
-    for t in [t1, closest_approach_t(ray).clamp(t0, t1)] {
-        let radius = ray.at(t).length();
-        min_radius = min_radius.min(radius);
-        max_radius = max_radius.max(radius);
-    }
-    (
-        min_radius - scene.planet.ground_radius_km,
-        max_radius - scene.planet.ground_radius_km,
-    )
-}
-
-fn closest_approach_t(ray: Ray) -> f32 {
-    -ray.origin.dot(ray.dir)
-}
-
-fn direct_sun_at_scatter(
-    scene: &SceneData,
-    config: &RenderConfig,
-    pos: Vec3,
-    view_dir: Vec3,
-    band_index: usize,
-    coeffs: MediumCoefficients,
-    rng: &mut SamplerState,
-) -> f32 {
-    let light_sample_count = config.direct_light_samples.max(1);
-    average_sun_samples(scene, config, rng, |sun_dir, pdf, rng| {
-        let Some(t_sun) = segment_to_sun_or_space(pos, sun_dir, scene.planet) else {
-            return 0.0;
-        };
-        let trans = estimate_transmittance(
-            scene,
-            Ray::new(pos + sun_dir * RAY_EPSILON_KM, sun_dir),
-            t_sun,
-            band_index,
-            rng,
-            config.transmittance_estimator,
-        );
-        let mu = view_dir.dot(sun_dir).clamp(-1.0, 1.0);
-        let phase = mixed_phase_value(scene, coeffs, band_index, mu);
-        let phase_pdf = mixed_phase_sampling_pdf(scene, coeffs, band_index, mu);
-        let weight = mis_weight(pdf, light_sample_count, phase_pdf, 1);
-        scene.solar_radiance_w_m2_sr(band_index) * trans * phase * weight / pdf
+fn storage_buffer<T: Pod>(device: &wgpu::Device, label: &'static str, data: &[T]) -> wgpu::Buffer {
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents: bytemuck::cast_slice(data),
+        usage: wgpu::BufferUsages::STORAGE,
     })
 }
 
-fn mixed_phase_value(
-    scene: &SceneData,
-    coeffs: MediumCoefficients,
-    band_index: usize,
-    mu: f32,
-) -> f32 {
-    let scattering = coeffs.scattering_total();
-    if scattering <= 0.0 {
-        return 0.0;
-    }
-
-    let mut phase = 0.0;
-    let rayleigh_weight = coeffs.rayleigh_scattering_km_inv / scattering;
-    if rayleigh_weight > 0.0 {
-        phase += rayleigh_weight * rayleigh_phase(mu);
-    }
-
-    for species_index in 0..SPECIES_COUNT {
-        let species_weight = coeffs.aerosol_scattering_km_inv[species_index] / scattering;
-        if species_weight <= 0.0 {
-            continue;
-        }
-        let mode = ScatteringMode::Aerosol { species_index };
-        phase += species_weight * phase_value(scene, mode, band_index, mu);
-    }
-
-    phase
-}
-
-fn mixed_phase_sampling_pdf(
-    scene: &SceneData,
-    coeffs: MediumCoefficients,
-    band_index: usize,
-    mu: f32,
-) -> f32 {
-    let scattering = coeffs.scattering_total();
-    if scattering <= 0.0 {
-        return 0.0;
-    }
-
-    let mut pdf = 0.0;
-    let rayleigh_weight = coeffs.rayleigh_scattering_km_inv / scattering;
-    if rayleigh_weight > 0.0 {
-        pdf += rayleigh_weight * rayleigh_phase(mu);
-    }
-
-    for species_index in 0..SPECIES_COUNT {
-        let species_weight = coeffs.aerosol_scattering_km_inv[species_index] / scattering;
-        if species_weight <= 0.0 {
-            continue;
-        }
-        let mode = ScatteringMode::Aerosol { species_index };
-        pdf += species_weight * phase_sampling_pdf(scene, mode, band_index, mu);
-    }
-
-    pdf.max(1.0e-12)
-}
-
-fn ground_radiance(
-    scene: &SceneData,
-    config: &RenderConfig,
-    pos: Vec3,
-    band_index: usize,
-    rng: &mut SamplerState,
-) -> f32 {
-    let n = surface_normal(pos);
-    let light_sample_count = config.direct_light_samples.max(1);
-    average_sun_samples(scene, config, rng, |sun_dir, pdf, rng| {
-        let cos_sun = n.dot(sun_dir).max(0.0);
-        if cos_sun <= 0.0 {
-            return 0.0;
-        }
-        let Some(t_sun) = segment_to_sun_or_space(pos, sun_dir, scene.planet) else {
-            return 0.0;
-        };
-        let trans = estimate_transmittance(
-            scene,
-            Ray::new(pos + sun_dir * RAY_EPSILON_KM, sun_dir),
-            t_sun,
-            band_index,
-            rng,
-            config.transmittance_estimator,
-        );
-        let bsdf_pdf = cosine_hemisphere_pdf(n, sun_dir);
-        let weight = match config.ground_estimator {
-            GroundEstimator::DirectOnly => 1.0,
-            GroundEstimator::LambertPath => mis_weight(pdf, light_sample_count, bsdf_pdf, 1),
-        };
-        GROUND_ALBEDO * INV_PI * scene.solar_radiance_w_m2_sr(band_index) * trans * cos_sun * weight
-            / pdf
+fn readback_buffer(device: &wgpu::Device, label: &'static str, size: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
     })
 }
 
-fn average_sun_samples(
-    scene: &SceneData,
-    config: &RenderConfig,
-    rng: &mut SamplerState,
-    mut evaluate: impl FnMut(Vec3, f32, &mut SamplerState) -> f32,
-) -> f32 {
-    let sample_count = config.direct_light_samples.max(1);
-    let mut sum = 0.0;
-    let mut sample = 0;
-
-    while sample + 1 < sample_count {
-        let xi_theta = rng.next_f32();
-        let xi_phi = rng.next_f32();
-        let (sun_dir, pdf) = sample_uniform_cone_from(
-            scene.sun.direction,
-            scene.sun.angular_radius_rad,
-            xi_theta,
-            xi_phi,
-        );
-        sum += evaluate(sun_dir, pdf, rng);
-
-        let (sun_dir, pdf) = sample_uniform_cone_from(
-            scene.sun.direction,
-            scene.sun.angular_radius_rad,
-            1.0 - xi_theta,
-            fract01(xi_phi + 0.5),
-        );
-        sum += evaluate(sun_dir, pdf, rng);
-        sample += 2;
-    }
-
-    if sample < sample_count {
-        let (sun_dir, pdf) =
-            sample_uniform_cone(scene.sun.direction, scene.sun.angular_radius_rad, rng);
-        sum += evaluate(sun_dir, pdf, rng);
-    }
-
-    sum / sample_count as f32
-}
-
-fn fract01(x: f32) -> f32 {
-    x - x.floor()
-}
-
-fn choose_scattering_mode(coeffs: MediumCoefficients, rng: &mut SamplerState) -> ScatteringMode {
-    let scattering = coeffs.scattering_total();
-    let mut xi = rng.next_f32() * scattering;
-    if xi < coeffs.rayleigh_scattering_km_inv {
-        return ScatteringMode::Rayleigh;
-    }
-    xi -= coeffs.rayleigh_scattering_km_inv;
-    for species in 0..SPECIES_COUNT {
-        if xi < coeffs.aerosol_scattering_km_inv[species] {
-            return ScatteringMode::Aerosol {
-                species_index: species,
-            };
-        }
-        xi -= coeffs.aerosol_scattering_km_inv[species];
-    }
-    ScatteringMode::Rayleigh
-}
-
-fn sample_scattering_direction(
-    scene: &SceneData,
-    coeffs: MediumCoefficients,
-    axis: Vec3,
-    band_index: usize,
-    rng: &mut SamplerState,
-) -> PhaseSample {
-    let mode = choose_scattering_mode(coeffs, rng);
-    let (direction, _component_pdf) = match mode {
-        ScatteringMode::Rayleigh => sample_rayleigh_phase(axis, rng),
-        ScatteringMode::Aerosol { species_index } => {
-            sample_mie_phase(axis, &scene.phase_table, species_index, band_index, rng)
-        }
-    };
-    let mu = axis.dot(direction).clamp(-1.0, 1.0);
-    PhaseSample {
-        direction,
-        phase: mixed_phase_value(scene, coeffs, band_index, mu),
-        pdf: mixed_phase_sampling_pdf(scene, coeffs, band_index, mu),
+fn bind_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
+    wgpu::BindGroupEntry {
+        binding,
+        resource: buffer.as_entire_binding(),
     }
 }
 
-fn phase_value(scene: &SceneData, mode: ScatteringMode, band_index: usize, mu: f32) -> f32 {
-    match mode {
-        ScatteringMode::Rayleigh => rayleigh_phase(mu),
-        ScatteringMode::Aerosol { .. } => scene.phase_table.eval_scalar(PhaseFrame {
-            mu,
-            band_index,
-            mode,
-        }),
-    }
+fn read_buffer<T: Pod>(
+    device: &wgpu::Device,
+    buffer: &wgpu::Buffer,
+) -> Result<Vec<T>, RenderError> {
+    let slice = buffer.slice(..);
+    let (sender, receiver) = mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result);
+    });
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(|err| RenderError::Poll(err.to_string()))?;
+    receiver
+        .recv()
+        .map_err(|err| RenderError::BufferMap(err.to_string()))?
+        .map_err(|err| RenderError::BufferMap(err.to_string()))?;
+
+    let mapped = slice.get_mapped_range();
+    let values = bytemuck::cast_slice(&mapped).to_vec();
+    drop(mapped);
+    buffer.unmap();
+    Ok(values)
 }
 
-fn phase_sampling_pdf(scene: &SceneData, mode: ScatteringMode, band_index: usize, mu: f32) -> f32 {
-    match mode {
-        ScatteringMode::Rayleigh => rayleigh_phase(mu),
-        ScatteringMode::Aerosol { species_index } => {
-            scene
-                .phase_table
-                .sampling_pdf(species_index, band_index, mu)
-        }
-    }
-}
-
-fn sun_light_pdf(scene: &SceneData) -> f32 {
-    1.0 / scene.sun.solid_angle_sr
-}
-
-fn balance_heuristic(pdf_a: f32, pdf_b: f32) -> f32 {
-    let denom = pdf_a + pdf_b;
-    if denom > 0.0 { pdf_a / denom } else { 0.0 }
-}
-
-fn mis_weight(pdf_a: f32, samples_a: usize, pdf_b: f32, samples_b: usize) -> f32 {
-    balance_heuristic(pdf_a * samples_a as f32, pdf_b * samples_b as f32)
+fn byte_size<T>(len: usize) -> Result<u64, RenderError> {
+    len.checked_mul(mem::size_of::<T>())
+        .map(|bytes| bytes as u64)
+        .ok_or_else(|| RenderError::InvalidConfig("buffer size overflow".to_owned()))
 }
 
 #[cfg(test)]
@@ -727,108 +481,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn azimuth_symmetry_is_enabled_only_for_exact_mirror_plane() {
-        assert!(can_use_azimuth_symmetry(&RenderConfig {
-            sun_azimuth_deg: 0.0,
+    fn packed_scene_matches_cpu_table_shapes() {
+        let config = RenderConfig {
+            width: 4,
+            height: 2,
+            spp: 1,
             ..RenderConfig::default()
-        }));
-        assert!(can_use_azimuth_symmetry(&RenderConfig {
-            sun_azimuth_deg: 180.0,
-            ..RenderConfig::default()
-        }));
-        assert!(!can_use_azimuth_symmetry(&RenderConfig {
-            sun_azimuth_deg: 90.0,
-            ..RenderConfig::default()
-        }));
-        assert!(!can_use_azimuth_symmetry(&RenderConfig {
-            sun_azimuth_deg: 0.0,
-            use_azimuth_symmetry: false,
-            ..RenderConfig::default()
-        }));
-    }
-
-    #[test]
-    fn balance_heuristic_splits_equal_pdfs() {
-        assert!((balance_heuristic(2.0, 2.0) - 0.5).abs() < 1.0e-6);
-        assert_eq!(balance_heuristic(0.0, 2.0), 0.0);
-    }
-
-    #[test]
-    fn mis_weight_accounts_for_sample_counts() {
-        assert!((mis_weight(2.0, 1, 2.0, 1) - 0.5).abs() < 1.0e-6);
-        assert!((mis_weight(2.0, 2, 2.0, 1) - 2.0 / 3.0).abs() < 1.0e-6);
-        let a = mis_weight(3.0, 2, 5.0, 1);
-        let b = mis_weight(5.0, 1, 3.0, 2);
-        assert!((a + b - 1.0).abs() < 1.0e-6);
-    }
-
-    #[test]
-    fn weighted_collision_uses_albedo_as_throughput() {
-        let mut rng = SamplerState::new(3);
-        let mut throughput = 2.0;
-        assert!(survive_collision(
-            CollisionEstimator::Weighted,
-            0.25,
-            &mut throughput,
-            &mut rng
-        ));
-        assert!((throughput - 0.5).abs() < 1.0e-6);
-
-        assert!(!survive_collision(
-            CollisionEstimator::Analog,
-            0.0,
-            &mut throughput,
-            &mut rng
-        ));
-    }
-
-    #[test]
-    fn spectral_band_streams_can_share_random_numbers() {
-        assert_eq!(
-            band_stream(SpectralCorrelation::Common, 7, 0),
-            band_stream(SpectralCorrelation::Common, 7, 3)
-        );
-        assert_ne!(
-            band_stream(SpectralCorrelation::Independent, 7, 0),
-            band_stream(SpectralCorrelation::Independent, 7, 3)
-        );
-    }
-
-    #[test]
-    fn depth_streams_are_stable_and_distinct() {
-        assert_eq!(
-            depth_stream(SCATTER_LIGHT_STREAM, 2),
-            depth_stream(SCATTER_LIGHT_STREAM, 2)
-        );
-        assert_ne!(
-            depth_stream(SCATTER_LIGHT_STREAM, 2),
-            depth_stream(SCATTER_LIGHT_STREAM, 3)
-        );
-        assert_ne!(
-            depth_stream(SCATTER_LIGHT_STREAM, 2),
-            depth_stream(GROUND_LIGHT_STREAM, 2)
-        );
-    }
-
-    #[test]
-    fn mixed_phase_value_and_pdf_sum_all_components() {
+        };
         let scene =
             crate::data::load_scene_data(std::path::Path::new("data"), 0.0, 0.0).expect("scene");
-        let mut coeffs = MediumCoefficients {
-            rayleigh_scattering_km_inv: 1.0,
-            ..MediumCoefficients::default()
-        };
-        coeffs.aerosol_scattering_km_inv[0] = 3.0;
+        let packed = PackedScene::new(&scene, &config).expect("packed scene");
 
-        let mu = 0.35;
-        let rayleigh = rayleigh_phase(mu);
-        let aerosol_mode = ScatteringMode::Aerosol { species_index: 0 };
-        let aerosol = phase_value(&scene, aerosol_mode, 0, mu);
-        let aerosol_pdf = phase_sampling_pdf(&scene, aerosol_mode, 0, mu);
-        let expected_phase = 0.25 * rayleigh + 0.75 * aerosol;
-        let expected_pdf = 0.25 * rayleigh + 0.75 * aerosol_pdf;
-
-        assert!((mixed_phase_value(&scene, coeffs, 0, mu) - expected_phase).abs() < 1.0e-6);
-        assert!((mixed_phase_sampling_pdf(&scene, coeffs, 0, mu) - expected_pdf).abs() < 1.0e-6);
+        assert_eq!(packed.bands.len(), BAND_COUNT);
+        assert_eq!(packed.atmosphere.len(), scene.atmospheric_profile.len());
+        assert_eq!(packed.aerosol.len(), scene.aerosol_profile.len());
+        assert_eq!(packed.aerosol_optics.len(), BAND_COUNT * SPECIES_COUNT);
+        assert_eq!(
+            packed.majorants.len(),
+            BAND_COUNT * scene.majorant_grid.layer_count
+        );
+        assert_eq!(
+            packed.phase_values.len(),
+            SPECIES_COUNT * BAND_COUNT * PHASE_BINS
+        );
+        assert_eq!(
+            packed.aerosol_optics[3].absorption_km_inv_per_g_m3,
+            scene.aerosol_optics[0][3].absorption_km_inv_per_g_m3
+        );
+        assert_eq!(
+            packed.majorants[scene.majorant_grid.layer_count],
+            scene.majorant_grid.values_km_inv[scene.majorant_grid.layer_count]
+        );
     }
 }

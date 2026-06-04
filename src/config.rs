@@ -1,124 +1,4 @@
 use std::path::PathBuf;
-use std::str::FromStr;
-use std::{fmt, fmt::Display};
-
-use crate::sampling::SamplerKind;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TransmittanceEstimator {
-    Ratio,
-    ResidualRatio,
-}
-
-impl Display for TransmittanceEstimator {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Ratio => write!(f, "ratio"),
-            Self::ResidualRatio => write!(f, "residual"),
-        }
-    }
-}
-
-impl FromStr for TransmittanceEstimator {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "ratio" | "ratio-tracking" => Ok(Self::Ratio),
-            "residual" | "residual-ratio" | "residual-ratio-tracking" => Ok(Self::ResidualRatio),
-            _ => Err(format!(
-                "unknown transmittance estimator `{s}`; expected `residual` or `ratio`"
-            )),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CollisionEstimator {
-    Analog,
-    Weighted,
-}
-
-impl Display for CollisionEstimator {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Analog => write!(f, "analog"),
-            Self::Weighted => write!(f, "weighted"),
-        }
-    }
-}
-
-impl FromStr for CollisionEstimator {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "analog" | "roulette" | "absorption-roulette" => Ok(Self::Analog),
-            "weighted" | "weighted-absorption" | "survival-biasing" => Ok(Self::Weighted),
-            _ => Err(format!(
-                "unknown collision estimator `{s}`; expected `weighted` or `analog`"
-            )),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SpectralCorrelation {
-    Common,
-    Independent,
-}
-
-impl Display for SpectralCorrelation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Common => write!(f, "common"),
-            Self::Independent => write!(f, "independent"),
-        }
-    }
-}
-
-impl FromStr for SpectralCorrelation {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "common" | "crn" | "common-random" | "common-random-numbers" => Ok(Self::Common),
-            "independent" | "decorrelated" => Ok(Self::Independent),
-            _ => Err(format!(
-                "unknown spectral correlation `{s}`; expected `common` or `independent`"
-            )),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GroundEstimator {
-    DirectOnly,
-    LambertPath,
-}
-
-impl Display for GroundEstimator {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::DirectOnly => write!(f, "direct"),
-            Self::LambertPath => write!(f, "path"),
-        }
-    }
-}
-
-impl FromStr for GroundEstimator {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "direct" | "direct-only" => Ok(Self::DirectOnly),
-            "path" | "lambert-path" | "bounce" => Ok(Self::LambertPath),
-            _ => Err(format!(
-                "unknown ground estimator `{s}`; expected `path` or `direct`"
-            )),
-        }
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct RenderConfig {
@@ -131,14 +11,7 @@ pub struct RenderConfig {
     pub sun_elevation_deg: f32,
     pub sun_azimuth_deg: f32,
     pub observer_altitude_km: f32,
-    pub use_azimuth_symmetry: bool,
-    pub sampler: SamplerKind,
-    pub transmittance_estimator: TransmittanceEstimator,
-    pub collision_estimator: CollisionEstimator,
-    pub spectral_correlation: SpectralCorrelation,
-    pub ground_estimator: GroundEstimator,
     pub direct_light_samples: usize,
-    pub max_depth: usize,
     pub png_exposure: f32,
 }
 
@@ -154,72 +27,8 @@ impl Default for RenderConfig {
             sun_elevation_deg: 0.0,
             sun_azimuth_deg: 0.0,
             observer_altitude_km: 0.2,
-            use_azimuth_symmetry: true,
-            sampler: SamplerKind::RandomizedQmc,
-            transmittance_estimator: TransmittanceEstimator::ResidualRatio,
-            collision_estimator: CollisionEstimator::Weighted,
-            spectral_correlation: SpectralCorrelation::Common,
-            ground_estimator: GroundEstimator::DirectOnly,
             direct_light_samples: 2,
-            max_depth: 16,
             png_exposure: 0.01,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn transmittance_estimator_parses_cli_names() {
-        assert_eq!(
-            "residual".parse::<TransmittanceEstimator>().unwrap(),
-            TransmittanceEstimator::ResidualRatio
-        );
-        assert_eq!(
-            "ratio".parse::<TransmittanceEstimator>().unwrap(),
-            TransmittanceEstimator::Ratio
-        );
-        assert!("bad".parse::<TransmittanceEstimator>().is_err());
-    }
-
-    #[test]
-    fn collision_estimator_parses_cli_names() {
-        assert_eq!(
-            "weighted".parse::<CollisionEstimator>().unwrap(),
-            CollisionEstimator::Weighted
-        );
-        assert_eq!(
-            "analog".parse::<CollisionEstimator>().unwrap(),
-            CollisionEstimator::Analog
-        );
-        assert!("bad".parse::<CollisionEstimator>().is_err());
-    }
-
-    #[test]
-    fn spectral_correlation_parses_cli_names() {
-        assert_eq!(
-            "common".parse::<SpectralCorrelation>().unwrap(),
-            SpectralCorrelation::Common
-        );
-        assert_eq!(
-            "independent".parse::<SpectralCorrelation>().unwrap(),
-            SpectralCorrelation::Independent
-        );
-        assert!("bad".parse::<SpectralCorrelation>().is_err());
-    }
-
-    #[test]
-    fn ground_estimator_parses_cli_names() {
-        assert_eq!(
-            "path".parse::<GroundEstimator>().unwrap(),
-            GroundEstimator::LambertPath
-        );
-        assert_eq!(
-            "direct".parse::<GroundEstimator>().unwrap(),
-            GroundEstimator::DirectOnly
-        );
-        assert!("bad".parse::<GroundEstimator>().is_err());
     }
 }
