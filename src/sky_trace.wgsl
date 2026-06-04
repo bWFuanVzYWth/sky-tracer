@@ -3,7 +3,9 @@ const SPECIES_COUNT: u32 = 4u;
 const PI: f32 = 3.14159265358979323846;
 const INV_PI: f32 = 0.31830988618379067154;
 const TAU: f32 = 6.28318530717958647692;
-const RAY_EPSILON_KM: f32 = 0.0001;
+// At Earth-radius coordinates, f32 ULP is about 0.00049 km; keep ray offsets
+// several ULPs wide so ground shadow rays do not self-intersect.
+const RAY_EPSILON_KM: f32 = 0.005;
 const GROUND_ALBEDO: f32 = 0.3;
 const ISOTROPIC_PDF: f32 = 0.07957747154594766788;
 
@@ -126,7 +128,10 @@ struct Basis {
 }
 
 struct Rng {
-    state: u32,
+    pixel: u32,
+    sample: u32,
+    band: u32,
+    dimension: u32,
 }
 
 struct TraceResult {
@@ -144,28 +149,34 @@ struct TraceResult {
 @group(0) @binding(7) var<storage, read_write> film: array<f32>;
 @group(0) @binding(8) var<storage, read_write> diagnostics: Diagnostics;
 
-fn hash32(x: u32) -> u32 {
-    var v = x;
-    v = v ^ (v >> 16u);
-    v = v * 0x7feb352du;
-    v = v ^ (v >> 15u);
-    v = v * 0x846ca68bu;
-    v = v ^ (v >> 16u);
+fn pcg4d(input: vec4u) -> vec4u {
+    var v = input * 1664525u + 1013904223u;
+    v.x = v.x + v.y * v.w;
+    v.y = v.y + v.z * v.x;
+    v.z = v.z + v.x * v.y;
+    v.w = v.w + v.y * v.z;
+    v = v ^ (v >> vec4u(16u));
+    v.x = v.x + v.y * v.w;
+    v.y = v.y + v.z * v.x;
+    v.z = v.z + v.x * v.y;
+    v.w = v.w + v.y * v.z;
     return v;
 }
 
 fn make_rng(pixel: u32, sample: u32, band: u32) -> Rng {
-    let seed = constants.seed_lo
-        ^ hash32(constants.seed_hi)
-        ^ hash32(pixel * 0x9e3779b9u)
-        ^ hash32(sample * 0x85ebca6bu)
-        ^ hash32(band * 0xc2b2ae35u);
-    return Rng(hash32(seed));
+    return Rng(pixel, sample, band, 0u);
 }
 
 fn rng_next_u32(rng: ptr<function, Rng>) -> u32 {
-    (*rng).state = (*rng).state * 1664525u + 1013904223u;
-    return hash32((*rng).state);
+    let counter = vec4u(
+        (*rng).pixel ^ constants.seed_lo,
+        (*rng).sample ^ constants.seed_hi,
+        (*rng).band,
+        (*rng).dimension,
+    );
+    (*rng).dimension = (*rng).dimension + 1u;
+    let value = pcg4d(counter);
+    return value.x ^ value.y ^ value.z ^ value.w;
 }
 
 fn rng_f32(rng: ptr<function, Rng>) -> f32 {
@@ -195,7 +206,8 @@ fn sun_dir() -> vec3f {
 
 fn intersect_sphere(ray: Ray, radius: f32) -> SphereHit {
     let b = dot(ray.origin, ray.dir);
-    let c = dot(ray.origin, ray.origin) - radius * radius;
+    let origin_radius = length(ray.origin);
+    let c = (origin_radius - radius) * (origin_radius + radius);
     let discriminant = b * b - c;
     if discriminant < 0.0 {
         return SphereHit(false, 0.0, 0.0);
