@@ -11,3 +11,6 @@ serde_json = { workspace = true }
 sky-core = { path = "../sky-core" }
 wgpu = { workspace = true }
 winit = { workspace = true }
+
+[dev-dependencies]
+naga = { version = "29.0.3", features = ["wgsl-in"] }
