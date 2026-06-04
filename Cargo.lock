@@ -666,6 +666,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "glam"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8fb167719045debebe9f532320accc7b5c993c5a3b813f5696a11d5ca7bdc57b"
+
+[[package]]
 name = "glow"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1808,6 +1814,7 @@ name = "sky-bake"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "exr",
  "serde_json",
  "sky-core",
  "sky-offline",
@@ -1833,15 +1840,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "sky-realtime-atmosphere"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "glam",
+ "naga",
+ "wgpu",
+]
+
+[[package]]
 name = "sky-realtime-demo"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
  "clap",
+ "exr",
+ "glam",
  "naga",
  "pollster",
  "serde_json",
  "sky-core",
+ "sky-realtime-atmosphere",
  "wgpu",
  "winit",
 ]

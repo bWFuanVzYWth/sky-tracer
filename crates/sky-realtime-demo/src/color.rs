@@ -7,27 +7,28 @@ pub struct DisplayTransform {
 impl Default for DisplayTransform {
     fn default() -> Self {
         Self {
-            output_space: OutputColorSpace::Rec2020LinearDebug,
-            exposure: 1.0,
+            output_space: OutputColorSpace::SrgbOpenDrtDebug,
+            exposure: 0.1,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutputColorSpace {
-    Rec2020LinearDebug,
+    SrgbOpenDrtDebug,
 }
 
 impl OutputColorSpace {
-    pub fn shader_id(self) -> f32 {
+    #[allow(dead_code)]
+    pub const fn shader_id(self) -> f32 {
         match self {
-            Self::Rec2020LinearDebug => 0.0,
+            Self::SrgbOpenDrtDebug => 0.0,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Rec2020LinearDebug => "rec2020-linear-debug",
+            Self::SrgbOpenDrtDebug => "srgb-opendrt-debug",
         }
     }
 }

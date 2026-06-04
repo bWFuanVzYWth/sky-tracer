@@ -72,6 +72,10 @@ impl RealtimeAsset {
             .collect()
     }
 
+    pub fn rgb_exr_path(&self) -> PathBuf {
+        self.root_dir.join(&self.manifest.files.rgb_exr)
+    }
+
     fn referenced_files(&self) -> Vec<PathBuf> {
         let mut files = Vec::with_capacity(2 + self.manifest.files.band_exrs.len());
         files.push(self.root_dir.join(&self.manifest.files.rgb_exr));

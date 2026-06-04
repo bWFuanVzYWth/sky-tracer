@@ -1,0 +1,12 @@
+[package]
+name = "sky-realtime-atmosphere"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bytemuck = { workspace = true }
+glam = { workspace = true }
+wgpu = { workspace = true }
+
+[dev-dependencies]
+naga = { version = "29.0.3", features = ["wgsl-in"] }

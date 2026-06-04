@@ -27,10 +27,16 @@ impl GpuContext {
             })
             .await
             .map_err(|error| error.to_string())?;
+        let required_features = sky_realtime_atmosphere::REQUIRED_FEATURES;
+        if !adapter.features().contains(required_features) {
+            return Err(format!(
+                "adapter does not support required realtime atmosphere features: {required_features:?}"
+            ));
+        }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("sky_realtime_demo_device"),
-                required_features: wgpu::Features::empty(),
+                required_features,
                 required_limits: wgpu::Limits::default(),
                 memory_hints: wgpu::MemoryHints::Performance,
                 ..Default::default()
@@ -118,12 +124,8 @@ impl GpuContext {
             }
             wgpu::CurrentSurfaceTexture::Validation => return Err(SurfaceFrameStatus::Exit),
         };
-        let view = texture
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
         Ok(SurfaceFrame {
             texture,
-            view,
             reconfigure_after_present,
         })
     }
@@ -131,7 +133,6 @@ impl GpuContext {
 
 pub struct SurfaceFrame {
     pub texture: wgpu::SurfaceTexture,
-    pub view: wgpu::TextureView,
     pub reconfigure_after_present: bool,
 }
 

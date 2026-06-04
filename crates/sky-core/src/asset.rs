@@ -14,7 +14,25 @@ pub struct SpectralAssetManifest {
     pub observer_altitude_km: f32,
     pub band_centers_nm: Vec<f32>,
     pub data_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub colorimetry: Option<SpectralAssetColorimetry>,
     pub files: SpectralAssetFiles,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SpectralAssetColorimetry {
+    pub cmf: String,
+    pub cmf_source: String,
+    pub rgb_color_space: String,
+    pub white_balance: SpectralAssetWhiteBalance,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SpectralAssetWhiteBalance {
+    pub method: String,
+    pub source_white_xyz_y1: [f32; 3],
+    pub target_white_xyz_y1: [f32; 3],
+    pub xyz_from_xyz: [[f32; 3]; 3],
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -46,6 +64,7 @@ impl SpectralAssetManifest {
             observer_altitude_km,
             band_centers_nm,
             data_hash: None,
+            colorimetry: None,
             files,
         }
     }

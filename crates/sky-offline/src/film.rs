@@ -6,7 +6,7 @@ use exr::prelude::write_rgb_file;
 use image::{ImageBuffer, RgbImage};
 
 use sky_core::math::{Rgb, clamp01};
-use sky_core::spectrum::{SpectralBand, spectral_to_linear_srgb};
+use sky_core::spectrum::{SpectralBand, SpectralRgbConverter};
 
 #[derive(Clone, Debug)]
 pub struct Film {
@@ -67,6 +67,17 @@ impl Film {
     ) -> Result<(), Box<dyn Error>> {
         fs::create_dir_all(out_dir.join("bands"))?;
         self.write_band_exrs(&out_dir.join("bands"), bands)?;
+        self.write_rgb_outputs(out_dir, bands, png_exposure)?;
+        Ok(())
+    }
+
+    pub fn write_rgb_outputs(
+        &self,
+        out_dir: &Path,
+        bands: &[SpectralBand],
+        png_exposure: f32,
+    ) -> Result<(), Box<dyn Error>> {
+        fs::create_dir_all(out_dir)?;
         self.write_rgb_exr(&out_dir.join("sky_rgb.exr"), bands)?;
         self.write_png(&out_dir.join("sky_rgb.png"), bands, png_exposure)?;
         Ok(())
@@ -89,9 +100,12 @@ impl Film {
     }
 
     fn write_rgb_exr(&self, path: &Path, bands: &[SpectralBand]) -> Result<(), Box<dyn Error>> {
+        let converter = SpectralRgbConverter::new_solar_d65(bands);
         write_rgb_file(path, self.width, self.height, |x, y| {
             let pixel = y * self.width + x;
-            let rgb = spectral_to_linear_srgb(bands, self.pixel_spectrum(pixel)).finite_or_black();
+            let rgb = converter
+                .to_linear_srgb(self.pixel_spectrum(pixel))
+                .finite_or_black();
             (rgb.r, rgb.g, rgb.b)
         })?;
         Ok(())
@@ -103,12 +117,14 @@ impl Film {
         bands: &[SpectralBand],
         exposure: f32,
     ) -> Result<(), Box<dyn Error>> {
+        let converter = SpectralRgbConverter::new_solar_d65(bands);
         let mut image: RgbImage = ImageBuffer::new(self.width as u32, self.height as u32);
         for y in 0..self.height {
             for x in 0..self.width {
                 let pixel = y * self.width + x;
-                let rgb =
-                    spectral_to_linear_srgb(bands, self.pixel_spectrum(pixel)).finite_or_black();
+                let rgb = converter
+                    .to_linear_srgb(self.pixel_spectrum(pixel))
+                    .finite_or_black();
                 let mapped = tonemap(rgb, exposure);
                 image.put_pixel(
                     x as u32,

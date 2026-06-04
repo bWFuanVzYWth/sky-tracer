@@ -4,15 +4,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{WindowAttributes, WindowId};
 
 use crate::assets::RealtimeAsset;
 use crate::color::DisplayTransform;
-use crate::experiment::{ExperimentInit, FrameContext, RealtimeExperiment, UpdateContext};
+use crate::experiment::{
+    CompareMode, ExperimentInit, FrameContext, RealtimeExperiment, UpdateContext,
+};
 use crate::gpu::{GpuContext, SurfaceFrameStatus};
-use crate::passes::fullscreen_debug::FullscreenDebugExperiment;
+use crate::passes::hillaire_atmosphere::HillaireAtmosphereExperiment;
 use crate::view::ViewController;
 
 pub struct RunConfig {
@@ -35,6 +38,7 @@ pub fn run(config: RunConfig) -> Result<(), Box<dyn Error>> {
         gpu: None,
         experiment: None,
         view: ViewController::default(),
+        compare_mode: CompareMode::default(),
         init_error: None,
     };
     event_loop.run_app(&mut app)?;
@@ -49,6 +53,7 @@ struct DemoApp {
     gpu: Option<GpuContext>,
     experiment: Option<Box<dyn RealtimeExperiment>>,
     view: ViewController,
+    compare_mode: CompareMode,
     init_error: Option<String>,
 }
 
@@ -74,6 +79,8 @@ impl DemoApp {
                 return;
             }
         };
+        let reconfigure_after_present = frame.reconfigure_after_present;
+        let texture = frame.texture;
 
         let mut encoder = gpu
             .device()
@@ -81,20 +88,28 @@ impl DemoApp {
                 label: Some("sky_realtime_demo_frame_encoder"),
             });
 
-        experiment.update(UpdateContext {
-            queue: gpu.queue(),
-            asset: &self.asset,
-            view: self.view.state(),
-        });
-        experiment.render(FrameContext {
-            encoder: &mut encoder,
-            target: &frame.view,
-        });
+        {
+            let view = texture
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            experiment.update(UpdateContext {
+                asset: &self.asset,
+                view: self.view.state(),
+                compare_mode: self.compare_mode,
+            });
+            experiment.render(FrameContext {
+                device: gpu.device(),
+                queue: gpu.queue(),
+                encoder: &mut encoder,
+                target: &view,
+                surface_size: gpu.size(),
+            });
+        }
 
         gpu.queue().submit([encoder.finish()]);
-        frame.texture.present();
+        texture.present();
 
-        if frame.reconfigure_after_present {
+        if reconfigure_after_present {
             gpu.resize(gpu.size());
             experiment.resize(gpu.size());
         }
@@ -102,6 +117,26 @@ impl DemoApp {
 
     fn window_id(&self) -> Option<WindowId> {
         self.gpu.as_ref().map(|gpu| gpu.window().id())
+    }
+
+    fn handle_compare_key(&mut self, event: &KeyEvent) -> bool {
+        if event.state != ElementState::Pressed || event.repeat {
+            return false;
+        }
+        let mode = match event.physical_key {
+            PhysicalKey::Code(KeyCode::Digit1) => Some(CompareMode::Realtime),
+            PhysicalKey::Code(KeyCode::Digit2) => Some(CompareMode::Reference),
+            PhysicalKey::Code(KeyCode::Digit3) => Some(CompareMode::AbsoluteDifference),
+            PhysicalKey::Code(KeyCode::Digit4) => Some(CompareMode::SignedDifference),
+            PhysicalKey::Code(KeyCode::KeyD) => Some(self.compare_mode.next()),
+            _ => None,
+        };
+        let Some(mode) = mode else {
+            return false;
+        };
+        self.compare_mode = mode;
+        println!("comparison mode: {}", self.compare_mode.label());
+        true
     }
 }
 
@@ -133,14 +168,25 @@ impl ApplicationHandler for DemoApp {
         let display = DisplayTransform::default();
         println!("display transform: {}", display.output_space.label());
         println!("view controls: left drag = yaw/pitch, mouse wheel = fov, R = reset");
+        println!(
+            "comparison controls: 1 realtime, 2 reference, 3 abs diff, 4 signed diff, D cycle"
+        );
 
         let mut experiment: Box<dyn RealtimeExperiment> =
-            Box::new(FullscreenDebugExperiment::new(ExperimentInit {
+            match HillaireAtmosphereExperiment::new(ExperimentInit {
                 device: gpu.device(),
+                queue: gpu.queue(),
                 surface_format: gpu.surface_format(),
                 asset: &self.asset,
                 display,
-            }));
+            }) {
+                Ok(experiment) => Box::new(experiment),
+                Err(error) => {
+                    self.init_error = Some(error);
+                    event_loop.exit();
+                    return;
+                }
+            };
         experiment.resize(gpu.size());
 
         println!("selected realtime experiment: {}", experiment.name());
@@ -178,6 +224,7 @@ impl ApplicationHandler for DemoApp {
                 self.view.mouse_wheel(delta);
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                self.handle_compare_key(&event);
                 self.view.keyboard_input(&event);
             }
             WindowEvent::RedrawRequested => self.render_frame(event_loop),
