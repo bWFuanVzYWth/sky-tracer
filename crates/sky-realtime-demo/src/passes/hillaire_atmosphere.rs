@@ -163,6 +163,7 @@ pub(super) struct TexturePresentPass {
     bind_group: wgpu::BindGroup,
     uniform_buffer: wgpu::Buffer,
     exposure: f32,
+    reference_projection_sun_observer: [f32; 4],
 }
 
 impl TexturePresentPass {
@@ -177,6 +178,7 @@ impl TexturePresentPass {
             label: Some("hillaire_present_shader"),
             source: wgpu::ShaderSource::Wgsl(PRESENT_SHADER.into()),
         });
+        let reference_projection_sun_observer = reference.projection_sun_observer();
         let uniform = PresentUniform {
             exposure_mode_ref_diff: [exposure.max(0.0), 0.0, reference.has_reference(), 4.0],
             view_yaw_pitch_fov_aspect: [
@@ -185,6 +187,7 @@ impl TexturePresentPass {
                 ViewState::default().fov_y_deg,
                 1.0,
             ],
+            reference_projection_sun_observer,
         };
         let uniform_buffer = wgpu::util::DeviceExt::create_buffer_init(
             device,
@@ -263,6 +266,7 @@ impl TexturePresentPass {
             bind_group,
             uniform_buffer,
             exposure,
+            reference_projection_sun_observer,
         }
     }
 
@@ -298,6 +302,7 @@ impl TexturePresentPass {
                 4.0,
             ],
             view_yaw_pitch_fov_aspect: [view.yaw_deg, view.pitch_deg, view.fov_y_deg, aspect],
+            reference_projection_sun_observer: self.reference_projection_sun_observer,
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
     }
@@ -361,15 +366,17 @@ fn present_bind_group(
 struct PresentUniform {
     exposure_mode_ref_diff: [f32; 4],
     view_yaw_pitch_fov_aspect: [f32; 4],
+    reference_projection_sun_observer: [f32; 4],
 }
 
-const _: () = assert!(core::mem::size_of::<PresentUniform>() == 32);
+const _: () = assert!(core::mem::size_of::<PresentUniform>() == 48);
 
 pub(super) struct ReferenceTexture {
     _texture: wgpu::Texture,
     view: wgpu::TextureView,
     sampler: wgpu::Sampler,
     available: bool,
+    projection_sun_observer: [f32; 4],
 }
 
 impl ReferenceTexture {
@@ -378,6 +385,13 @@ impl ReferenceTexture {
         queue: &wgpu::Queue,
         asset: &RealtimeAsset,
     ) -> Self {
+        let manifest = asset.manifest();
+        let projection_sun_observer = [
+            asset.reference_projection_id(),
+            manifest.sun_elevation_deg,
+            manifest.sun_azimuth_deg,
+            manifest.observer_altitude_km,
+        ];
         let path = asset.rgb_exr_path();
         match load_reference_rgba32f(&path) {
             Ok((width, height, rgba)) => {
@@ -387,14 +401,30 @@ impl ReferenceTexture {
                     width,
                     height
                 );
-                Self::from_rgba32f(device, queue, width, height, &rgba, true)
+                Self::from_rgba32f(
+                    device,
+                    queue,
+                    width,
+                    height,
+                    &rgba,
+                    true,
+                    projection_sun_observer,
+                )
             }
             Err(error) => {
                 eprintln!(
                     "warning: failed to load linear offline reference {}: {error}",
                     path.display()
                 );
-                Self::from_rgba32f(device, queue, 1, 1, &[0.0, 0.0, 0.0, 1.0], false)
+                Self::from_rgba32f(
+                    device,
+                    queue,
+                    1,
+                    1,
+                    &[0.0, 0.0, 0.0, 1.0],
+                    false,
+                    projection_sun_observer,
+                )
             }
         }
     }
@@ -406,6 +436,7 @@ impl ReferenceTexture {
         height: u32,
         rgba: &[f32],
         available: bool,
+        projection_sun_observer: [f32; 4],
     ) -> Self {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("offline_reference_rgb_exr"),
@@ -458,6 +489,7 @@ impl ReferenceTexture {
             view,
             sampler,
             available,
+            projection_sun_observer,
         }
     }
 
@@ -467,6 +499,10 @@ impl ReferenceTexture {
 
     fn has_reference(&self) -> f32 {
         if self.available { 1.0 } else { 0.0 }
+    }
+
+    fn projection_sun_observer(&self) -> [f32; 4] {
+        self.projection_sun_observer
     }
 }
 

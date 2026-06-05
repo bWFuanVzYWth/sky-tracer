@@ -14,7 +14,7 @@ use sky_core::spectrum::{
     CIE_1931_2DEG_CMF_NAME, CIE_1931_2DEG_CMF_SOURCE, LINEAR_SRGB_D65_NAME, SpectralBand,
     SpectralRgbConverter,
 };
-use sky_offline::config::RenderConfig;
+use sky_offline::config::{OutputProjection, RenderConfig};
 use sky_offline::film::Film;
 use sky_offline::integrator::render;
 
@@ -41,8 +41,10 @@ struct Cli {
     observer_altitude_km: f32,
     #[arg(long, default_value_t = 1)]
     direct_light_samples: usize,
-    #[arg(long, default_value_t = 0.01)]
+    #[arg(long, default_value_t = 0.1)]
     png_exposure: f32,
+    #[arg(long)]
+    sky_view_lut: bool,
     #[arg(long)]
     rebuild_rgb_only: bool,
 }
@@ -62,6 +64,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         observer_altitude_km: cli.observer_altitude_km,
         direct_light_samples: cli.direct_light_samples,
         png_exposure: cli.png_exposure,
+        output_projection: if cli.sky_view_lut {
+            OutputProjection::SkyViewLut
+        } else {
+            OutputProjection::Panorama
+        },
     };
 
     let load_start = Instant::now();
@@ -94,7 +101,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     println!(
-        "config: gpu-integrator direct-light-samples={}",
+        "config: gpu-integrator output={} direct-light-samples={}",
+        config.output_projection.label(),
         config.direct_light_samples
     );
 
@@ -109,9 +117,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let total_elapsed = total_start.elapsed();
 
     println!(
-        "wrote {}x{} panorama with {} spp to {}",
+        "wrote {}x{} {} with {} spp to {}",
         film.width(),
         film.height(),
+        config.output_projection.label(),
         config.spp,
         config.out_dir.display()
     );
@@ -206,16 +215,30 @@ fn write_asset_manifest(config: &RenderConfig, scene: &SceneData) -> Result<(), 
         rgb_png: "sky_rgb.png".to_owned(),
         band_exrs,
     };
-    let mut manifest = SpectralAssetManifest::spectral_panorama(
-        [config.width, config.height],
-        config.spp,
-        config.seed,
-        config.sun_elevation_deg,
-        config.sun_azimuth_deg,
-        config.observer_altitude_km,
-        scene.bands.iter().map(|band| band.center_nm).collect(),
-        files,
-    );
+    let dimensions = [config.width, config.height];
+    let band_centers_nm = scene.bands.iter().map(|band| band.center_nm).collect();
+    let mut manifest = match config.output_projection {
+        OutputProjection::Panorama => SpectralAssetManifest::spectral_panorama(
+            dimensions,
+            config.spp,
+            config.seed,
+            config.sun_elevation_deg,
+            config.sun_azimuth_deg,
+            config.observer_altitude_km,
+            band_centers_nm,
+            files,
+        ),
+        OutputProjection::SkyViewLut => SpectralAssetManifest::spectral_sky_view_lut(
+            dimensions,
+            config.spp,
+            config.seed,
+            config.sun_elevation_deg,
+            config.sun_azimuth_deg,
+            config.observer_altitude_km,
+            band_centers_nm,
+            files,
+        ),
+    };
     manifest.colorimetry = Some(colorimetry_from_scene(scene));
     let path = config.out_dir.join("asset.json");
     let file = File::create(path)?;

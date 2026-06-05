@@ -13,6 +13,31 @@ pub struct RenderConfig {
     pub observer_altitude_km: f32,
     pub direct_light_samples: usize,
     pub png_exposure: f32,
+    pub output_projection: OutputProjection,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutputProjection {
+    Panorama,
+    SkyViewLut,
+}
+
+impl OutputProjection {
+    #[must_use]
+    pub const fn as_gpu_u32(self) -> u32 {
+        match self {
+            Self::Panorama => 0,
+            Self::SkyViewLut => 1,
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Panorama => "panorama",
+            Self::SkyViewLut => "sky-view LUT",
+        }
+    }
 }
 
 impl Default for RenderConfig {
@@ -29,6 +54,7 @@ impl Default for RenderConfig {
             observer_altitude_km: 0.2,
             direct_light_samples: 1,
             png_exposure: 0.01,
+            output_projection: OutputProjection::Panorama,
         }
     }
 }

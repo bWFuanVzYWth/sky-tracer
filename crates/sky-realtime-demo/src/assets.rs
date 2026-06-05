@@ -3,7 +3,7 @@ use std::fmt;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
-use sky_core::asset::{SPECTRAL_PANORAMA_KIND, SpectralAssetManifest};
+use sky_core::asset::{SPECTRAL_PANORAMA_KIND, SPECTRAL_SKY_VIEW_LUT_KIND, SpectralAssetManifest};
 
 #[derive(Clone, Debug)]
 pub struct RealtimeAsset {
@@ -44,7 +44,8 @@ impl RealtimeAsset {
 
     pub fn title(&self) -> String {
         format!(
-            "sky realtime demo - {}x{} {} bands - {} spp",
+            "sky realtime demo - {} {}x{} {} bands - {} spp",
+            self.kind_label(),
             self.manifest.dimensions[0],
             self.manifest.dimensions[1],
             self.manifest.band_centers_nm.len(),
@@ -54,8 +55,9 @@ impl RealtimeAsset {
 
     pub fn summary_line(&self) -> String {
         format!(
-            "{} [{}x{}, {} bands, {} spp, sun elev {:.2} deg, observer {:.3} km]",
+            "{} [{} {}x{}, {} bands, {} spp, sun elev {:.2} deg, observer {:.3} km]",
             self.manifest_path.display(),
+            self.kind_label(),
             self.manifest.dimensions[0],
             self.manifest.dimensions[1],
             self.manifest.band_centers_nm.len(),
@@ -74,6 +76,22 @@ impl RealtimeAsset {
 
     pub fn rgb_exr_path(&self) -> PathBuf {
         self.root_dir.join(&self.manifest.files.rgb_exr)
+    }
+
+    pub fn reference_projection_id(&self) -> f32 {
+        if self.manifest.kind == SPECTRAL_SKY_VIEW_LUT_KIND {
+            1.0
+        } else {
+            0.0
+        }
+    }
+
+    fn kind_label(&self) -> &'static str {
+        if self.manifest.kind == SPECTRAL_SKY_VIEW_LUT_KIND {
+            "sky-view-lut"
+        } else {
+            "panorama"
+        }
     }
 
     fn referenced_files(&self) -> Vec<PathBuf> {
@@ -143,15 +161,15 @@ fn validate_manifest(manifest: &SpectralAssetManifest) -> Result<(), AssetLoadEr
             manifest.version
         )));
     }
-    if manifest.kind != SPECTRAL_PANORAMA_KIND {
+    if manifest.kind != SPECTRAL_PANORAMA_KIND && manifest.kind != SPECTRAL_SKY_VIEW_LUT_KIND {
         return Err(AssetLoadError::InvalidManifest(format!(
-            "unsupported kind {}; expected {SPECTRAL_PANORAMA_KIND}",
+            "unsupported kind {}; expected {SPECTRAL_PANORAMA_KIND} or {SPECTRAL_SKY_VIEW_LUT_KIND}",
             manifest.kind
         )));
     }
     if manifest.dimensions[0] == 0 || manifest.dimensions[1] == 0 {
         return Err(AssetLoadError::InvalidManifest(
-            "panorama dimensions must be non-zero".to_owned(),
+            "asset dimensions must be non-zero".to_owned(),
         ));
     }
     if manifest.spp == 0 {
@@ -193,7 +211,7 @@ fn validate_manifest(manifest: &SpectralAssetManifest) -> Result<(), AssetLoadEr
 
 #[cfg(test)]
 mod tests {
-    use sky_core::asset::{SpectralAssetFiles, SpectralAssetManifest};
+    use sky_core::asset::{SPECTRAL_SKY_VIEW_LUT_KIND, SpectralAssetFiles, SpectralAssetManifest};
 
     use super::{AssetLoadError, validate_manifest};
 
@@ -217,6 +235,13 @@ mod tests {
     #[test]
     fn accepts_valid_spectral_panorama_manifest() {
         validate_manifest(&sample_manifest()).expect("valid manifest");
+    }
+
+    #[test]
+    fn accepts_valid_spectral_sky_view_lut_manifest() {
+        let mut manifest = sample_manifest();
+        manifest.kind = SPECTRAL_SKY_VIEW_LUT_KIND.to_owned();
+        validate_manifest(&manifest).expect("valid manifest");
     }
 
     #[test]

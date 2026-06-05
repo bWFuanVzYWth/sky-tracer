@@ -1,4 +1,5 @@
 target/
 out/
+out_skyview/
 
 run_deepseek*

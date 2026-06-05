@@ -8,6 +8,8 @@ const TAU: f32 = 6.28318530717958647692;
 const RAY_EPSILON_KM: f32 = 0.005;
 const GROUND_ALBEDO: f32 = 0.3;
 const ISOTROPIC_PDF: f32 = 0.07957747154594766788;
+const OUTPUT_PROJECTION_PANORAMA: u32 = 0u;
+const OUTPUT_PROJECTION_SKY_VIEW_LUT: u32 = 1u;
 
 struct Constants {
     width: u32,
@@ -25,7 +27,7 @@ struct Constants {
     seed_lo: u32,
     seed_hi: u32,
     watchdog_limit: u32,
-    _pad0: u32,
+    output_projection: u32,
     _pad1: u32,
     observer_altitude_km: f32,
     ground_radius_km: f32,
@@ -603,17 +605,85 @@ fn ground_radiance(pos: vec3f, band: u32, rng: ptr<function, Rng>) -> f32 {
     return sum / f32(constants.direct_light_samples);
 }
 
-fn camera_ray(u: f32, v: f32) -> Ray {
+fn observer_origin() -> vec3f {
+    return vec3f(0.0, constants.ground_radius_km + max(constants.observer_altitude_km, 0.0), 0.0);
+}
+
+fn panorama_dir(u: f32, v: f32) -> vec3f {
     let azimuth = (u - 0.5) * TAU;
     let elevation = (0.5 - v) * PI;
     let cos_e = cos(elevation);
-    let dir = normalize_or_y(vec3f(
+    return normalize_or_y(vec3f(
         cos_e * sin(azimuth),
         sin(elevation),
         cos_e * cos(azimuth),
     ));
-    let origin = vec3f(0.0, constants.ground_radius_km + max(constants.observer_altitude_km, 0.0), 0.0);
-    return Ray(origin, dir);
+}
+
+fn from_sub_uvs_to_unit(u: f32, resolution: f32) -> f32 {
+    if resolution <= 1.0 {
+        return 0.5;
+    }
+    return (u - 0.5 / resolution) * (resolution / (resolution - 1.0));
+}
+
+fn sky_view_horizon_angles(view_height: f32) -> vec2f {
+    let bottom = constants.ground_radius_km;
+    let v_horizon = sqrt(max(view_height * view_height - bottom * bottom, 0.0));
+    let cos_beta = clamp(v_horizon / max(view_height, 0.000001), 0.0, 1.0);
+    let beta = acos(cos_beta);
+    let zenith_horizon_angle = PI - beta;
+    return vec2f(zenith_horizon_angle, beta);
+}
+
+fn sky_view_lut_dir(u_in: f32, v_in: f32) -> vec3f {
+    let uv = vec2f(
+        clamp(from_sub_uvs_to_unit(u_in, f32(constants.width)), 0.0, 1.0),
+        clamp(from_sub_uvs_to_unit(v_in, f32(constants.height)), 0.0, 1.0),
+    );
+    let view_height = length(observer_origin());
+    let angles = sky_view_horizon_angles(view_height);
+    let zenith_horizon_angle = angles.x;
+    let beta = angles.y;
+
+    var view_zenith_cos_angle: f32;
+    if uv.y < 0.5 {
+        var coord = 2.0 * uv.y;
+        coord = 1.0 - coord;
+        coord = coord * coord;
+        coord = 1.0 - coord;
+        view_zenith_cos_angle = cos(zenith_horizon_angle * coord);
+    } else {
+        var coord = uv.y * 2.0 - 1.0;
+        coord = coord * coord;
+        view_zenith_cos_angle = cos(zenith_horizon_angle + beta * coord);
+    }
+
+    var coord = uv.x;
+    coord = coord * coord;
+    let light_view_cos_angle = -(coord * 2.0 - 1.0);
+
+    let up = vec3f(0.0, 1.0, 0.0);
+    let sun_h = sun_dir() - up * dot(sun_dir(), up);
+    let sun_h_len = length(sun_h);
+    let forward = sun_h / max(sun_h_len, 0.00001);
+    let forward_safe = select(vec3f(1.0, 0.0, 0.0), forward, sun_h_len > 0.00001);
+    let side = normalize(cross(up, forward_safe));
+
+    let sin_view = sqrt(max(1.0 - view_zenith_cos_angle * view_zenith_cos_angle, 0.0));
+    let side_scale = sqrt(max(1.0 - light_view_cos_angle * light_view_cos_angle, 0.0));
+    return normalize_or_y(
+        up * view_zenith_cos_angle
+            + sin_view * (forward_safe * light_view_cos_angle + side * side_scale)
+    );
+}
+
+fn camera_ray(u: f32, v: f32) -> Ray {
+    let origin = observer_origin();
+    if constants.output_projection == OUTPUT_PROJECTION_SKY_VIEW_LUT {
+        return Ray(origin, sky_view_lut_dir(u, v));
+    }
+    return Ray(origin, panorama_dir(u, v));
 }
 
 fn russian_roulette(throughput: ptr<function, f32>, depth: u32, rng: ptr<function, Rng>) -> bool {
@@ -726,8 +796,12 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         }
         let sample_index = constants.sample_offset + sample;
         var rng = make_rng(pixel, sample_index, band);
-        let u = (f32(x) + rng_f32(&rng)) / f32(constants.width);
-        let v = (f32(y) + rng_f32(&rng)) / f32(constants.height);
+        var u = (f32(x) + rng_f32(&rng)) / f32(constants.width);
+        var v = (f32(y) + rng_f32(&rng)) / f32(constants.height);
+        if constants.output_projection == OUTPUT_PROJECTION_SKY_VIEW_LUT {
+            u = (f32(x) + 0.5) / f32(constants.width);
+            v = (f32(y) + 0.5) / f32(constants.height);
+        }
         let traced = trace_path(camera_ray(u, v), band, &rng);
         if traced.watchdog {
             atomicStore(&diagnostics.watchdog, 1u);

@@ -36,8 +36,27 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         ray.dir,
         segment.t_max_km,
     );
+    var radiance = scatter.radiance;
+    if (segment.hits_ground) {
+        let ground_pos = origin.local_pos_km + ray.dir * segment.t_ground_km;
+        let ground_normal = normalize(ground_pos);
+        let sun_cos = max(dot(ground_normal, hp.sun_dir), 0.0);
+        if (sun_cos > 0.0) {
+            let sun_transmittance = transmittance_from_lut(
+                transmittance_lut,
+                lut_sampler,
+                sun_cos,
+                0.0,
+            );
+            radiance += hp.sun_spectral_irradiance
+                * sun_transmittance
+                * hp.ground_albedo_spectral
+                * (sun_cos * ATM_INV_PI)
+                * scatter.transmittance;
+        }
+    }
     let rec2020 = max(
-        white_balanced_linear_rec2020_from_spectral(scatter.radiance),
+        white_balanced_linear_rec2020_from_spectral(radiance),
         vec3<f32>(0.0),
     );
     textureStore(

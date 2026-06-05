@@ -4,6 +4,7 @@ var source_texture: texture_2d<f32>;
 struct PresentParams {
     exposure_mode_ref_diff: vec4<f32>,
     view_yaw_pitch_fov_aspect: vec4<f32>,
+    reference_projection_sun_observer: vec4<f32>,
 };
 
 @group(0) @binding(1)
@@ -19,6 +20,8 @@ const PI: f32 = 3.141592653589793;
 const TAU: f32 = 6.283185307179586;
 const DEG_TO_RAD: f32 = 0.017453292519943295;
 const SQRT3: f32 = 1.7320508075688772;
+const SKY_VIEW_REFERENCE_PROJECTION: f32 = 1.0;
+const SKY_VIEW_GROUND_RADIUS_KM: f32 = 6360.0;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -58,7 +61,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let view_uv = vec2<f32>(framebuffer_uv.x, 1.0 - framebuffer_uv.y);
     let ray = view_ray_from_uv(view_uv);
     let reference_scene_srgb = max(
-        textureSampleLevel(reference_texture, reference_sampler, equirect_uv(ray), 0.0).rgb,
+        textureSampleLevel(reference_texture, reference_sampler, reference_uv(ray), 0.0).rgb,
         vec3<f32>(0.0),
     );
     let reference = display_linear_srgb_from_scene_rec2020(srgb_to_rec2020(reference_scene_srgb));
@@ -168,4 +171,110 @@ fn equirect_uv(ray: vec3<f32>) -> vec2<f32> {
     let u = fract(atan2(dir.x, dir.z) / TAU + 0.5);
     let v = clamp(0.5 - asin(clamp(dir.y, -1.0, 1.0)) / PI, 0.0, 1.0);
     return vec2<f32>(u, v);
+}
+
+fn reference_uv(ray: vec3<f32>) -> vec2<f32> {
+    if present.reference_projection_sun_observer.x >= SKY_VIEW_REFERENCE_PROJECTION {
+        return sky_view_uv_from_dir(ray);
+    }
+    return equirect_uv(ray);
+}
+
+fn reference_sun_dir() -> vec3<f32> {
+    let elevation = present.reference_projection_sun_observer.y * DEG_TO_RAD;
+    let azimuth = present.reference_projection_sun_observer.z * DEG_TO_RAD;
+    return normalize(vec3<f32>(
+        sin(azimuth) * cos(elevation),
+        sin(elevation),
+        cos(azimuth) * cos(elevation),
+    ));
+}
+
+fn sky_view_height_km() -> f32 {
+    return SKY_VIEW_GROUND_RADIUS_KM + max(present.reference_projection_sun_observer.w, 0.0);
+}
+
+fn ray_sphere_intersection(ro: vec3<f32>, rd: vec3<f32>, radius: f32) -> f32 {
+    let b = dot(ro, rd);
+    let c = dot(ro, ro) - radius * radius;
+    if (c > 0.0 && b > 0.0) {
+        return -1.0;
+    }
+    let d = b * b - c;
+    if (d < 0.0) {
+        return -1.0;
+    }
+    if (d > b * b) {
+        return -b + sqrt(d);
+    }
+    return -b - sqrt(d);
+}
+
+fn sky_view_horizon_angles(view_height: f32) -> vec2<f32> {
+    let v_horizon = sqrt(max(view_height * view_height - SKY_VIEW_GROUND_RADIUS_KM * SKY_VIEW_GROUND_RADIUS_KM, 0.0));
+    let cos_beta = clamp(v_horizon / max(view_height, 1.0e-6), 0.0, 1.0);
+    let beta = acos(cos_beta);
+    let zenith_horizon_angle = PI - beta;
+    return vec2<f32>(zenith_horizon_angle, beta);
+}
+
+fn from_unit_to_sub_uvs(u: f32, resolution: f32) -> f32 {
+    return (u + 0.5 / resolution) * (resolution / (resolution + 1.0));
+}
+
+fn sky_view_uv_from_dir(ray: vec3<f32>) -> vec2<f32> {
+    let dir = normalize(ray);
+    let dims = vec2<f32>(textureDimensions(reference_texture));
+    let up = vec3<f32>(0.0, 1.0, 0.0);
+    let view_zenith_cos_angle = dot(dir, up);
+
+    let view_h = dir - up * view_zenith_cos_angle;
+    let sun = reference_sun_dir();
+    let sun_h = sun - up * dot(sun, up);
+    let view_h_len = length(view_h);
+    let sun_h_len = length(sun_h);
+    let view_h_dir = view_h / max(view_h_len, 1.0e-5);
+    let sun_h_dir = sun_h / max(sun_h_len, 1.0e-5);
+    let light_view_cos_angle = select(
+        1.0,
+        dot(view_h_dir, sun_h_dir),
+        view_h_len > 1.0e-5 && sun_h_len > 1.0e-5,
+    );
+
+    let origin = vec3<f32>(0.0, sky_view_height_km(), 0.0);
+    let intersect_ground = ray_sphere_intersection(origin, dir, SKY_VIEW_GROUND_RADIUS_KM) >= 0.0;
+    return sky_view_params_to_uv(view_zenith_cos_angle, light_view_cos_angle, intersect_ground, dims);
+}
+
+fn sky_view_params_to_uv(
+    view_zenith_cos_angle: f32,
+    light_view_cos_angle: f32,
+    intersect_ground: bool,
+    dims: vec2<f32>,
+) -> vec2<f32> {
+    let angles = sky_view_horizon_angles(sky_view_height_km());
+    let zenith_horizon_angle = angles.x;
+    let beta = max(angles.y, 1.0e-6);
+    let view_angle = acos(clamp(view_zenith_cos_angle, -1.0, 1.0));
+
+    var v: f32;
+    if (!intersect_ground) {
+        var coord = clamp(view_angle / max(zenith_horizon_angle, 1.0e-6), 0.0, 1.0);
+        coord = 1.0 - coord;
+        coord = sqrt(max(coord, 0.0));
+        coord = 1.0 - coord;
+        v = coord * 0.5;
+    } else {
+        var coord = clamp((view_angle - zenith_horizon_angle) / beta, 0.0, 1.0);
+        coord = sqrt(max(coord, 0.0));
+        v = coord * 0.5 + 0.5;
+    }
+
+    var u = clamp(-light_view_cos_angle * 0.5 + 0.5, 0.0, 1.0);
+    u = sqrt(u);
+
+    return vec2<f32>(
+        from_unit_to_sub_uvs(u, dims.x),
+        from_unit_to_sub_uvs(v, dims.y),
+    );
 }
