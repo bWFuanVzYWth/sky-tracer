@@ -2,7 +2,8 @@
 //!
 //! This crate keeps the project's current atmosphere, spectral bands and OPAC
 //! aerosol phase data, but follows the Unreal/Hillaire LUT structure directly:
-//! transmittance, a 2D multiple-scattering LUT, and a sky-view LUT.
+//! transmittance, a direct plus single-scattered ground irradiance LUT, a 2D
+//! multiple-scattering LUT, and a sky-view LUT.
 
 mod renderer;
 
@@ -56,6 +57,17 @@ mod tests {
             include_str!("wgsl/sky_view.comp.wgsl")
         );
         compose_wgsl(&source, "unreal/sky_view_combined.wgsl")
+    }
+
+    #[test]
+    fn ground_irradiance_wgsl_composes() -> Result<(), String> {
+        let source = format!(
+            "{}\n\n{}\n\n{}",
+            crate::COMMON_WGSL,
+            crate::INSCATTER_WGSL,
+            include_str!("wgsl/ground_irradiance.comp.wgsl")
+        );
+        compose_wgsl(&source, "unreal/ground_irradiance_combined.wgsl")
     }
 
     #[test]

@@ -16,6 +16,7 @@ use wgpu::util::{BufferInitDescriptor, DeviceExt};
 const M_TO_KM: f32 = 1.0e-3;
 const TRANSMITTANCE_SIZE: UVec2 = UVec2::new(256, 64);
 const MULTI_SCATTERING_SIZE: UVec2 = UVec2::new(32, 32);
+const GROUND_IRRADIANCE_SIZE: UVec2 = UVec2::new(64, 16);
 const SKY_VIEW_SIZE: UVec2 = UVec2::new(256, 512);
 const LUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
@@ -169,6 +170,23 @@ impl UnrealAtmosphereContext {
         );
         dispatch_compute_2d(
             encoder,
+            &self.pipelines.ground_irradiance,
+            &ground_irradiance_bind_group(
+                device,
+                &self.layouts.ground_irradiance,
+                GroundIrradianceBindGroupInput {
+                    params: &self.params_buffer,
+                    transmittance: &self.resources.transmittance.view,
+                    sampler: &self.sampler,
+                    ground_irradiance: &self.resources.ground_irradiance.view,
+                    phase_lut: &self.resources.phase_lut.view,
+                },
+            ),
+            GROUND_IRRADIANCE_SIZE,
+            "unreal.ground_irradiance.pass",
+        );
+        dispatch_compute_2d(
+            encoder,
             &self.pipelines.multi_scattering,
             &multi_scattering_bind_group(
                 device,
@@ -179,6 +197,7 @@ impl UnrealAtmosphereContext {
                     sampler: &self.sampler,
                     multi_scattering: &self.resources.multi_scattering.view,
                     phase_lut: &self.resources.phase_lut.view,
+                    ground_irradiance: &self.resources.ground_irradiance.view,
                 },
             ),
             MULTI_SCATTERING_SIZE,
@@ -195,6 +214,7 @@ impl UnrealAtmosphereContext {
                     transmittance: &self.resources.transmittance.view,
                     sampler: &self.sampler,
                     multi_scattering: &self.resources.multi_scattering.view,
+                    ground_irradiance: &self.resources.ground_irradiance.view,
                     sky_view: &self.resources.sky_view.view,
                     phase_lut: &self.resources.phase_lut.view,
                 },
@@ -266,6 +286,7 @@ impl PrecomputeKey {
 struct Resources {
     transmittance: Texture2d,
     multi_scattering: Texture2d,
+    ground_irradiance: Texture2d,
     sky_view: Texture2d,
     phase_lut: TextureArray,
 }
@@ -278,6 +299,11 @@ impl Resources {
                 device,
                 MULTI_SCATTERING_SIZE,
                 "unreal.multi_scattering",
+            ),
+            ground_irradiance: Texture2d::new(
+                device,
+                GROUND_IRRADIANCE_SIZE,
+                "unreal.ground_irradiance",
             ),
             sky_view: Texture2d::new(device, SKY_VIEW_SIZE, "unreal.sky_view"),
             phase_lut: TextureArray::phase_lut(device, queue),
@@ -379,6 +405,7 @@ impl TextureArray {
 struct Layouts {
     transmittance: wgpu::BindGroupLayout,
     multi_scattering: wgpu::BindGroupLayout,
+    ground_irradiance: wgpu::BindGroupLayout,
     sky_view: wgpu::BindGroupLayout,
     render: wgpu::BindGroupLayout,
 }
@@ -401,6 +428,17 @@ impl Layouts {
                     sampler_entry(2, wgpu::ShaderStages::COMPUTE),
                     storage_2d_entry(3),
                     texture_2d_array_entry(4, wgpu::ShaderStages::COMPUTE),
+                    texture_2d_entry(5, wgpu::ShaderStages::COMPUTE),
+                ],
+            }),
+            ground_irradiance: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("unreal.ground_irradiance.bgl"),
+                entries: &[
+                    uniform_entry(0, wgpu::ShaderStages::COMPUTE),
+                    texture_2d_entry(1, wgpu::ShaderStages::COMPUTE),
+                    sampler_entry(2, wgpu::ShaderStages::COMPUTE),
+                    storage_2d_entry(3),
+                    texture_2d_array_entry(4, wgpu::ShaderStages::COMPUTE),
                 ],
             }),
             sky_view: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -410,8 +448,9 @@ impl Layouts {
                     texture_2d_entry(1, wgpu::ShaderStages::COMPUTE),
                     sampler_entry(2, wgpu::ShaderStages::COMPUTE),
                     texture_2d_entry(3, wgpu::ShaderStages::COMPUTE),
-                    storage_2d_entry(4),
-                    texture_2d_array_entry(5, wgpu::ShaderStages::COMPUTE),
+                    texture_2d_entry(4, wgpu::ShaderStages::COMPUTE),
+                    storage_2d_entry(5),
+                    texture_2d_array_entry(6, wgpu::ShaderStages::COMPUTE),
                 ],
             }),
             render: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -432,6 +471,7 @@ impl Layouts {
 struct Pipelines {
     transmittance: wgpu::ComputePipeline,
     multi_scattering: wgpu::ComputePipeline,
+    ground_irradiance: wgpu::ComputePipeline,
     sky_view: wgpu::ComputePipeline,
     render: wgpu::RenderPipeline,
 }
@@ -458,6 +498,17 @@ impl Pipelines {
                     crate::COMMON_WGSL,
                     crate::INSCATTER_WGSL,
                     include_str!("wgsl/multi_scattering.comp.wgsl")
+                ),
+            ),
+            ground_irradiance: compute_pipeline(
+                device,
+                &layouts.ground_irradiance,
+                "unreal.ground_irradiance.pipeline",
+                &format!(
+                    "{}\n\n{}\n\n{}",
+                    crate::COMMON_WGSL,
+                    crate::INSCATTER_WGSL,
+                    include_str!("wgsl/ground_irradiance.comp.wgsl")
                 ),
             ),
             sky_view: compute_pipeline(
@@ -732,6 +783,7 @@ struct MultiScatteringBindGroupInput<'a> {
     sampler: &'a wgpu::Sampler,
     multi_scattering: &'a wgpu::TextureView,
     phase_lut: &'a wgpu::TextureView,
+    ground_irradiance: &'a wgpu::TextureView,
 }
 
 fn multi_scattering_bind_group(
@@ -748,6 +800,33 @@ fn multi_scattering_bind_group(
             sampler_binding(2, input.sampler),
             texture_binding(3, input.multi_scattering),
             texture_binding(4, input.phase_lut),
+            texture_binding(5, input.ground_irradiance),
+        ],
+    })
+}
+
+struct GroundIrradianceBindGroupInput<'a> {
+    params: &'a wgpu::Buffer,
+    transmittance: &'a wgpu::TextureView,
+    sampler: &'a wgpu::Sampler,
+    ground_irradiance: &'a wgpu::TextureView,
+    phase_lut: &'a wgpu::TextureView,
+}
+
+fn ground_irradiance_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    input: GroundIrradianceBindGroupInput<'_>,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("unreal.ground_irradiance.bg"),
+        layout,
+        entries: &[
+            buffer_binding(0, input.params),
+            texture_binding(1, input.transmittance),
+            sampler_binding(2, input.sampler),
+            texture_binding(3, input.ground_irradiance),
+            texture_binding(4, input.phase_lut),
         ],
     })
 }
@@ -757,6 +836,7 @@ struct SkyViewBindGroupInput<'a> {
     transmittance: &'a wgpu::TextureView,
     sampler: &'a wgpu::Sampler,
     multi_scattering: &'a wgpu::TextureView,
+    ground_irradiance: &'a wgpu::TextureView,
     sky_view: &'a wgpu::TextureView,
     phase_lut: &'a wgpu::TextureView,
 }
@@ -774,8 +854,9 @@ fn sky_view_bind_group(
             texture_binding(1, input.transmittance),
             sampler_binding(2, input.sampler),
             texture_binding(3, input.multi_scattering),
-            texture_binding(4, input.sky_view),
-            texture_binding(5, input.phase_lut),
+            texture_binding(4, input.ground_irradiance),
+            texture_binding(5, input.sky_view),
+            texture_binding(6, input.phase_lut),
         ],
     })
 }

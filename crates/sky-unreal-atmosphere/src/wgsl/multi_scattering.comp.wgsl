@@ -3,6 +3,7 @@
 @group(0) @binding(2) var lut_sampler: sampler;
 @group(0) @binding(3) var multi_scattering_out: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(4) var aerosol_phase_lut: texture_2d_array<f32>;
+@group(0) @binding(5) var ground_irradiance_lut: texture_2d<f32>;
 
 const MULTI_SCATTERING_RAY_STEPS: u32 = 20u;
 const MULTI_SCATTERING_SQRT_DIR_SAMPLES: u32 = 8u;
@@ -47,8 +48,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let dir = uniform_sphere_dir_y_up(i);
         let segment = atmosphere_ray_limit(origin, dir);
         if (segment.t_max_km >= 0.0) {
-            let result = integrate_scattered_luminance_direct(
+            let result = integrate_scattered_luminance_direct_with_ground_irradiance(
                 transmittance_lut,
+                ground_irradiance_lut,
                 lut_sampler,
                 origin,
                 dir,

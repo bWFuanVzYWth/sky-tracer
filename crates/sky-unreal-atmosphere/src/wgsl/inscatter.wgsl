@@ -126,6 +126,58 @@ fn integrate_scattered_luminance_direct(
     return UnrealScatterResult(radiance, transmittance, multi_scat_as1);
 }
 
+fn integrate_scattered_luminance_direct_with_ground_irradiance(
+    transmittance_lut: texture_2d<f32>,
+    ground_irradiance_lut: texture_2d<f32>,
+    samp: sampler,
+    ray_origin_km: vec3<f32>,
+    ray_dir_in: vec3<f32>,
+    sun_dir_in: vec3<f32>,
+    t_max_km: f32,
+    sample_count: u32,
+    use_mie_ray_phase: bool,
+    include_ground: bool,
+    illuminance_is_one: bool,
+) -> UnrealScatterResult {
+    let ray_dir = normalize(ray_dir_in);
+    let sun_dir = normalize(sun_dir_in);
+    var result = integrate_scattered_luminance_direct(
+        transmittance_lut,
+        samp,
+        ray_origin_km,
+        ray_dir,
+        sun_dir,
+        t_max_km,
+        sample_count,
+        use_mie_ray_phase,
+        false,
+        illuminance_is_one,
+    );
+
+    let n = max(sample_count, 1u);
+    let dt = t_max_km / f32(n);
+    let segment = atmosphere_ray_limit(ray_origin_km, ray_dir);
+    if (include_ground && segment.hits_ground && abs(segment.t_ground_km - t_max_km) < max(0.01, dt * 2.0)) {
+        let ground_pos = ray_origin_km + ray_dir * segment.t_ground_km;
+        let ground_normal = normalize(ground_pos);
+        let sun_cos_raw = dot(ground_normal, sun_dir);
+        let ground_irradiance_transfer = ground_irradiance_from_lut(
+            ground_irradiance_lut,
+            samp,
+            hp.earth_radius_km,
+            sun_cos_raw,
+        );
+        let global_illum = select(hp.sun_spectral_irradiance, vec4<f32>(1.0), illuminance_is_one);
+        result.radiance += global_illum
+            * ground_irradiance_transfer
+            * result.transmittance
+            * hp.ground_albedo_spectral
+            * ATM_INV_PI;
+    }
+
+    return result;
+}
+
 fn integrate_scattered_luminance_with_ms(
     transmittance_lut: texture_2d<f32>,
     multi_scattering_lut: texture_2d<f32>,
