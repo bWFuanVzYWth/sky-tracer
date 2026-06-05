@@ -1874,8 +1874,20 @@ dependencies = [
  "sky-core",
  "sky-precomputed-atmosphere",
  "sky-realtime-atmosphere",
+ "sky-unreal-atmosphere",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "sky-unreal-atmosphere"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "glam",
+ "naga",
+ "sky-realtime-atmosphere",
+ "wgpu",
 ]
 
 [[package]]

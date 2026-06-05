@@ -17,6 +17,7 @@ use crate::experiment::{
 use crate::gpu::{GpuContext, SurfaceFrameStatus};
 use crate::passes::hillaire_atmosphere::HillaireAtmosphereExperiment;
 use crate::passes::precomputed_atmosphere::PrecomputedAtmosphereExperiment;
+use crate::passes::unreal_atmosphere::UnrealAtmosphereExperiment;
 use crate::view::ViewController;
 
 pub struct RunConfig {
@@ -28,6 +29,7 @@ pub struct RunConfig {
 pub enum ExperimentKind {
     Hillaire,
     Precomputed,
+    Unreal,
 }
 
 pub fn run(config: RunConfig) -> Result<(), Box<dyn Error>> {
@@ -199,6 +201,14 @@ impl ApplicationHandler for DemoApp {
                 }
             },
             ExperimentKind::Precomputed => match PrecomputedAtmosphereExperiment::new(init) {
+                Ok(experiment) => Box::new(experiment),
+                Err(error) => {
+                    self.init_error = Some(error);
+                    event_loop.exit();
+                    return;
+                }
+            },
+            ExperimentKind::Unreal => match UnrealAtmosphereExperiment::new(init) {
                 Ok(experiment) => Box::new(experiment),
                 Err(error) => {
                     self.init_error = Some(error);
