@@ -1,20 +1,13 @@
 [package]
-name = "sky-realtime-demo"
+name = "sky-precomputed-atmosphere"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 bytemuck = { workspace = true }
-clap = { workspace = true }
-exr = { workspace = true }
 glam = { workspace = true }
-pollster = { workspace = true }
-serde_json = { workspace = true }
-sky-core = { path = "../sky-core" }
-sky-precomputed-atmosphere = { path = "../sky-precomputed-atmosphere" }
 sky-realtime-atmosphere = { path = "../sky-realtime-atmosphere" }
 wgpu = { workspace = true }
-winit = { workspace = true }
 
 [dev-dependencies]
 naga = { version = "29.0.3", features = ["wgsl-in"] }

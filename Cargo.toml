@@ -4,6 +4,7 @@ members = [
     "crates/sky-offline",
     "crates/sky-bake",
     "crates/sky-realtime-atmosphere",
+    "crates/sky-precomputed-atmosphere",
     "crates/sky-realtime-demo",
 ]
 resolver = "3"

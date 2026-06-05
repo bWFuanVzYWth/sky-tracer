@@ -5,12 +5,12 @@
 
 extern crate self as ca_render;
 
+pub mod aerosol;
 pub mod atmo;
 pub mod gpu;
+pub mod params;
 
-mod aerosol;
 mod atmosphere;
-mod params;
 mod renderer;
 mod sun;
 

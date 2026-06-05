@@ -15,11 +15,14 @@ use clap::Parser;
 struct Cli {
     #[arg(long, default_value = "out/asset.json")]
     asset: PathBuf,
+    #[arg(long, value_enum, default_value_t = app::ExperimentKind::Hillaire)]
+    experiment: app::ExperimentKind,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     app::run(app::RunConfig {
         asset_path: cli.asset,
+        experiment: cli.experiment,
     })
 }

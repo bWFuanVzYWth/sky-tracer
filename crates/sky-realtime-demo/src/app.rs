@@ -16,10 +16,18 @@ use crate::experiment::{
 };
 use crate::gpu::{GpuContext, SurfaceFrameStatus};
 use crate::passes::hillaire_atmosphere::HillaireAtmosphereExperiment;
+use crate::passes::precomputed_atmosphere::PrecomputedAtmosphereExperiment;
 use crate::view::ViewController;
 
 pub struct RunConfig {
     pub asset_path: PathBuf,
+    pub experiment: ExperimentKind,
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum ExperimentKind {
+    Hillaire,
+    Precomputed,
 }
 
 pub fn run(config: RunConfig) -> Result<(), Box<dyn Error>> {
@@ -37,6 +45,7 @@ pub fn run(config: RunConfig) -> Result<(), Box<dyn Error>> {
         asset,
         gpu: None,
         experiment: None,
+        experiment_kind: config.experiment,
         view: ViewController::default(),
         compare_mode: CompareMode::default(),
         init_error: None,
@@ -52,6 +61,7 @@ struct DemoApp {
     asset: RealtimeAsset,
     gpu: Option<GpuContext>,
     experiment: Option<Box<dyn RealtimeExperiment>>,
+    experiment_kind: ExperimentKind,
     view: ViewController,
     compare_mode: CompareMode,
     init_error: Option<String>,
@@ -172,21 +182,31 @@ impl ApplicationHandler for DemoApp {
             "comparison controls: 1 realtime, 2 reference, 3 abs diff, 4 signed diff, D cycle"
         );
 
-        let mut experiment: Box<dyn RealtimeExperiment> =
-            match HillaireAtmosphereExperiment::new(ExperimentInit {
-                device: gpu.device(),
-                queue: gpu.queue(),
-                surface_format: gpu.surface_format(),
-                asset: &self.asset,
-                display,
-            }) {
+        let init = ExperimentInit {
+            device: gpu.device(),
+            queue: gpu.queue(),
+            surface_format: gpu.surface_format(),
+            asset: &self.asset,
+            display,
+        };
+        let mut experiment: Box<dyn RealtimeExperiment> = match self.experiment_kind {
+            ExperimentKind::Hillaire => match HillaireAtmosphereExperiment::new(init) {
                 Ok(experiment) => Box::new(experiment),
                 Err(error) => {
                     self.init_error = Some(error);
                     event_loop.exit();
                     return;
                 }
-            };
+            },
+            ExperimentKind::Precomputed => match PrecomputedAtmosphereExperiment::new(init) {
+                Ok(experiment) => Box::new(experiment),
+                Err(error) => {
+                    self.init_error = Some(error);
+                    event_loop.exit();
+                    return;
+                }
+            },
+        };
         experiment.resize(gpu.size());
 
         println!("selected realtime experiment: {}", experiment.name());

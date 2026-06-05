@@ -157,7 +157,7 @@ impl RealtimeExperiment for HillaireAtmosphereExperiment {
     }
 }
 
-struct TexturePresentPass {
+pub(super) struct TexturePresentPass {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
@@ -166,7 +166,7 @@ struct TexturePresentPass {
 }
 
 impl TexturePresentPass {
-    fn new(
+    pub(super) fn new(
         device: &wgpu::Device,
         surface_format: wgpu::TextureFormat,
         source: &wgpu::TextureView,
@@ -266,7 +266,7 @@ impl TexturePresentPass {
         }
     }
 
-    fn set_source(
+    pub(super) fn set_source(
         &mut self,
         device: &wgpu::Device,
         source: &wgpu::TextureView,
@@ -281,7 +281,7 @@ impl TexturePresentPass {
         );
     }
 
-    fn update_uniform(
+    pub(super) fn update_uniform(
         &self,
         queue: &wgpu::Queue,
         compare_mode: CompareMode,
@@ -302,7 +302,7 @@ impl TexturePresentPass {
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
     }
 
-    fn render(&self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView) {
+    pub(super) fn render(&self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("hillaire_present_pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -365,7 +365,7 @@ struct PresentUniform {
 
 const _: () = assert!(core::mem::size_of::<PresentUniform>() == 32);
 
-struct ReferenceTexture {
+pub(super) struct ReferenceTexture {
     _texture: wgpu::Texture,
     view: wgpu::TextureView,
     sampler: wgpu::Sampler,
@@ -373,7 +373,11 @@ struct ReferenceTexture {
 }
 
 impl ReferenceTexture {
-    fn from_asset(device: &wgpu::Device, queue: &wgpu::Queue, asset: &RealtimeAsset) -> Self {
+    pub(super) fn from_asset(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        asset: &RealtimeAsset,
+    ) -> Self {
         let path = asset.rgb_exr_path();
         match load_reference_rgba32f(&path) {
             Ok((width, height, rgba)) => {
@@ -457,7 +461,7 @@ impl ReferenceTexture {
         }
     }
 
-    fn is_available(&self) -> bool {
+    pub(super) fn is_available(&self) -> bool {
         self.available
     }
 
@@ -511,7 +515,7 @@ const fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-fn clear_scene_targets(encoder: &mut wgpu::CommandEncoder, targets: &RenderTargets) {
+pub(super) fn clear_scene_targets(encoder: &mut wgpu::CommandEncoder, targets: &RenderTargets) {
     let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("hillaire_clear_scene_targets"),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -537,14 +541,14 @@ fn clear_scene_targets(encoder: &mut wgpu::CommandEncoder, targets: &RenderTarge
     });
 }
 
-fn atmosphere_from_asset(asset: &RealtimeAsset) -> HillaireAtmosphere {
+pub(super) fn atmosphere_from_asset(asset: &RealtimeAsset) -> HillaireAtmosphere {
     let mut atmosphere = HillaireAtmosphere::default();
     atmosphere.world_y0_radius_m =
         atmosphere.bottom_radius_m + asset.manifest().observer_altitude_km.max(0.0) * 1000.0;
     atmosphere
 }
 
-fn sun_from_asset(asset: &RealtimeAsset) -> Sun {
+pub(super) fn sun_from_asset(asset: &RealtimeAsset) -> Sun {
     let manifest = asset.manifest();
     let to_sun =
         direction_from_azimuth_elevation(manifest.sun_azimuth_deg, manifest.sun_elevation_deg);
@@ -555,7 +559,11 @@ fn sun_from_asset(asset: &RealtimeAsset) -> Sun {
     }
 }
 
-fn view_frame_from_state(view: ViewState, size: NonZeroRenderSize, sun: Sun) -> ViewFrame {
+pub(super) fn view_frame_from_state(
+    view: ViewState,
+    size: NonZeroRenderSize,
+    sun: Sun,
+) -> ViewFrame {
     let aspect = size.width() as f32 / size.height() as f32;
     let yaw = view.yaw_deg.to_radians();
     let pitch = view.pitch_deg.to_radians();

@@ -1840,6 +1840,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sky-precomputed-atmosphere"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "glam",
+ "naga",
+ "sky-realtime-atmosphere",
+ "wgpu",
+]
+
+[[package]]
 name = "sky-realtime-atmosphere"
 version = "0.1.0"
 dependencies = [
@@ -1861,6 +1872,7 @@ dependencies = [
  "pollster",
  "serde_json",
  "sky-core",
+ "sky-precomputed-atmosphere",
  "sky-realtime-atmosphere",
  "wgpu",
  "winit",
