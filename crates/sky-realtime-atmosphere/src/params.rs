@@ -141,6 +141,8 @@ pub const fn ozone_monthly_dobson(month: u32) -> f32 {
     }
 }
 
+/// Wavelength order used by every 4-channel spectral GPU constant.
+pub const SPECTRAL_SAMPLE_WAVELENGTHS_NM: [f32; 4] = [630.0, 560.0, 490.0, 430.0];
 pub const SUN_SPECTRAL_IRRADIANCE: [f32; 4] = [1.679, 1.828, 1.986, 1.307];
 pub const MOLECULAR_SCATTERING_BASE: [f32; 4] = [6.605e-3, 1.067e-2, 1.842e-2, 3.156e-2];
 pub const OZONE_ABSORPTION_CROSS_SECTION: [f32; 4] = [3.472e-25, 3.914e-25, 1.349e-25, 11.03e-27];

@@ -479,17 +479,26 @@ fn sample_irradiance(tex: texture_2d<f32>, samp: sampler, r: f32, mu_s: f32) -> 
 }
 
 fn linear_rec2020_from_spectral(l: vec4<f32>) -> vec3<f32> {
+    // 630/560/490/430 nm -> scene-linear Rec.2020 D65. Derived from CIE 1931
+    // 2 degree CMFs with an atmosphere-shaped least-squares spectral fit.
+    // The fit is uniformly scaled to preserve the previous solar luminance.
     let m = mat4x3<f32>(
-        vec3<f32>(83.460, 1.554, -0.043),
-        vec3<f32>(49.968, 86.062, -2.182),
-        vec3<f32>(-11.823, 29.205, 29.153),
-        vec3<f32>(6.811, -8.283, 104.377),
+        vec3<f32>(86.3182148, -0.122697755, 0.547224869),
+        vec3<f32>(30.0452569, 92.3535448, -8.36373448),
+        vec3<f32>(-1.57281544, 29.5419052, 48.5065647),
+        vec3<f32>(3.57535605, -9.78845357, 70.7444659),
     );
     return m * l;
 }
 
 fn white_balance_rec2020(rgb: vec3<f32>) -> vec3<f32> {
-    return rgb * vec3<f32>(0.9441, 0.9888, 1.0761);
+    // Bradford solar-white-to-D65 adaptation expressed in Rec.2020 RGB.
+    let m = mat3x3<f32>(
+        vec3<f32>(1.01363293, 0.00103366792, 0.00115468962),
+        vec3<f32>(0.019007348, 0.974260442, -0.00255465921),
+        vec3<f32>(0.00260596377, -0.00288158643, 1.19816913),
+    );
+    return m * rgb;
 }
 
 fn white_balanced_linear_rec2020_from_spectral(l: vec4<f32>) -> vec3<f32> {
