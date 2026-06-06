@@ -96,15 +96,49 @@ fn henyey_greenstein_phase(mu: f32, g: f32) -> f32 {
     return INV_4PI * (1.0 - g * g) / denom;
 }
 
-fn chapman_approx(radius_km: f32, mu: f32, scale_height_km: f32) -> f32 {
-    let x = max(radius_km / max(scale_height_km, 1.0e-4), 1.0);
-    let horizon = sqrt(0.5 * PI * x);
-    let inv_horizon = 1.0 / max(horizon, 1.0e-4);
-    if (mu >= 0.0) {
-        return 1.0 / max(mu + inv_horizon, 1.0e-4);
+// Source: Vasylyev et al. 2021, "Approximate Chapman function for high zenith angles",
+// Earth, Planets and Space, Eq. 37. The erfcx rational form evaluates
+// exp(x * x) * erfc(x) using the Smith and Smith approximation cited there.
+// https://doi.org/10.1186/s40623-021-01435-y
+fn erfcx_vasylyev(x_in: f32) -> f32 {
+    let x = clamp(x_in, 0.0, 100.0);
+    if (x <= 8.0) {
+        return (1.0606963 + 0.55643831 * x) / (1.0619896 + 1.7245609 * x + x * x);
     }
-    let reflected = 1.0 / max(-mu + inv_horizon, 1.0e-4);
-    return max(horizon, 2.0 * horizon - reflected);
+    return 0.56498823 / (0.06651874 + x);
+}
+
+fn chapman_vasylyev_upward(radius_km: f32, mu_in: f32, scale_height_km: f32) -> f32 {
+    let x = max(radius_km / max(scale_height_km, 1.0e-4), 1.0);
+    let mu = clamp(mu_in, 0.0, 1.0);
+    if (mu > 0.9999) {
+        return 1.0 / max(mu, 1.0e-4);
+    }
+    let horizon = sqrt(0.5 * PI * x) * (1.0 + 0.375 / x);
+    // Eq. 37 contains strong cancellation as mu approaches 0. In f32 this
+    // creates visible horizon spikes/bands, so keep the same asymptote and
+    // use a stable rational form before blending back to the Vasylyev fit.
+    let stable_horizon = horizon / (1.0 + 0.8 * horizon * mu);
+    if (mu < 8.0e-3) {
+        return stable_horizon;
+    }
+
+    let sin_z = sqrt(max(1.0 - mu * mu, 0.0));
+    let x_sin = max(x * sin_z, 1.0e-4);
+    let erfcx_arg = sqrt(max(x * (1.0 - sin_z), 0.0));
+    let first = sqrt(0.5 * PI)
+        * sqrt(x_sin)
+        * (1.0 + 0.375 / x_sin)
+        * erfcx_vasylyev(erfcx_arg);
+
+    let cos2 = max(1.0 - sin_z * sin_z, 1.0e-6);
+    let t = sqrt(max(0.5 * sin_z * (1.0 + sin_z), 0.0));
+    let bracket = sin_z * sin_z * sin_z - t * t * t + 0.375 * t * cos2;
+    let second = (1.0 - t - bracket / max(x_sin * cos2 * cos2, 1.0e-6)) / sqrt(cos2);
+    let vasylyev = max(first + second, 0.0);
+    let horizon_blend_t = clamp((mu - 8.0e-3) / (2.0e-2 - 8.0e-3), 0.0, 1.0);
+    let horizon_blend = horizon_blend_t * horizon_blend_t * (3.0 - 2.0 * horizon_blend_t);
+    return stable_horizon + (vasylyev - stable_horizon) * horizon_blend;
 }
 
 fn column_to_space(pos_km: vec3<f32>, dir: vec3<f32>, scale_height_km: f32) -> f32 {
@@ -113,7 +147,17 @@ fn column_to_space(pos_km: vec3<f32>, dir: vec3<f32>, scale_height_km: f32) -> f
     let up = pos_km / radius;
     let mu = dot(normalize(dir), up);
     return scale_height_km * exp(-altitude / scale_height_km)
-        * chapman_approx(radius, mu, scale_height_km);
+        * chapman_vasylyev_upward(radius, max(mu, 0.0), scale_height_km);
+}
+
+fn column_to_top_unblocked(pos_km: vec3<f32>, dir: vec3<f32>, scale_height_km: f32) -> f32 {
+    let d = normalize(dir);
+    let t_top = ray_sphere_intersection(pos_km, d, top_radius_km());
+    if (t_top < 0.0) {
+        return 0.0;
+    }
+    let p_top = pos_km + d * t_top;
+    return max(column_to_space(pos_km, d, scale_height_km) - column_to_space(p_top, d, scale_height_km), 0.0);
 }
 
 fn column_to_top(pos_km: vec3<f32>, dir: vec3<f32>, scale_height_km: f32) -> f32 {
@@ -121,12 +165,17 @@ fn column_to_top(pos_km: vec3<f32>, dir: vec3<f32>, scale_height_km: f32) -> f32
     if (ray_sphere_intersection(pos_km, d, bottom_radius_km()) >= 0.0) {
         return 1.0e8;
     }
-    let t_top = ray_sphere_intersection(pos_km, d, top_radius_km());
-    if (t_top < 0.0) {
-        return 0.0;
+    let radius = max(length(pos_km), bottom_radius_km() + 1.0e-3);
+    let mu = dot(d, pos_km / radius);
+    if (mu < 0.0) {
+        let near_side = column_to_top_unblocked(pos_km, -d, scale_height_km);
+        let tangent_radius = radius * sqrt(max(1.0 - mu * mu, 0.0));
+        let tangent_altitude = max(tangent_radius - bottom_radius_km(), 0.0);
+        let tangent_to_space = scale_height_km * exp(-tangent_altitude / scale_height_km)
+            * chapman_vasylyev_upward(max(tangent_radius, bottom_radius_km()), 0.0, scale_height_km);
+        return max(2.0 * tangent_to_space - near_side, 0.0);
     }
-    let p_top = pos_km + d * t_top;
-    return max(column_to_space(pos_km, d, scale_height_km) - column_to_space(p_top, d, scale_height_km), 0.0);
+    return column_to_top_unblocked(pos_km, d, scale_height_km);
 }
 
 fn average_transmittance(tau0: vec4<f32>, tau1: vec4<f32>) -> vec4<f32> {
