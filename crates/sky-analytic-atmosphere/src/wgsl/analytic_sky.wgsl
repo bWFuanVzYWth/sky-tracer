@@ -1,4 +1,6 @@
 const PI: f32 = 3.141592653589793;
+const SQRT_PI: f32 = 1.772453850905516;
+const TWO_INV_SQRT_PI: f32 = 1.1283791670955126;
 const INV_4PI: f32 = 0.07957747154594767;
 const RAYLEIGH_PHASE_SCALE: f32 = 0.05968310365946075;
 const RAYLEIGH_SCALE_HEIGHT_KM: f32 = 8.0;
@@ -178,13 +180,92 @@ fn column_to_top(pos_km: vec3<f32>, dir: vec3<f32>, scale_height_km: f32) -> f32
     return column_to_top_unblocked(pos_km, d, scale_height_km);
 }
 
-fn average_transmittance(tau0: vec4<f32>, tau1: vec4<f32>) -> vec4<f32> {
+fn erf_approx(x_in: f32) -> f32 {
+    let s = select(-1.0, 1.0, x_in >= 0.0);
+    let x = abs(x_in);
+    let t = 1.0 / (1.0 + 0.3275911 * x);
+    let poly = (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t;
+    return s * (1.0 - poly * exp(-x * x));
+}
+
+fn erfi_approx(x_in: f32) -> f32 {
+    let s = select(-1.0, 1.0, x_in >= 0.0);
+    let x = abs(x_in);
+    if (x < 2.5) {
+        let xx = x * x;
+        var term = x;
+        var sum = x;
+        for (var i = 1u; i <= 12u; i = i + 1u) {
+            let n = f32(i);
+            term *= xx * (2.0 * n - 1.0) / (n * (2.0 * n + 1.0));
+            sum += term;
+        }
+        return s * TWO_INV_SQRT_PI * sum;
+    }
+
+    let inv_x2 = 1.0 / max(x * x, 1.0e-6);
+    let series = 1.0
+        + 0.5 * inv_x2
+        + 0.75 * inv_x2 * inv_x2
+        + 1.875 * inv_x2 * inv_x2 * inv_x2
+        + 6.5625 * inv_x2 * inv_x2 * inv_x2 * inv_x2;
+    return s * exp(min(x * x, 80.0)) * series / (SQRT_PI * max(x, 1.0e-4));
+}
+
+fn average_transmittance_linear_scalar(tau0: f32, tau1: f32) -> f32 {
     let d = tau1 - tau0;
-    let small = abs(d) < vec4<f32>(1.0e-3);
-    let safe_d = select(d, vec4<f32>(1.0), small);
-    let exact = (exp(-tau0) - exp(-tau1)) / safe_d;
-    let approx = exp(-0.5 * (tau0 + tau1));
-    return select(exact, approx, small);
+    if (abs(d) < 1.0e-3) {
+        return exp(-0.5 * (tau0 + tau1));
+    }
+    return (exp(-tau0) - exp(-tau1)) / d;
+}
+
+fn average_transmittance_quadratic_scalar(tau0: f32, tau_mid: f32, tau1: f32, u_mid_in: f32) -> f32 {
+    if (u_mid_in <= 0.05 || u_mid_in >= 0.95) {
+        return average_transmittance_linear_scalar(tau0, tau1);
+    }
+
+    let u_mid = clamp(u_mid_in, 0.05, 0.95);
+    let d = tau1 - tau0;
+    // tau(u) = tau0 + d * u + q * u * (1 - u). q is estimated from one
+    // closed-form midpoint. Positive q means the optical depth arches above
+    // the endpoint line, which is the problematic low-sun horizon case.
+    let q = (tau_mid - (tau0 + d * u_mid)) / max(u_mid * (1.0 - u_mid), 1.0e-4);
+    if (abs(q) < 1.0e-3) {
+        return average_transmittance_linear_scalar(tau0, tau1);
+    }
+
+    let b = d + q;
+    if (q > 0.0) {
+        let sqrt_q = sqrt(q);
+        let x0 = -b / (2.0 * sqrt_q);
+        let x1 = sqrt_q + x0;
+        let scale = exp(clamp(-tau0 - b * b / (4.0 * q), -80.0, 80.0));
+        let integral = scale * SQRT_PI * (erfi_approx(x1) - erfi_approx(x0)) / (2.0 * sqrt_q);
+        return max(integral, 0.0);
+    }
+
+    let p = -q;
+    let sqrt_p = sqrt(p);
+    let x0 = b / (2.0 * sqrt_p);
+    let x1 = sqrt_p + x0;
+    let scale = exp(clamp(-tau0 + b * b / (4.0 * p), -80.0, 80.0));
+    let integral = scale * SQRT_PI * (erf_approx(x1) - erf_approx(x0)) / (2.0 * sqrt_p);
+    return max(integral, 0.0);
+}
+
+fn average_transmittance_quadratic(
+    tau0: vec4<f32>,
+    tau_mid: vec4<f32>,
+    tau1: vec4<f32>,
+    u_mid: f32,
+) -> vec4<f32> {
+    return vec4<f32>(
+        average_transmittance_quadratic_scalar(tau0.x, tau_mid.x, tau1.x, u_mid),
+        average_transmittance_quadratic_scalar(tau0.y, tau_mid.y, tau1.y, u_mid),
+        average_transmittance_quadratic_scalar(tau0.z, tau_mid.z, tau1.z, u_mid),
+        average_transmittance_quadratic_scalar(tau0.w, tau_mid.w, tau1.w, u_mid),
+    );
 }
 
 fn spectral_sun_transmittance_to_rec2020(transmittance: vec4<f32>) -> vec3<f32> {
@@ -222,21 +303,39 @@ fn analytic_sky_radiance(direction: vec3<f32>) -> vec3<f32> {
 
     let sun_dir = to_sun_dir();
     let p_end = origin + dir * t_top;
+    let p_mid = origin + dir * (0.5 * t_top);
     let view_col_r = column_to_top(origin, dir, RAYLEIGH_SCALE_HEIGHT_KM);
     let view_col_m = column_to_top(origin, dir, MIE_SCALE_HEIGHT_KM);
+    let view_col_mid_r = clamp(view_col_r - column_to_top(p_mid, dir, RAYLEIGH_SCALE_HEIGHT_KM), 0.0, view_col_r);
+    let view_col_mid_m = clamp(view_col_m - column_to_top(p_mid, dir, MIE_SCALE_HEIGHT_KM), 0.0, view_col_m);
     let sun_col0_r = column_to_top(origin, sun_dir, RAYLEIGH_SCALE_HEIGHT_KM);
     let sun_col0_m = column_to_top(origin, sun_dir, MIE_SCALE_HEIGHT_KM);
+    let sun_col_mid_r = column_to_top(p_mid, sun_dir, RAYLEIGH_SCALE_HEIGHT_KM);
+    let sun_col_mid_m = column_to_top(p_mid, sun_dir, MIE_SCALE_HEIGHT_KM);
     let sun_col1_r = column_to_top(p_end, sun_dir, RAYLEIGH_SCALE_HEIGHT_KM);
     let sun_col1_m = column_to_top(p_end, sun_dir, MIE_SCALE_HEIGHT_KM);
 
     let tau_s0 = ap.rayleigh_scattering_base * sun_col0_r + ap.mie_extinction_base * sun_col0_m;
+    let tau_mid = ap.rayleigh_scattering_base * (sun_col_mid_r + view_col_mid_r)
+        + ap.mie_extinction_base * (sun_col_mid_m + view_col_mid_m);
     let tau_s1_v = ap.rayleigh_scattering_base * (sun_col1_r + view_col_r)
         + ap.mie_extinction_base * (sun_col1_m + view_col_m);
-    let avg_t = average_transmittance(tau_s0, tau_s1_v);
+    let avg_t_r = average_transmittance_quadratic(
+        tau_s0,
+        tau_mid,
+        tau_s1_v,
+        view_col_mid_r / max(view_col_r, 1.0e-6),
+    );
+    let avg_t_m = average_transmittance_quadratic(
+        tau_s0,
+        tau_mid,
+        tau_s1_v,
+        view_col_mid_m / max(view_col_m, 1.0e-6),
+    );
     let mu = dot(sun_dir, dir);
-    let scatter = ap.rayleigh_scattering_base * view_col_r * rayleigh_phase(mu)
-        + ap.mie_scattering_base * view_col_m * henyey_greenstein_phase(mu, MIE_G);
-    let sky_spectral = ap.sun_spectral_irradiance * scatter * avg_t;
+    let rayleigh_scatter = ap.rayleigh_scattering_base * view_col_r * rayleigh_phase(mu) * avg_t_r;
+    let mie_scatter = ap.mie_scattering_base * view_col_m * henyey_greenstein_phase(mu, MIE_G) * avg_t_m;
+    let sky_spectral = ap.sun_spectral_irradiance * (rayleigh_scatter + mie_scatter);
     var rgb = max(white_balanced_linear_rec2020_from_spectral(sky_spectral), vec3<f32>(0.0));
 
     let sun_tau = ap.rayleigh_scattering_base * sun_col0_r + ap.mie_extinction_base * sun_col0_m;
