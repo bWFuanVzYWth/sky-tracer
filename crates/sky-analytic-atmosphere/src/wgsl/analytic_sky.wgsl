@@ -6,11 +6,12 @@ const INV_4PI: f32 = 0.07957747154594767;
 const RAYLEIGH_PHASE_SCALE: f32 = 0.05968310365946075;
 const RAYLEIGH_SCALE_HEIGHT_KM: f32 = 8.0;
 const MIE_SCALE_HEIGHT_KM: f32 = 1.2;
-const MIE_G: f32 = 0.8;
+const MIE_HACK_PHASE_E: f32 = 3500.0;
 const SUN_DIRECTIONAL_COS_RADIUS: f32 = 0.999999;
 const OZONE_CENTER_ALTITUDE_KM: f32 = 22.0;
 const OZONE_HALF_WIDTH_KM: f32 = 22.0;
 const GROUND_ALBEDO: f32 = 0.18;
+const FINITE_SEGMENT_STEPS: u32 = 8u;
 
 struct AnalyticParams {
     planet: vec4<f32>,
@@ -94,13 +95,27 @@ fn ray_sphere_intersection(ro: vec3<f32>, rd: vec3<f32>, radius: f32) -> f32 {
     return -b - sqrt(d);
 }
 
+fn eye_ground_intersection(dir: vec3<f32>) -> f32 {
+    let r = eye_radius_km();
+    let ground = bottom_radius_km();
+    let horizon_mu2 = max(1.0 - (ground * ground) / max(r * r, 1.0e-6), 0.0);
+    let mu = normalize(dir).y;
+    if (mu >= 0.0 || mu * mu < horizon_mu2) {
+        return -1.0;
+    }
+    return -r * mu - r * sqrt(max(mu * mu - horizon_mu2, 0.0));
+}
+
 fn rayleigh_phase(mu: f32) -> f32 {
     return RAYLEIGH_PHASE_SCALE * (1.0 + mu * mu);
 }
 
-fn henyey_greenstein_phase(mu: f32, g: f32) -> f32 {
-    let denom = pow(max(1.0 + g * g - 2.0 * g * mu, 1.0e-5), 1.5);
-    return INV_4PI * (1.0 - g * g) / denom;
+fn opac_like_mie_phase_hack(mu: f32) -> f32 {
+    // Empirical Alpha-Piscium/Jessie Klein-Nishina-style phase. This is not
+    // a physically correct atmospheric Mie phase, but it is cheap, normalized,
+    // and visually closer to OPAC's strong forward lobe than Henyey-Greenstein.
+    let e = MIE_HACK_PHASE_E;
+    return e / (2.0 * PI * (e * (1.0 - clamp(mu, -1.0, 1.0)) + 1.0) * log(2.0 * e + 1.0));
 }
 
 // Source: Vasylyev et al. 2021, "Approximate Chapman function for high zenith angles",
@@ -280,6 +295,38 @@ fn optical_depth_from_columns(rayleigh_col: f32, mie_col: f32, ozone_col: f32) -
         + ap.ozone_absorption_base * ozone_col;
 }
 
+fn exp_density(pos_km: vec3<f32>, scale_height_km: f32) -> f32 {
+    let altitude = max(length(pos_km) - bottom_radius_km(), 0.0);
+    return exp(-altitude / scale_height_km);
+}
+
+fn exp_density_column_segment(pos_km: vec3<f32>, dir: vec3<f32>, distance_km: f32, scale_height_km: f32) -> f32 {
+    let distance = max(distance_km, 0.0);
+    if (distance <= 0.0) {
+        return 0.0;
+    }
+
+    let d = normalize(dir);
+    let dt = distance / f32(FINITE_SEGMENT_STEPS);
+    var sum = 0.0;
+    for (var i = 0u; i <= FINITE_SEGMENT_STEPS; i = i + 1u) {
+        let endpoint = i == 0u || i == FINITE_SEGMENT_STEPS;
+        let odd = (i & 1u) == 1u;
+        let weight = select(select(2.0, 4.0, odd), 1.0, endpoint);
+        sum += weight * exp_density(pos_km + d * (f32(i) * dt), scale_height_km);
+    }
+    return sum * dt / 3.0;
+}
+
+fn optical_depth_segment(pos_km: vec3<f32>, dir: vec3<f32>, distance_km: f32) -> vec4<f32> {
+    let d = normalize(dir);
+    let distance = max(distance_km, 0.0);
+    let rayleigh_col = exp_density_column_segment(pos_km, d, distance, RAYLEIGH_SCALE_HEIGHT_KM);
+    let mie_col = exp_density_column_segment(pos_km, d, distance, MIE_SCALE_HEIGHT_KM);
+    let ozone_col = ozone_triangle_column_segment(pos_km, d, distance);
+    return optical_depth_from_columns(rayleigh_col, mie_col, ozone_col);
+}
+
 fn ground_bounce_transfer(pos_km: vec3<f32>, sun_dir: vec3<f32>) -> vec4<f32> {
     let radius = max(length(pos_km), bottom_radius_km() + 1.0e-3);
     let up = pos_km / radius;
@@ -318,6 +365,147 @@ fn ground_bounce_transfer(pos_km: vec3<f32>, sun_dir: vec3<f32>) -> vec4<f32> {
 
     return vec4<f32>(INV_4PI * GROUND_ALBEDO * INV_PI * planet_solid_angle * sun_cos)
         * exp(-(sun_ground_tau + ground_to_sample_tau));
+}
+
+fn ground_direct_irradiance_transfer(ground_pos_km: vec3<f32>, normal: vec3<f32>, sun_dir: vec3<f32>) -> vec4<f32> {
+    let sun_cos = max(dot(normal, sun_dir), 0.0);
+    if (sun_cos <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+    let sun_tau = optical_depth_from_columns(
+        column_to_top(ground_pos_km, sun_dir, RAYLEIGH_SCALE_HEIGHT_KM),
+        column_to_top(ground_pos_km, sun_dir, MIE_SCALE_HEIGHT_KM),
+        ozone_column_to_top(ground_pos_km, sun_dir),
+    );
+    return vec4<f32>(sun_cos) * exp(-sun_tau);
+}
+
+fn ground_sky_irradiance_transfer_approx(ground_pos_km: vec3<f32>, normal: vec3<f32>, sun_dir: vec3<f32>) -> vec4<f32> {
+    let sun_cos = max(dot(normal, sun_dir), 0.0);
+    if (sun_cos <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+
+    let t_top = ray_sphere_intersection(ground_pos_km, normal, top_radius_km());
+    if (t_top <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+
+    let p_mid = ground_pos_km + normal * (0.5 * t_top);
+    let p_end = ground_pos_km + normal * t_top;
+    let view_col_r = column_to_top(ground_pos_km, normal, RAYLEIGH_SCALE_HEIGHT_KM);
+    let view_col_m = column_to_top(ground_pos_km, normal, MIE_SCALE_HEIGHT_KM);
+    let view_col_mid_r = clamp(view_col_r - column_to_top(p_mid, normal, RAYLEIGH_SCALE_HEIGHT_KM), 0.0, view_col_r);
+    let view_col_mid_m = clamp(view_col_m - column_to_top(p_mid, normal, MIE_SCALE_HEIGHT_KM), 0.0, view_col_m);
+    let view_col_o = ozone_triangle_column_segment(ground_pos_km, normal, t_top);
+    let view_col_mid_o = ozone_triangle_column_segment(ground_pos_km, normal, 0.5 * t_top);
+
+    let sun_col0_r = column_to_top(ground_pos_km, sun_dir, RAYLEIGH_SCALE_HEIGHT_KM);
+    let sun_col0_m = column_to_top(ground_pos_km, sun_dir, MIE_SCALE_HEIGHT_KM);
+    let sun_col0_o = ozone_column_to_top(ground_pos_km, sun_dir);
+    let sun_col_mid_r = column_to_top(p_mid, sun_dir, RAYLEIGH_SCALE_HEIGHT_KM);
+    let sun_col_mid_m = column_to_top(p_mid, sun_dir, MIE_SCALE_HEIGHT_KM);
+    let sun_col_mid_o = ozone_column_to_top(p_mid, sun_dir);
+    let sun_col1_r = column_to_top(p_end, sun_dir, RAYLEIGH_SCALE_HEIGHT_KM);
+    let sun_col1_m = column_to_top(p_end, sun_dir, MIE_SCALE_HEIGHT_KM);
+    let sun_col1_o = ozone_column_to_top(p_end, sun_dir);
+
+    let tau_s0 = optical_depth_from_columns(sun_col0_r, sun_col0_m, sun_col0_o);
+    let tau_mid = optical_depth_from_columns(sun_col_mid_r, sun_col_mid_m, sun_col_mid_o)
+        + optical_depth_from_columns(view_col_mid_r, view_col_mid_m, view_col_mid_o);
+    let tau_s1_v = optical_depth_from_columns(sun_col1_r, sun_col1_m, sun_col1_o)
+        + optical_depth_from_columns(view_col_r, view_col_m, view_col_o);
+    let avg_t_r = average_transmittance_quadratic(
+        tau_s0,
+        tau_mid,
+        tau_s1_v,
+        view_col_mid_r / max(view_col_r, 1.0e-6),
+    );
+    let avg_t_m = average_transmittance_quadratic(
+        tau_s0,
+        tau_mid,
+        tau_s1_v,
+        view_col_mid_m / max(view_col_m, 1.0e-6),
+    );
+
+    // Low-order diffuse skylight estimate for visible Lambert ground. The
+    // aerosol term intentionally uses an isotropic phase instead of the OPAC
+    // forward-lobe hack, because this approximates hemispherical irradiance,
+    // not a single view ray through the sun aureole.
+    let rayleigh = ap.rayleigh_scattering_base * view_col_r * rayleigh_phase(0.5 * sun_cos) * avg_t_r;
+    let mie = ap.mie_scattering_base * view_col_m * INV_4PI * avg_t_m;
+    return PI * (rayleigh + mie);
+}
+
+fn view_segment_scatter_to_ground(
+    origin: vec3<f32>,
+    ground_pos_km: vec3<f32>,
+    sun_dir: vec3<f32>,
+) -> vec4<f32> {
+    let ray_dir = normalize(ground_pos_km - origin);
+    let distance = length(ground_pos_km - origin);
+    if (distance <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+
+    let p_mid = origin + ray_dir * (0.5 * distance);
+    let view_col_r = exp_density_column_segment(origin, ray_dir, distance, RAYLEIGH_SCALE_HEIGHT_KM);
+    let view_col_m = exp_density_column_segment(origin, ray_dir, distance, MIE_SCALE_HEIGHT_KM);
+    let view_col_mid_r = exp_density_column_segment(origin, ray_dir, 0.5 * distance, RAYLEIGH_SCALE_HEIGHT_KM);
+    let view_col_mid_m = exp_density_column_segment(origin, ray_dir, 0.5 * distance, MIE_SCALE_HEIGHT_KM);
+    let view_col_o = ozone_triangle_column_segment(origin, ray_dir, distance);
+    let view_col_mid_o = ozone_triangle_column_segment(origin, ray_dir, 0.5 * distance);
+
+    let sun_col0_r = column_to_top(origin, sun_dir, RAYLEIGH_SCALE_HEIGHT_KM);
+    let sun_col0_m = column_to_top(origin, sun_dir, MIE_SCALE_HEIGHT_KM);
+    let sun_col0_o = ozone_column_to_top(origin, sun_dir);
+    let sun_col_mid_r = column_to_top(p_mid, sun_dir, RAYLEIGH_SCALE_HEIGHT_KM);
+    let sun_col_mid_m = column_to_top(p_mid, sun_dir, MIE_SCALE_HEIGHT_KM);
+    let sun_col_mid_o = ozone_column_to_top(p_mid, sun_dir);
+    let sun_col1_r = column_to_top(ground_pos_km, sun_dir, RAYLEIGH_SCALE_HEIGHT_KM);
+    let sun_col1_m = column_to_top(ground_pos_km, sun_dir, MIE_SCALE_HEIGHT_KM);
+    let sun_col1_o = ozone_column_to_top(ground_pos_km, sun_dir);
+
+    let tau_s0 = optical_depth_from_columns(sun_col0_r, sun_col0_m, sun_col0_o);
+    let tau_view_mid = optical_depth_from_columns(view_col_mid_r, view_col_mid_m, view_col_mid_o);
+    let tau_view1 = optical_depth_from_columns(view_col_r, view_col_m, view_col_o);
+    let tau_mid = optical_depth_from_columns(sun_col_mid_r, sun_col_mid_m, sun_col_mid_o) + tau_view_mid;
+    let tau_s1_v = optical_depth_from_columns(sun_col1_r, sun_col1_m, sun_col1_o) + tau_view1;
+    let avg_t_r = average_transmittance_quadratic(
+        tau_s0,
+        tau_mid,
+        tau_s1_v,
+        view_col_mid_r / max(view_col_r, 1.0e-6),
+    );
+    let avg_t_m = average_transmittance_quadratic(
+        tau_s0,
+        tau_mid,
+        tau_s1_v,
+        view_col_mid_m / max(view_col_m, 1.0e-6),
+    );
+
+    let mu = dot(sun_dir, ray_dir);
+    let rayleigh_scatter = ap.rayleigh_scattering_base * view_col_r * rayleigh_phase(mu) * avg_t_r;
+    let mie_scatter = ap.mie_scattering_base * view_col_m * opac_like_mie_phase_hack(mu) * avg_t_m;
+    return ap.sun_spectral_irradiance * (rayleigh_scatter + mie_scatter);
+}
+
+fn analytic_ground_radiance(origin: vec3<f32>, dir: vec3<f32>, t_ground: f32, sun_dir: vec3<f32>) -> vec3<f32> {
+    let ground_hit = origin + dir * t_ground;
+    let normal = normalize(ground_hit);
+    let ground_pos = normal * (bottom_radius_km() + 1.0e-3);
+    let view_to_eye = normalize(origin - ground_pos);
+    let view_distance = length(origin - ground_pos);
+
+    let direct_transfer = ground_direct_irradiance_transfer(ground_pos, normal, sun_dir);
+    let sky_transfer = ground_sky_irradiance_transfer_approx(ground_pos, normal, sun_dir);
+    let view_transmittance = exp(-optical_depth_segment(ground_pos, view_to_eye, view_distance));
+    let ground_spectral = ap.sun_spectral_irradiance
+        * (direct_transfer + sky_transfer)
+        * vec4<f32>(GROUND_ALBEDO * INV_PI)
+        * view_transmittance;
+    let view_scatter_spectral = view_segment_scatter_to_ground(origin, ground_pos, sun_dir);
+    return max(white_balanced_linear_rec2020_from_spectral(ground_spectral + view_scatter_spectral), vec3<f32>(0.0));
 }
 
 fn erf_approx(x_in: f32) -> f32 {
@@ -438,8 +626,10 @@ fn sun_disk_eval(direction: vec3<f32>, transmittance: vec3<f32>) -> vec3<f32> {
 fn analytic_sky_radiance(direction: vec3<f32>) -> vec3<f32> {
     let origin = vec3<f32>(0.0, eye_radius_km(), 0.0);
     let dir = normalize(direction);
-    if (ray_sphere_intersection(origin, dir, bottom_radius_km()) >= 0.0) {
-        return vec3<f32>(0.0);
+    let sun_dir = to_sun_dir();
+    let t_ground = eye_ground_intersection(dir);
+    if (t_ground >= 0.0) {
+        return analytic_ground_radiance(origin, dir, t_ground, sun_dir);
     }
 
     let t_top = ray_sphere_intersection(origin, dir, top_radius_km());
@@ -447,7 +637,6 @@ fn analytic_sky_radiance(direction: vec3<f32>) -> vec3<f32> {
         return vec3<f32>(0.0);
     }
 
-    let sun_dir = to_sun_dir();
     let p_end = origin + dir * t_top;
     let p_mid = origin + dir * (0.5 * t_top);
     let view_col_r = column_to_top(origin, dir, RAYLEIGH_SCALE_HEIGHT_KM);
@@ -497,7 +686,7 @@ fn analytic_sky_radiance(direction: vec3<f32>) -> vec3<f32> {
     );
     let mu = dot(sun_dir, dir);
     let rayleigh_scatter = ap.rayleigh_scattering_base * view_col_r * rayleigh_phase(mu) * avg_t_r;
-    let mie_scatter = ap.mie_scattering_base * view_col_m * henyey_greenstein_phase(mu, MIE_G) * avg_t_m;
+    let mie_scatter = ap.mie_scattering_base * view_col_m * opac_like_mie_phase_hack(mu) * avg_t_m;
     let ground_transfer = ground_bounce_transfer(p_mid, sun_dir);
     let ground_scatter = ground_transfer
         * (ap.rayleigh_scattering_base * view_col_r * avg_view_t_r
