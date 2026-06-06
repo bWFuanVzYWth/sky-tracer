@@ -54,6 +54,7 @@ pub struct UpdateContext<'a> {
     pub asset: &'a RealtimeAsset,
     pub view: ViewState,
     pub compare_mode: CompareMode,
+    pub sun_elevation_deg: f32,
 }
 
 pub struct FrameContext<'a> {

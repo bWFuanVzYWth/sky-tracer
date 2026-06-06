@@ -13,7 +13,10 @@ pub struct GpuContext {
 }
 
 impl GpuContext {
-    pub async fn new(window: Arc<Window>) -> Result<Self, String> {
+    pub async fn new(
+        window: Arc<Window>,
+        required_features: wgpu::Features,
+    ) -> Result<Self, String> {
         let size = window.inner_size();
         let instance = wgpu::Instance::default();
         let surface = instance
@@ -27,7 +30,6 @@ impl GpuContext {
             })
             .await
             .map_err(|error| error.to_string())?;
-        let required_features = sky_unreal_atmosphere::REQUIRED_FEATURES;
         if !adapter.features().contains(required_features) {
             return Err(format!(
                 "adapter does not support required realtime atmosphere features: {required_features:?}"

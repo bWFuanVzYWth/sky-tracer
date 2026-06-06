@@ -53,7 +53,7 @@ impl UnrealAtmosphereExperiment {
             size,
             view: ViewState::default(),
             compare_mode: CompareMode::default(),
-            sun: sun_from_asset(context.asset),
+            sun: sun_from_asset(context.asset, context.asset.manifest().sun_elevation_deg),
             atmosphere_profile: atmosphere_from_asset(context.asset),
             settings: HillaireSettings::default(),
             aerosol: AerosolPreset::default(),
@@ -85,7 +85,7 @@ impl RealtimeExperiment for UnrealAtmosphereExperiment {
     fn update(&mut self, context: UpdateContext<'_>) {
         self.view = context.view;
         self.compare_mode = context.compare_mode;
-        self.sun = sun_from_asset(context.asset);
+        self.sun = sun_from_asset(context.asset, context.sun_elevation_deg);
         self.atmosphere_profile = atmosphere_from_asset(context.asset);
     }
 
@@ -110,7 +110,8 @@ impl RealtimeExperiment for UnrealAtmosphereExperiment {
             context.queue,
             self.compare_mode,
             self.view,
-            self.size,
+            self.size.width(),
+            self.size.height(),
             self.reference.is_available(),
         );
         self.present.render(context.encoder, context.target);

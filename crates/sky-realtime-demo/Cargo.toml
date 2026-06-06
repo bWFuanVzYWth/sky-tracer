@@ -11,6 +11,7 @@ glam = { workspace = true }
 pollster = { workspace = true }
 serde_json = { workspace = true }
 sky-core = { path = "../sky-core" }
+sky-analytic-atmosphere = { path = "../sky-analytic-atmosphere" }
 sky-unreal-atmosphere = { path = "../sky-unreal-atmosphere" }
 wgpu = { workspace = true }
 winit = { workspace = true }

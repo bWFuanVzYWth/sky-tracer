@@ -67,7 +67,7 @@ impl TexturePresentPass {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
@@ -76,7 +76,7 @@ impl TexturePresentPass {
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
                     visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
                     count: None,
                 },
             ],
@@ -142,10 +142,11 @@ impl TexturePresentPass {
         queue: &wgpu::Queue,
         compare_mode: CompareMode,
         view: ViewState,
-        size: NonZeroRenderSize,
+        width: u32,
+        height: u32,
         has_reference: bool,
     ) {
-        let aspect = size.width() as f32 / size.height() as f32;
+        let aspect = width.max(1) as f32 / height.max(1) as f32;
         let uniform = PresentUniform {
             exposure_mode_ref_diff: [
                 self.exposure,
@@ -331,8 +332,8 @@ impl ReferenceTexture {
             label: Some("offline_reference_rgb_exr.sampler"),
             address_mode_u: wgpu::AddressMode::Repeat,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
@@ -410,10 +411,9 @@ pub(crate) fn atmosphere_from_asset(asset: &RealtimeAsset) -> HillaireAtmosphere
     atmosphere
 }
 
-pub(crate) fn sun_from_asset(asset: &RealtimeAsset) -> Sun {
+pub(crate) fn sun_from_asset(asset: &RealtimeAsset, elevation_deg: f32) -> Sun {
     let manifest = asset.manifest();
-    let to_sun =
-        direction_from_azimuth_elevation(manifest.sun_azimuth_deg, manifest.sun_elevation_deg);
+    let to_sun = direction_from_azimuth_elevation(manifest.sun_azimuth_deg, elevation_deg);
     Sun {
         sun_to_scene: -to_sun,
         irradiance_rec2020_w_m2: Vec3::from_array(SUN_IRRADIANCE_REC2020_W_PER_M2),
