@@ -1,6 +1,7 @@
 const PI: f32 = 3.141592653589793;
 const SQRT_PI: f32 = 1.772453850905516;
 const TWO_INV_SQRT_PI: f32 = 1.1283791670955126;
+const INV_PI: f32 = 0.31830988618379067;
 const INV_4PI: f32 = 0.07957747154594767;
 const RAYLEIGH_PHASE_SCALE: f32 = 0.05968310365946075;
 const RAYLEIGH_SCALE_HEIGHT_KM: f32 = 8.0;
@@ -9,6 +10,7 @@ const MIE_G: f32 = 0.8;
 const SUN_DIRECTIONAL_COS_RADIUS: f32 = 0.999999;
 const OZONE_CENTER_ALTITUDE_KM: f32 = 22.0;
 const OZONE_HALF_WIDTH_KM: f32 = 22.0;
+const GROUND_ALBEDO: f32 = 0.18;
 
 struct AnalyticParams {
     planet: vec4<f32>,
@@ -272,6 +274,52 @@ fn ozone_column_to_top(pos_km: vec3<f32>, dir: vec3<f32>) -> f32 {
     return ozone_triangle_column_segment(pos_km, d, t_top);
 }
 
+fn optical_depth_from_columns(rayleigh_col: f32, mie_col: f32, ozone_col: f32) -> vec4<f32> {
+    return ap.rayleigh_scattering_base * rayleigh_col
+        + ap.mie_extinction_base * mie_col
+        + ap.ozone_absorption_base * ozone_col;
+}
+
+fn ground_bounce_transfer(pos_km: vec3<f32>, sun_dir: vec3<f32>) -> vec4<f32> {
+    let radius = max(length(pos_km), bottom_radius_km() + 1.0e-3);
+    let up = pos_km / radius;
+    let sun_cos = max(dot(up, sun_dir), 0.0);
+    if (sun_cos <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+
+    let bottom = bottom_radius_km();
+    let ground_pos = up * (bottom + 1.0e-3);
+    let ground_to_sample_distance = max(radius - (bottom + 1.0e-3), 0.0);
+    let horizon = sqrt(max(radius * radius - bottom * bottom, 0.0));
+    let planet_solid_angle = 2.0 * PI * (1.0 - horizon / radius);
+
+    let sun_ground_tau = optical_depth_from_columns(
+        column_to_top(ground_pos, sun_dir, RAYLEIGH_SCALE_HEIGHT_KM),
+        column_to_top(ground_pos, sun_dir, MIE_SCALE_HEIGHT_KM),
+        ozone_column_to_top(ground_pos, sun_dir),
+    );
+    let ground_to_sample_r = max(
+        column_to_top(ground_pos, up, RAYLEIGH_SCALE_HEIGHT_KM)
+            - column_to_top(pos_km, up, RAYLEIGH_SCALE_HEIGHT_KM),
+        0.0,
+    );
+    let ground_to_sample_m = max(
+        column_to_top(ground_pos, up, MIE_SCALE_HEIGHT_KM)
+            - column_to_top(pos_km, up, MIE_SCALE_HEIGHT_KM),
+        0.0,
+    );
+    let ground_to_sample_o = ozone_triangle_column_segment(ground_pos, up, ground_to_sample_distance);
+    let ground_to_sample_tau = optical_depth_from_columns(
+        ground_to_sample_r,
+        ground_to_sample_m,
+        ground_to_sample_o,
+    );
+
+    return vec4<f32>(INV_4PI * GROUND_ALBEDO * INV_PI * planet_solid_angle * sun_cos)
+        * exp(-(sun_ground_tau + ground_to_sample_tau));
+}
+
 fn erf_approx(x_in: f32) -> f32 {
     let s = select(-1.0, 1.0, x_in >= 0.0);
     let x = abs(x_in);
@@ -418,15 +466,11 @@ fn analytic_sky_radiance(direction: vec3<f32>) -> vec3<f32> {
     let view_col_o = ozone_triangle_column_segment(origin, dir, t_top);
     let view_col_mid_o = ozone_triangle_column_segment(origin, dir, 0.5 * t_top);
 
-    let tau_s0 = ap.rayleigh_scattering_base * sun_col0_r
-        + ap.mie_extinction_base * sun_col0_m
-        + ap.ozone_absorption_base * sun_col0_o;
-    let tau_mid = ap.rayleigh_scattering_base * (sun_col_mid_r + view_col_mid_r)
-        + ap.mie_extinction_base * (sun_col_mid_m + view_col_mid_m)
-        + ap.ozone_absorption_base * (sun_col_mid_o + view_col_mid_o);
-    let tau_s1_v = ap.rayleigh_scattering_base * (sun_col1_r + view_col_r)
-        + ap.mie_extinction_base * (sun_col1_m + view_col_m)
-        + ap.ozone_absorption_base * (sun_col1_o + view_col_o);
+    let tau_s0 = optical_depth_from_columns(sun_col0_r, sun_col0_m, sun_col0_o);
+    let tau_view_mid = optical_depth_from_columns(view_col_mid_r, view_col_mid_m, view_col_mid_o);
+    let tau_view1 = optical_depth_from_columns(view_col_r, view_col_m, view_col_o);
+    let tau_mid = optical_depth_from_columns(sun_col_mid_r, sun_col_mid_m, sun_col_mid_o) + tau_view_mid;
+    let tau_s1_v = optical_depth_from_columns(sun_col1_r, sun_col1_m, sun_col1_o) + tau_view1;
     let avg_t_r = average_transmittance_quadratic(
         tau_s0,
         tau_mid,
@@ -439,16 +483,29 @@ fn analytic_sky_radiance(direction: vec3<f32>) -> vec3<f32> {
         tau_s1_v,
         view_col_mid_m / max(view_col_m, 1.0e-6),
     );
+    let avg_view_t_r = average_transmittance_quadratic(
+        vec4<f32>(0.0),
+        tau_view_mid,
+        tau_view1,
+        view_col_mid_r / max(view_col_r, 1.0e-6),
+    );
+    let avg_view_t_m = average_transmittance_quadratic(
+        vec4<f32>(0.0),
+        tau_view_mid,
+        tau_view1,
+        view_col_mid_m / max(view_col_m, 1.0e-6),
+    );
     let mu = dot(sun_dir, dir);
     let rayleigh_scatter = ap.rayleigh_scattering_base * view_col_r * rayleigh_phase(mu) * avg_t_r;
     let mie_scatter = ap.mie_scattering_base * view_col_m * henyey_greenstein_phase(mu, MIE_G) * avg_t_m;
-    let sky_spectral = ap.sun_spectral_irradiance * (rayleigh_scatter + mie_scatter);
+    let ground_transfer = ground_bounce_transfer(p_mid, sun_dir);
+    let ground_scatter = ground_transfer
+        * (ap.rayleigh_scattering_base * view_col_r * avg_view_t_r
+            + ap.mie_scattering_base * view_col_m * avg_view_t_m);
+    let sky_spectral = ap.sun_spectral_irradiance * (rayleigh_scatter + mie_scatter + ground_scatter);
     var rgb = max(white_balanced_linear_rec2020_from_spectral(sky_spectral), vec3<f32>(0.0));
 
-    let sun_tau = ap.rayleigh_scattering_base * sun_col0_r
-        + ap.mie_extinction_base * sun_col0_m
-        + ap.ozone_absorption_base * sun_col0_o;
-    let sun_t = spectral_sun_transmittance_to_rec2020(exp(-sun_tau));
+    let sun_t = spectral_sun_transmittance_to_rec2020(exp(-tau_s0));
     rgb += sun_disk_eval(dir, sun_t);
     return rgb;
 }
