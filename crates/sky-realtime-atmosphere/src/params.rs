@@ -46,7 +46,7 @@ impl Default for HillaireSettings {
         Self {
             month: 2,
             aerosol_turbidity: 1.0,
-            ground_albedo_spectral: [0.3; 4],
+            ground_albedo_spectral: [0.18; 4],
         }
     }
 }

@@ -210,6 +210,6 @@ mod tests {
         let c = coefficients_at(&scene, Vec3::new(0.0, planet.ground_radius_km, 0.0), 0);
         assert!(c.rayleigh_scattering_km_inv > 0.0);
         assert!(c.extinction_total() >= c.scattering_total());
-        assert!((GROUND_ALBEDO - 0.3).abs() < f32::EPSILON);
+        assert!((GROUND_ALBEDO - 0.18).abs() < f32::EPSILON);
     }
 }

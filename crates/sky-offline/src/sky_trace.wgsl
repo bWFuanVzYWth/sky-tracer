@@ -6,7 +6,7 @@ const TAU: f32 = 6.28318530717958647692;
 // At Earth-radius coordinates, f32 ULP is about 0.00049 km; keep ray offsets
 // several ULPs wide so ground shadow rays do not self-intersect.
 const RAY_EPSILON_KM: f32 = 0.005;
-const GROUND_ALBEDO: f32 = 0.3;
+const GROUND_ALBEDO: f32 = 0.18;
 const ISOTROPIC_PDF: f32 = 0.07957747154594766788;
 const OUTPUT_PROJECTION_PANORAMA: u32 = 0u;
 const OUTPUT_PROJECTION_SKY_VIEW_LUT: u32 = 1u;

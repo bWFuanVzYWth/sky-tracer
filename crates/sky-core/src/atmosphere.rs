@@ -6,7 +6,7 @@ use crate::spectrum::SpectralBand;
 pub const SPECIES_COUNT: usize = 4;
 pub const PHASE_BINS: usize = 1024;
 pub const SPECIES_NAMES: [&str; SPECIES_COUNT] = ["inso", "waso", "soot", "suso"];
-pub const GROUND_ALBEDO: f32 = 0.3;
+pub const GROUND_ALBEDO: f32 = 0.18;
 pub const SOLAR_ANGULAR_RADIUS_RAD: f32 = 0.004_650_47;
 
 #[derive(Clone, Copy, Debug)]
