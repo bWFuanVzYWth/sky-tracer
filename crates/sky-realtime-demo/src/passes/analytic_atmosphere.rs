@@ -1,6 +1,6 @@
 use glam::{Mat4, Vec3, Vec4};
 use sky_analytic_atmosphere::{
-    AnalyticAtmosphere, AnalyticAtmosphereContext, AnalyticFrameParams, AnalyticSun, AnalyticView,
+    AnalyticAtmosphereContext, AnalyticFrameParams, AnalyticSun, AnalyticView,
     SCENE_RADIANCE_FORMAT,
 };
 use winit::dpi::PhysicalSize;
@@ -21,7 +21,6 @@ pub struct AnalyticAtmosphereExperiment {
     view: ViewState,
     compare_mode: CompareMode,
     sun: AnalyticSun,
-    atmosphere_profile: AnalyticAtmosphere,
     _display: DisplayTransform,
 }
 
@@ -47,7 +46,6 @@ impl AnalyticAtmosphereExperiment {
             view: ViewState::default(),
             compare_mode: CompareMode::default(),
             sun: analytic_sun_from_asset(context.asset, context.asset.manifest().sun_elevation_deg),
-            atmosphere_profile: analytic_atmosphere_from_asset(context.asset),
             _display: context.display,
         })
     }
@@ -72,14 +70,12 @@ impl RealtimeExperiment for AnalyticAtmosphereExperiment {
         self.view = context.view;
         self.compare_mode = context.compare_mode;
         self.sun = analytic_sun_from_asset(context.asset, context.sun_elevation_deg);
-        self.atmosphere_profile = analytic_atmosphere_from_asset(context.asset);
     }
 
     fn render(&mut self, context: FrameContext<'_>) {
         self.ensure_size(context.device, context.surface_size);
         let frame_params = AnalyticFrameParams {
             view: analytic_view_from_state(self.view, self.target.size),
-            atmosphere: self.atmosphere_profile,
             sun: self.sun,
         };
         self.atmosphere.prepare(context.queue, &frame_params);
@@ -131,19 +127,11 @@ impl SceneTarget {
     }
 }
 
-fn analytic_atmosphere_from_asset(asset: &RealtimeAsset) -> AnalyticAtmosphere {
-    let mut atmosphere = AnalyticAtmosphere::default();
-    atmosphere.world_y0_radius_m =
-        atmosphere.bottom_radius_m + asset.manifest().observer_altitude_km.max(0.0) * 1000.0;
-    atmosphere
-}
-
 fn analytic_sun_from_asset(asset: &RealtimeAsset, elevation_deg: f32) -> AnalyticSun {
     let manifest = asset.manifest();
     let to_sun = direction_from_azimuth_elevation(manifest.sun_azimuth_deg, elevation_deg);
     AnalyticSun {
         sun_to_scene: -to_sun,
-        angular_radius_rad: AnalyticSun::default().angular_radius_rad,
     }
 }
 

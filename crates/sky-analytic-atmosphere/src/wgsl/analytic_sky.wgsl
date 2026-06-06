@@ -5,6 +5,24 @@ const INV_PI: f32 = 0.31830988618379067;
 const INV_4PI: f32 = 0.07957747154594767;
 const RAYLEIGH_PHASE_SCALE: f32 = 0.05968310365946075;
 
+// Shadertoy-style scene constants. Runtime code only supplies the camera basis
+// and sun direction; fixed physical and color calibration knobs live here so
+// the shader can be ported as a single file.
+const PLANET_BOTTOM_RADIUS_KM: f32 = 6360.0;
+const ATMOSPHERE_TOP_RADIUS_KM: f32 = 6460.0;
+const OBSERVER_ALTITUDE_KM: f32 = 0.2;
+const SUN_ANGULAR_RADIUS_RAD: f32 = 0.00471;
+const SUN_COS_ANGULAR_RADIUS: f32 = 0.99998891;
+const SUN_IRRADIANCE_REC2020_W_M2: vec3<f32> = vec3<f32>(205.0, 205.0, 205.0);
+const SUN_SPECTRAL_IRRADIANCE: vec4<f32> = vec4<f32>(1.679, 1.828, 1.986, 1.307);
+const RAYLEIGH_SCATTERING_BASE_KM_INV: vec4<f32> = vec4<f32>(6.605e-3, 1.067e-2, 1.842e-2, 3.156e-2);
+const MIE_SCATTERING_UNSCALED_KM_INV: vec4<f32> = vec4<f32>(1.25e-3, 1.69e-3, 2.53e-3, 3.40e-3);
+const MIE_CONCENTRATION_SCALE: f32 = 10.0;
+const MIE_EXTINCTION_SCALE: f32 = 1.11;
+// 630/560/490/430 nm ozone peak absorption for a 0..44 km triangular layer
+// centered at 22 km, matched to the vertical ozone column in data/atmosphere_profile.csv.
+const OZONE_ABSORPTION_PEAK_KM_INV: vec4<f32> = vec4<f32>(1.37334e-3, 1.39023e-3, 5.15003e-4, 1.68431e-5);
+
 // Physical model knobs for this analytic approximation. Rayleigh and Mie use
 // a radial quadratic exponential density:
 //   rho(r) = exp(-(r^2 - Rg^2) / (2 * Rg * H)).
@@ -41,25 +59,12 @@ const COLUMN_RATIO_EPS: f32 = 1.0e-6;
 const GROUND_SKY_RAYLEIGH_PHASE_MU_SCALE: f32 = 0.5;
 
 struct AnalyticParams {
-    planet: vec4<f32>,
     sun_dir: vec4<f32>,
-    sun_spectral_irradiance: vec4<f32>,
-    rayleigh_scattering_base: vec4<f32>,
-    mie_scattering_base: vec4<f32>,
-    mie_extinction_base: vec4<f32>,
-    ozone_absorption_base: vec4<f32>,
 }
 
 struct AnalyticView {
     relative_world_from_clip: mat4x4<f32>,
     world_position: vec4<f32>,
-}
-
-struct AnalyticSun {
-    sun_to_scene: vec3<f32>,
-    angular_radius_rad: f32,
-    irradiance_rec2020_w_m2: vec3<f32>,
-    cos_angular_radius: f32,
 }
 
 struct VertexOutput {
@@ -69,7 +74,6 @@ struct VertexOutput {
 
 @group(0) @binding(0) var<uniform> ap: AnalyticParams;
 @group(0) @binding(1) var<uniform> view: AnalyticView;
-@group(0) @binding(2) var<uniform> sun: AnalyticSun;
 
 // Fullscreen entry points.
 @vertex
@@ -93,19 +97,31 @@ fn fragment(vertex_out: VertexOutput) -> @location(0) vec4<f32> {
 
 // Uniform-derived scene parameters.
 fn bottom_radius_km() -> f32 {
-    return ap.planet.x;
+    return PLANET_BOTTOM_RADIUS_KM;
 }
 
 fn top_radius_km() -> f32 {
-    return ap.planet.y;
+    return ATMOSPHERE_TOP_RADIUS_KM;
 }
 
 fn eye_radius_km() -> f32 {
-    return clamp(ap.planet.z, bottom_radius_km() + PLANET_RADIUS_EPS_KM, top_radius_km() - PLANET_RADIUS_EPS_KM);
+    return clamp(
+        bottom_radius_km() + OBSERVER_ALTITUDE_KM,
+        bottom_radius_km() + PLANET_RADIUS_EPS_KM,
+        top_radius_km() - PLANET_RADIUS_EPS_KM,
+    );
 }
 
 fn to_sun_dir() -> vec3<f32> {
     return normalize(ap.sun_dir.xyz);
+}
+
+fn mie_scattering_base_km_inv() -> vec4<f32> {
+    return MIE_SCATTERING_UNSCALED_KM_INV * MIE_CONCENTRATION_SCALE;
+}
+
+fn mie_extinction_base_km_inv() -> vec4<f32> {
+    return mie_scattering_base_km_inv() * MIE_EXTINCTION_SCALE;
 }
 
 // Geometry helpers.
@@ -335,9 +351,9 @@ fn ozone_column_to_top(pos_km: vec3<f32>, dir: vec3<f32>) -> f32 {
 }
 
 fn optical_depth_from_columns(rayleigh_col: f32, mie_col: f32, ozone_col: f32) -> vec4<f32> {
-    return ap.rayleigh_scattering_base * rayleigh_col
-        + ap.mie_extinction_base * mie_col
-        + ap.ozone_absorption_base * ozone_col;
+    return RAYLEIGH_SCATTERING_BASE_KM_INV * rayleigh_col
+        + mie_extinction_base_km_inv() * mie_col
+        + OZONE_ABSORPTION_PEAK_KM_INV * ozone_col;
 }
 
 fn optical_depth_segment(pos_km: vec3<f32>, dir: vec3<f32>, distance_km: f32) -> vec4<f32> {
@@ -467,8 +483,8 @@ fn ground_sky_irradiance_transfer_approx(ground_pos_km: vec3<f32>, normal: vec3<
     // aerosol term intentionally uses an isotropic phase instead of the OPAC
     // forward-lobe hack, because this approximates hemispherical irradiance,
     // not a single view ray through the sun aureole.
-    let rayleigh = ap.rayleigh_scattering_base * view_col_r * rayleigh_phase(GROUND_SKY_RAYLEIGH_PHASE_MU_SCALE * sun_cos) * avg_t_r;
-    let mie = ap.mie_scattering_base * view_col_m * INV_4PI * avg_t_m;
+    let rayleigh = RAYLEIGH_SCATTERING_BASE_KM_INV * view_col_r * rayleigh_phase(GROUND_SKY_RAYLEIGH_PHASE_MU_SCALE * sun_cos) * avg_t_r;
+    let mie = mie_scattering_base_km_inv() * view_col_m * INV_4PI * avg_t_m;
     return PI * (rayleigh + mie);
 }
 
@@ -520,9 +536,9 @@ fn view_segment_scatter_to_ground(
     );
 
     let mu = dot(sun_dir, ray_dir);
-    let rayleigh_scatter = ap.rayleigh_scattering_base * view_col_r * rayleigh_phase(mu) * avg_t_r;
-    let mie_scatter = ap.mie_scattering_base * view_col_m * opac_like_mie_phase_hack(mu) * avg_t_m;
-    return ap.sun_spectral_irradiance * (rayleigh_scatter + mie_scatter);
+    let rayleigh_scatter = RAYLEIGH_SCATTERING_BASE_KM_INV * view_col_r * rayleigh_phase(mu) * avg_t_r;
+    let mie_scatter = mie_scattering_base_km_inv() * view_col_m * opac_like_mie_phase_hack(mu) * avg_t_m;
+    return SUN_SPECTRAL_IRRADIANCE * (rayleigh_scatter + mie_scatter);
 }
 
 fn analytic_ground_radiance(origin: vec3<f32>, dir: vec3<f32>, t_ground: f32, sun_dir: vec3<f32>) -> vec3<f32> {
@@ -535,7 +551,7 @@ fn analytic_ground_radiance(origin: vec3<f32>, dir: vec3<f32>, t_ground: f32, su
     let direct_transfer = ground_direct_irradiance_transfer(ground_pos, normal, sun_dir);
     let sky_transfer = ground_sky_irradiance_transfer_approx(ground_pos, normal, sun_dir);
     let view_transmittance = exp(-optical_depth_segment(ground_pos, view_to_eye, view_distance));
-    let ground_spectral = ap.sun_spectral_irradiance
+    let ground_spectral = SUN_SPECTRAL_IRRADIANCE
         * (direct_transfer + sky_transfer)
         * vec4<f32>(GROUND_ALBEDO * INV_PI)
         * view_transmittance;
@@ -640,13 +656,13 @@ fn average_transmittance_quadratic(
 
 // Sun disk and spectral display conversion.
 fn spectral_sun_transmittance_to_rec2020(transmittance: vec4<f32>) -> vec3<f32> {
-    let clear_sun = max(white_balanced_linear_rec2020_from_spectral(ap.sun_spectral_irradiance), vec3<f32>(COLUMN_RATIO_EPS));
-    let attenuated_sun = max(white_balanced_linear_rec2020_from_spectral(ap.sun_spectral_irradiance * transmittance), vec3<f32>(0.0));
+    let clear_sun = max(white_balanced_linear_rec2020_from_spectral(SUN_SPECTRAL_IRRADIANCE), vec3<f32>(COLUMN_RATIO_EPS));
+    let attenuated_sun = max(white_balanced_linear_rec2020_from_spectral(SUN_SPECTRAL_IRRADIANCE * transmittance), vec3<f32>(0.0));
     return clamp(attenuated_sun / clear_sun, vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
 fn sun_disk_eval(direction: vec3<f32>, transmittance: vec3<f32>) -> vec3<f32> {
-    let cos_radius = clamp(sun.cos_angular_radius, -1.0, 1.0);
+    let cos_radius = clamp(SUN_COS_ANGULAR_RADIUS, -1.0, 1.0);
     if (cos_radius >= SUN_DIRECTIONAL_COS_RADIUS) {
         return vec3<f32>(0.0);
     }
@@ -657,7 +673,7 @@ fn sun_disk_eval(direction: vec3<f32>, transmittance: vec3<f32>) -> vec3<f32> {
     if (solid_angle <= 0.0) {
         return vec3<f32>(0.0);
     }
-    return sun.irradiance_rec2020_w_m2 * transmittance / solid_angle;
+    return SUN_IRRADIANCE_REC2020_W_M2 * transmittance / solid_angle;
 }
 
 // Main analytic sky/ground evaluation.
@@ -733,13 +749,13 @@ fn analytic_sky_radiance(direction: vec3<f32>) -> vec3<f32> {
         view_col_mid_m / max(view_col_m, COLUMN_RATIO_EPS),
     );
     let mu = dot(sun_dir, dir);
-    let rayleigh_scatter = ap.rayleigh_scattering_base * view_col_r * rayleigh_phase(mu) * avg_t_r;
-    let mie_scatter = ap.mie_scattering_base * view_col_m * opac_like_mie_phase_hack(mu) * avg_t_m;
+    let rayleigh_scatter = RAYLEIGH_SCATTERING_BASE_KM_INV * view_col_r * rayleigh_phase(mu) * avg_t_r;
+    let mie_scatter = mie_scattering_base_km_inv() * view_col_m * opac_like_mie_phase_hack(mu) * avg_t_m;
     let ground_transfer = ground_bounce_transfer(p_mid, sun_dir);
     let ground_scatter = ground_transfer
-        * (ap.rayleigh_scattering_base * view_col_r * avg_view_t_r
-            + ap.mie_scattering_base * view_col_m * avg_view_t_m);
-    let sky_spectral = ap.sun_spectral_irradiance * (rayleigh_scatter + mie_scatter + ground_scatter);
+        * (RAYLEIGH_SCATTERING_BASE_KM_INV * view_col_r * avg_view_t_r
+            + mie_scattering_base_km_inv() * view_col_m * avg_view_t_m);
+    let sky_spectral = SUN_SPECTRAL_IRRADIANCE * (rayleigh_scatter + mie_scatter + ground_scatter);
     var rgb = max(white_balanced_linear_rec2020_from_spectral(sky_spectral), vec3<f32>(0.0));
 
     let sun_t = spectral_sun_transmittance_to_rec2020(exp(-tau_s0));

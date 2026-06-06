@@ -1,13 +1,13 @@
 //! Aggressively simplified analytic atmosphere renderer.
 //!
 //! This crate intentionally does not depend on the higher-quality UE-style
-//! renderer. It keeps its own copied spectral constants and uses standard
-//! exponential Rayleigh/Mie layers with a Chapman-style column approximation.
+//! renderer. It keeps its physical and spectral constants in the WGSL header
+//! so the shader can be moved as a mostly self-contained single-file model.
 
 mod renderer;
 
 pub use renderer::{
-    AnalyticAtmosphere, AnalyticAtmosphereContext, AnalyticFrameParams, AnalyticSun, AnalyticView,
+    AnalyticAtmosphereContext, AnalyticFrameParams, AnalyticSun, AnalyticView,
     SCENE_RADIANCE_FORMAT,
 };
 
