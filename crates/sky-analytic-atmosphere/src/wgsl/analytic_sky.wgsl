@@ -4,14 +4,46 @@ const TWO_INV_SQRT_PI: f32 = 1.1283791670955126;
 const INV_PI: f32 = 0.31830988618379067;
 const INV_4PI: f32 = 0.07957747154594767;
 const RAYLEIGH_PHASE_SCALE: f32 = 0.05968310365946075;
+
+// Physical model knobs for this analytic approximation.
 const RAYLEIGH_SCALE_HEIGHT_KM: f32 = 8.0;
 const MIE_SCALE_HEIGHT_KM: f32 = 1.2;
 const MIE_HACK_PHASE_E: f32 = 3500.0;
-const SUN_DIRECTIONAL_COS_RADIUS: f32 = 0.999999;
 const OZONE_CENTER_ALTITUDE_KM: f32 = 22.0;
 const OZONE_HALF_WIDTH_KM: f32 = 22.0;
 const GROUND_ALBEDO: f32 = 0.18;
+
+// Numerical and quality controls.
 const FINITE_SEGMENT_STEPS: u32 = 8u;
+const SEGMENT_MIDPOINT_U: f32 = 0.5;
+const SIMPSON_ENDPOINT_WEIGHT: f32 = 1.0;
+const SIMPSON_EVEN_WEIGHT: f32 = 2.0;
+const SIMPSON_ODD_WEIGHT: f32 = 4.0;
+const SIMPSON_NORMALIZATION: f32 = 3.0;
+const PLANET_RADIUS_EPS_KM: f32 = 1.0e-3;
+const MIN_SCALE_HEIGHT_KM: f32 = 1.0e-4;
+const DISTANCE_EPS_KM: f32 = 1.0e-6;
+const GEOMETRY_EPS: f32 = 1.0e-8;
+const LOG_ARG_EPS: f32 = 1.0e-20;
+const NO_INTERSECTION: f32 = -1.0;
+const OPAQUE_COLUMN: f32 = 1.0e8;
+const SUN_DIRECTIONAL_COS_RADIUS: f32 = 0.999999;
+const CHAPMAN_VERTICAL_MU: f32 = 0.9999;
+const CHAPMAN_HORIZON_BLEND_BEGIN_MU: f32 = 8.0e-3;
+const CHAPMAN_HORIZON_BLEND_END_MU: f32 = 2.0e-2;
+const CHAPMAN_HORIZON_DAMPING: f32 = 0.8;
+const CHAPMAN_MIN_MU: f32 = 1.0e-4;
+const ERFCX_MAX_X: f32 = 100.0;
+const ERFCX_RATIONAL_SWITCH_X: f32 = 8.0;
+const ERFI_SERIES_SWITCH_X: f32 = 2.5;
+const ERFI_SERIES_TERMS: u32 = 12u;
+const OPTICAL_DEPTH_CLAMP: f32 = 80.0;
+const TRANSMITTANCE_LINEAR_TAU_EPS: f32 = 1.0e-3;
+const TRANSMITTANCE_QUADRATIC_Q_EPS: f32 = 1.0e-3;
+const TRANSMITTANCE_QUADRATIC_U_MIN: f32 = 0.05;
+const TRANSMITTANCE_QUADRATIC_U_MAX: f32 = 0.95;
+const COLUMN_RATIO_EPS: f32 = 1.0e-6;
+const GROUND_SKY_RAYLEIGH_PHASE_MU_SCALE: f32 = 0.5;
 
 struct AnalyticParams {
     planet: vec4<f32>,
@@ -44,6 +76,7 @@ struct VertexOutput {
 @group(0) @binding(1) var<uniform> view: AnalyticView;
 @group(0) @binding(2) var<uniform> sun: AnalyticSun;
 
+// Fullscreen entry points.
 @vertex
 fn vertex(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     let u = f32((vertex_index << 1u) & 2u);
@@ -63,6 +96,7 @@ fn fragment(vertex_out: VertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(radiance, 1.0);
 }
 
+// Uniform-derived scene parameters.
 fn bottom_radius_km() -> f32 {
     return ap.planet.x;
 }
@@ -72,22 +106,23 @@ fn top_radius_km() -> f32 {
 }
 
 fn eye_radius_km() -> f32 {
-    return clamp(ap.planet.z, bottom_radius_km() + 1.0e-3, top_radius_km() - 1.0e-3);
+    return clamp(ap.planet.z, bottom_radius_km() + PLANET_RADIUS_EPS_KM, top_radius_km() - PLANET_RADIUS_EPS_KM);
 }
 
 fn to_sun_dir() -> vec3<f32> {
     return normalize(ap.sun_dir.xyz);
 }
 
+// Geometry helpers.
 fn ray_sphere_intersection(ro: vec3<f32>, rd: vec3<f32>, radius: f32) -> f32 {
     let b = dot(ro, rd);
     let c = dot(ro, ro) - radius * radius;
     if (c > 0.0 && b > 0.0) {
-        return -1.0;
+        return NO_INTERSECTION;
     }
     let d = b * b - c;
     if (d < 0.0) {
-        return -1.0;
+        return NO_INTERSECTION;
     }
     if (d > b * b) {
         return -b + sqrt(d);
@@ -98,14 +133,15 @@ fn ray_sphere_intersection(ro: vec3<f32>, rd: vec3<f32>, radius: f32) -> f32 {
 fn eye_ground_intersection(dir: vec3<f32>) -> f32 {
     let r = eye_radius_km();
     let ground = bottom_radius_km();
-    let horizon_mu2 = max(1.0 - (ground * ground) / max(r * r, 1.0e-6), 0.0);
+    let horizon_mu2 = max(1.0 - (ground * ground) / max(r * r, GEOMETRY_EPS), 0.0);
     let mu = normalize(dir).y;
     if (mu >= 0.0 || mu * mu < horizon_mu2) {
-        return -1.0;
+        return NO_INTERSECTION;
     }
     return -r * mu - r * sqrt(max(mu * mu - horizon_mu2, 0.0));
 }
 
+// Phase functions.
 fn rayleigh_phase(mu: f32) -> f32 {
     return RAYLEIGH_PHASE_SCALE * (1.0 + mu * mu);
 }
@@ -123,48 +159,53 @@ fn opac_like_mie_phase_hack(mu: f32) -> f32 {
 // exp(x * x) * erfc(x) using the Smith and Smith approximation cited there.
 // https://doi.org/10.1186/s40623-021-01435-y
 fn erfcx_vasylyev(x_in: f32) -> f32 {
-    let x = clamp(x_in, 0.0, 100.0);
-    if (x <= 8.0) {
+    let x = clamp(x_in, 0.0, ERFCX_MAX_X);
+    if (x <= ERFCX_RATIONAL_SWITCH_X) {
         return (1.0606963 + 0.55643831 * x) / (1.0619896 + 1.7245609 * x + x * x);
     }
     return 0.56498823 / (0.06651874 + x);
 }
 
 fn chapman_vasylyev_upward(radius_km: f32, mu_in: f32, scale_height_km: f32) -> f32 {
-    let x = max(radius_km / max(scale_height_km, 1.0e-4), 1.0);
+    let x = max(radius_km / max(scale_height_km, MIN_SCALE_HEIGHT_KM), 1.0);
     let mu = clamp(mu_in, 0.0, 1.0);
-    if (mu > 0.9999) {
-        return 1.0 / max(mu, 1.0e-4);
+    if (mu > CHAPMAN_VERTICAL_MU) {
+        return 1.0 / max(mu, CHAPMAN_MIN_MU);
     }
     let horizon = sqrt(0.5 * PI * x) * (1.0 + 0.375 / x);
     // Eq. 37 contains strong cancellation as mu approaches 0. In f32 this
     // creates visible horizon spikes/bands, so keep the same asymptote and
     // use a stable rational form before blending back to the Vasylyev fit.
-    let stable_horizon = horizon / (1.0 + 0.8 * horizon * mu);
-    if (mu < 8.0e-3) {
+    let stable_horizon = horizon / (1.0 + CHAPMAN_HORIZON_DAMPING * horizon * mu);
+    if (mu < CHAPMAN_HORIZON_BLEND_BEGIN_MU) {
         return stable_horizon;
     }
 
     let sin_z = sqrt(max(1.0 - mu * mu, 0.0));
-    let x_sin = max(x * sin_z, 1.0e-4);
+    let x_sin = max(x * sin_z, MIN_SCALE_HEIGHT_KM);
     let erfcx_arg = sqrt(max(x * (1.0 - sin_z), 0.0));
     let first = sqrt(0.5 * PI)
         * sqrt(x_sin)
         * (1.0 + 0.375 / x_sin)
         * erfcx_vasylyev(erfcx_arg);
 
-    let cos2 = max(1.0 - sin_z * sin_z, 1.0e-6);
+    let cos2 = max(1.0 - sin_z * sin_z, COLUMN_RATIO_EPS);
     let t = sqrt(max(0.5 * sin_z * (1.0 + sin_z), 0.0));
     let bracket = sin_z * sin_z * sin_z - t * t * t + 0.375 * t * cos2;
-    let second = (1.0 - t - bracket / max(x_sin * cos2 * cos2, 1.0e-6)) / sqrt(cos2);
+    let second = (1.0 - t - bracket / max(x_sin * cos2 * cos2, COLUMN_RATIO_EPS)) / sqrt(cos2);
     let vasylyev = max(first + second, 0.0);
-    let horizon_blend_t = clamp((mu - 8.0e-3) / (2.0e-2 - 8.0e-3), 0.0, 1.0);
+    let horizon_blend_t = clamp(
+        (mu - CHAPMAN_HORIZON_BLEND_BEGIN_MU) / (CHAPMAN_HORIZON_BLEND_END_MU - CHAPMAN_HORIZON_BLEND_BEGIN_MU),
+        0.0,
+        1.0,
+    );
     let horizon_blend = horizon_blend_t * horizon_blend_t * (3.0 - 2.0 * horizon_blend_t);
     return stable_horizon + (vasylyev - stable_horizon) * horizon_blend;
 }
 
+// Analytic column-density approximations.
 fn column_to_space(pos_km: vec3<f32>, dir: vec3<f32>, scale_height_km: f32) -> f32 {
-    let radius = max(length(pos_km), bottom_radius_km() + 1.0e-3);
+    let radius = max(length(pos_km), bottom_radius_km() + PLANET_RADIUS_EPS_KM);
     let altitude = max(radius - bottom_radius_km(), 0.0);
     let up = pos_km / radius;
     let mu = dot(normalize(dir), up);
@@ -185,9 +226,9 @@ fn column_to_top_unblocked(pos_km: vec3<f32>, dir: vec3<f32>, scale_height_km: f
 fn column_to_top(pos_km: vec3<f32>, dir: vec3<f32>, scale_height_km: f32) -> f32 {
     let d = normalize(dir);
     if (ray_sphere_intersection(pos_km, d, bottom_radius_km()) >= 0.0) {
-        return 1.0e8;
+        return OPAQUE_COLUMN;
     }
-    let radius = max(length(pos_km), bottom_radius_km() + 1.0e-3);
+    let radius = max(length(pos_km), bottom_radius_km() + PLANET_RADIUS_EPS_KM);
     let mu = dot(d, pos_km / radius);
     if (mu < 0.0) {
         let near_side = column_to_top_unblocked(pos_km, -d, scale_height_km);
@@ -200,13 +241,14 @@ fn column_to_top(pos_km: vec3<f32>, dir: vec3<f32>, scale_height_km: f32) -> f32
     return column_to_top_unblocked(pos_km, d, scale_height_km);
 }
 
+// Closed-form triangular ozone layer.
 fn radial_ramp_primitive(pos_km: vec3<f32>, dir: vec3<f32>, s: f32, threshold_radius_km: f32) -> f32 {
     let b = dot(pos_km, dir);
-    let p2 = max(dot(pos_km, pos_km) - b * b, 1.0e-8);
+    let p2 = max(dot(pos_km, pos_km) - b * b, GEOMETRY_EPS);
     let p = sqrt(p2);
     let x = s + b;
     let radius = sqrt(x * x + p2);
-    let sqrt_integral = 0.5 * (x * radius + p2 * log(max((x + radius) / p, 1.0e-20)));
+    let sqrt_integral = 0.5 * (x * radius + p2 * log(max((x + radius) / p, LOG_ARG_EPS)));
     return sqrt_integral - threshold_radius_km * x;
 }
 
@@ -274,13 +316,13 @@ fn ozone_triangle_column_segment(pos_km: vec3<f32>, dir: vec3<f32>, t_max_km: f3
     let mass = radial_ramp_interval(pos_km, d, lo, hi, r0)
         - 2.0 * radial_ramp_interval(pos_km, d, lo, hi, r1)
         + radial_ramp_interval(pos_km, d, lo, hi, r2);
-    return max(mass / max(OZONE_HALF_WIDTH_KM, 1.0e-4), 0.0);
+    return max(mass / max(OZONE_HALF_WIDTH_KM, MIN_SCALE_HEIGHT_KM), 0.0);
 }
 
 fn ozone_column_to_top(pos_km: vec3<f32>, dir: vec3<f32>) -> f32 {
     let d = normalize(dir);
     if (ray_sphere_intersection(pos_km, d, bottom_radius_km()) >= 0.0) {
-        return 1.0e8;
+        return OPAQUE_COLUMN;
     }
     let t_top = ray_sphere_intersection(pos_km, d, top_radius_km());
     if (t_top < 0.0) {
@@ -295,6 +337,7 @@ fn optical_depth_from_columns(rayleigh_col: f32, mie_col: f32, ozone_col: f32) -
         + ap.ozone_absorption_base * ozone_col;
 }
 
+// Stable finite-segment optical depth for visible ground rays.
 fn exp_density(pos_km: vec3<f32>, scale_height_km: f32) -> f32 {
     let altitude = max(length(pos_km) - bottom_radius_km(), 0.0);
     return exp(-altitude / scale_height_km);
@@ -302,7 +345,7 @@ fn exp_density(pos_km: vec3<f32>, scale_height_km: f32) -> f32 {
 
 fn exp_density_column_segment(pos_km: vec3<f32>, dir: vec3<f32>, distance_km: f32, scale_height_km: f32) -> f32 {
     let distance = max(distance_km, 0.0);
-    if (distance <= 0.0) {
+    if (distance <= DISTANCE_EPS_KM) {
         return 0.0;
     }
 
@@ -312,10 +355,10 @@ fn exp_density_column_segment(pos_km: vec3<f32>, dir: vec3<f32>, distance_km: f3
     for (var i = 0u; i <= FINITE_SEGMENT_STEPS; i = i + 1u) {
         let endpoint = i == 0u || i == FINITE_SEGMENT_STEPS;
         let odd = (i & 1u) == 1u;
-        let weight = select(select(2.0, 4.0, odd), 1.0, endpoint);
+        let weight = select(select(SIMPSON_EVEN_WEIGHT, SIMPSON_ODD_WEIGHT, odd), SIMPSON_ENDPOINT_WEIGHT, endpoint);
         sum += weight * exp_density(pos_km + d * (f32(i) * dt), scale_height_km);
     }
-    return sum * dt / 3.0;
+    return sum * dt / SIMPSON_NORMALIZATION;
 }
 
 fn optical_depth_segment(pos_km: vec3<f32>, dir: vec3<f32>, distance_km: f32) -> vec4<f32> {
@@ -327,8 +370,9 @@ fn optical_depth_segment(pos_km: vec3<f32>, dir: vec3<f32>, distance_km: f32) ->
     return optical_depth_from_columns(rayleigh_col, mie_col, ozone_col);
 }
 
+// Ground terms.
 fn ground_bounce_transfer(pos_km: vec3<f32>, sun_dir: vec3<f32>) -> vec4<f32> {
-    let radius = max(length(pos_km), bottom_radius_km() + 1.0e-3);
+    let radius = max(length(pos_km), bottom_radius_km() + PLANET_RADIUS_EPS_KM);
     let up = pos_km / radius;
     let sun_cos = max(dot(up, sun_dir), 0.0);
     if (sun_cos <= 0.0) {
@@ -336,8 +380,8 @@ fn ground_bounce_transfer(pos_km: vec3<f32>, sun_dir: vec3<f32>) -> vec4<f32> {
     }
 
     let bottom = bottom_radius_km();
-    let ground_pos = up * (bottom + 1.0e-3);
-    let ground_to_sample_distance = max(radius - (bottom + 1.0e-3), 0.0);
+    let ground_pos = up * (bottom + PLANET_RADIUS_EPS_KM);
+    let ground_to_sample_distance = max(radius - (bottom + PLANET_RADIUS_EPS_KM), 0.0);
     let horizon = sqrt(max(radius * radius - bottom * bottom, 0.0));
     let planet_solid_angle = 2.0 * PI * (1.0 - horizon / radius);
 
@@ -391,14 +435,14 @@ fn ground_sky_irradiance_transfer_approx(ground_pos_km: vec3<f32>, normal: vec3<
         return vec4<f32>(0.0);
     }
 
-    let p_mid = ground_pos_km + normal * (0.5 * t_top);
+    let p_mid = ground_pos_km + normal * (SEGMENT_MIDPOINT_U * t_top);
     let p_end = ground_pos_km + normal * t_top;
     let view_col_r = column_to_top(ground_pos_km, normal, RAYLEIGH_SCALE_HEIGHT_KM);
     let view_col_m = column_to_top(ground_pos_km, normal, MIE_SCALE_HEIGHT_KM);
     let view_col_mid_r = clamp(view_col_r - column_to_top(p_mid, normal, RAYLEIGH_SCALE_HEIGHT_KM), 0.0, view_col_r);
     let view_col_mid_m = clamp(view_col_m - column_to_top(p_mid, normal, MIE_SCALE_HEIGHT_KM), 0.0, view_col_m);
     let view_col_o = ozone_triangle_column_segment(ground_pos_km, normal, t_top);
-    let view_col_mid_o = ozone_triangle_column_segment(ground_pos_km, normal, 0.5 * t_top);
+    let view_col_mid_o = ozone_triangle_column_segment(ground_pos_km, normal, SEGMENT_MIDPOINT_U * t_top);
 
     let sun_col0_r = column_to_top(ground_pos_km, sun_dir, RAYLEIGH_SCALE_HEIGHT_KM);
     let sun_col0_m = column_to_top(ground_pos_km, sun_dir, MIE_SCALE_HEIGHT_KM);
@@ -419,20 +463,20 @@ fn ground_sky_irradiance_transfer_approx(ground_pos_km: vec3<f32>, normal: vec3<
         tau_s0,
         tau_mid,
         tau_s1_v,
-        view_col_mid_r / max(view_col_r, 1.0e-6),
+        view_col_mid_r / max(view_col_r, COLUMN_RATIO_EPS),
     );
     let avg_t_m = average_transmittance_quadratic(
         tau_s0,
         tau_mid,
         tau_s1_v,
-        view_col_mid_m / max(view_col_m, 1.0e-6),
+        view_col_mid_m / max(view_col_m, COLUMN_RATIO_EPS),
     );
 
     // Low-order diffuse skylight estimate for visible Lambert ground. The
     // aerosol term intentionally uses an isotropic phase instead of the OPAC
     // forward-lobe hack, because this approximates hemispherical irradiance,
     // not a single view ray through the sun aureole.
-    let rayleigh = ap.rayleigh_scattering_base * view_col_r * rayleigh_phase(0.5 * sun_cos) * avg_t_r;
+    let rayleigh = ap.rayleigh_scattering_base * view_col_r * rayleigh_phase(GROUND_SKY_RAYLEIGH_PHASE_MU_SCALE * sun_cos) * avg_t_r;
     let mie = ap.mie_scattering_base * view_col_m * INV_4PI * avg_t_m;
     return PI * (rayleigh + mie);
 }
@@ -444,17 +488,17 @@ fn view_segment_scatter_to_ground(
 ) -> vec4<f32> {
     let ray_dir = normalize(ground_pos_km - origin);
     let distance = length(ground_pos_km - origin);
-    if (distance <= 0.0) {
+    if (distance <= DISTANCE_EPS_KM) {
         return vec4<f32>(0.0);
     }
 
-    let p_mid = origin + ray_dir * (0.5 * distance);
+    let p_mid = origin + ray_dir * (SEGMENT_MIDPOINT_U * distance);
     let view_col_r = exp_density_column_segment(origin, ray_dir, distance, RAYLEIGH_SCALE_HEIGHT_KM);
     let view_col_m = exp_density_column_segment(origin, ray_dir, distance, MIE_SCALE_HEIGHT_KM);
-    let view_col_mid_r = exp_density_column_segment(origin, ray_dir, 0.5 * distance, RAYLEIGH_SCALE_HEIGHT_KM);
-    let view_col_mid_m = exp_density_column_segment(origin, ray_dir, 0.5 * distance, MIE_SCALE_HEIGHT_KM);
+    let view_col_mid_r = exp_density_column_segment(origin, ray_dir, SEGMENT_MIDPOINT_U * distance, RAYLEIGH_SCALE_HEIGHT_KM);
+    let view_col_mid_m = exp_density_column_segment(origin, ray_dir, SEGMENT_MIDPOINT_U * distance, MIE_SCALE_HEIGHT_KM);
     let view_col_o = ozone_triangle_column_segment(origin, ray_dir, distance);
-    let view_col_mid_o = ozone_triangle_column_segment(origin, ray_dir, 0.5 * distance);
+    let view_col_mid_o = ozone_triangle_column_segment(origin, ray_dir, SEGMENT_MIDPOINT_U * distance);
 
     let sun_col0_r = column_to_top(origin, sun_dir, RAYLEIGH_SCALE_HEIGHT_KM);
     let sun_col0_m = column_to_top(origin, sun_dir, MIE_SCALE_HEIGHT_KM);
@@ -475,13 +519,13 @@ fn view_segment_scatter_to_ground(
         tau_s0,
         tau_mid,
         tau_s1_v,
-        view_col_mid_r / max(view_col_r, 1.0e-6),
+        view_col_mid_r / max(view_col_r, COLUMN_RATIO_EPS),
     );
     let avg_t_m = average_transmittance_quadratic(
         tau_s0,
         tau_mid,
         tau_s1_v,
-        view_col_mid_m / max(view_col_m, 1.0e-6),
+        view_col_mid_m / max(view_col_m, COLUMN_RATIO_EPS),
     );
 
     let mu = dot(sun_dir, ray_dir);
@@ -493,7 +537,7 @@ fn view_segment_scatter_to_ground(
 fn analytic_ground_radiance(origin: vec3<f32>, dir: vec3<f32>, t_ground: f32, sun_dir: vec3<f32>) -> vec3<f32> {
     let ground_hit = origin + dir * t_ground;
     let normal = normalize(ground_hit);
-    let ground_pos = normal * (bottom_radius_km() + 1.0e-3);
+    let ground_pos = normal * (bottom_radius_km() + PLANET_RADIUS_EPS_KM);
     let view_to_eye = normalize(origin - ground_pos);
     let view_distance = length(origin - ground_pos);
 
@@ -508,6 +552,7 @@ fn analytic_ground_radiance(origin: vec3<f32>, dir: vec3<f32>, t_ground: f32, su
     return max(white_balanced_linear_rec2020_from_spectral(ground_spectral + view_scatter_spectral), vec3<f32>(0.0));
 }
 
+// Error functions and closed-form transmittance averages.
 fn erf_approx(x_in: f32) -> f32 {
     let s = select(-1.0, 1.0, x_in >= 0.0);
     let x = abs(x_in);
@@ -519,11 +564,11 @@ fn erf_approx(x_in: f32) -> f32 {
 fn erfi_approx(x_in: f32) -> f32 {
     let s = select(-1.0, 1.0, x_in >= 0.0);
     let x = abs(x_in);
-    if (x < 2.5) {
+    if (x < ERFI_SERIES_SWITCH_X) {
         let xx = x * x;
         var term = x;
         var sum = x;
-        for (var i = 1u; i <= 12u; i = i + 1u) {
+        for (var i = 1u; i <= ERFI_SERIES_TERMS; i = i + 1u) {
             let n = f32(i);
             term *= xx * (2.0 * n - 1.0) / (n * (2.0 * n + 1.0));
             sum += term;
@@ -531,41 +576,41 @@ fn erfi_approx(x_in: f32) -> f32 {
         return s * TWO_INV_SQRT_PI * sum;
     }
 
-    let inv_x2 = 1.0 / max(x * x, 1.0e-6);
+    let inv_x2 = 1.0 / max(x * x, COLUMN_RATIO_EPS);
     let series = 1.0
         + 0.5 * inv_x2
         + 0.75 * inv_x2 * inv_x2
         + 1.875 * inv_x2 * inv_x2 * inv_x2
         + 6.5625 * inv_x2 * inv_x2 * inv_x2 * inv_x2;
-    return s * exp(min(x * x, 80.0)) * series / (SQRT_PI * max(x, 1.0e-4));
+    return s * exp(min(x * x, OPTICAL_DEPTH_CLAMP)) * series / (SQRT_PI * max(x, MIN_SCALE_HEIGHT_KM));
 }
 
 fn average_transmittance_linear_scalar(tau0: f32, tau1: f32) -> f32 {
     let d = tau1 - tau0;
-    if (abs(d) < 1.0e-3) {
+    if (abs(d) < TRANSMITTANCE_LINEAR_TAU_EPS) {
         return exp(-0.5 * (tau0 + tau1));
     }
     return (exp(-tau0) - exp(-tau1)) / d;
 }
 
 fn average_transmittance_quadratic_scalar(tau0: f32, tau_mid: f32, tau1: f32, u_mid_in: f32) -> f32 {
-    if (tau_mid > 80.0) {
+    if (tau_mid > OPTICAL_DEPTH_CLAMP) {
         return 0.0;
     }
-    if (tau0 > 80.0 || tau1 > 80.0) {
+    if (tau0 > OPTICAL_DEPTH_CLAMP || tau1 > OPTICAL_DEPTH_CLAMP) {
         return average_transmittance_linear_scalar(tau0, tau1);
     }
-    if (u_mid_in <= 0.05 || u_mid_in >= 0.95) {
+    if (u_mid_in <= TRANSMITTANCE_QUADRATIC_U_MIN || u_mid_in >= TRANSMITTANCE_QUADRATIC_U_MAX) {
         return average_transmittance_linear_scalar(tau0, tau1);
     }
 
-    let u_mid = clamp(u_mid_in, 0.05, 0.95);
+    let u_mid = clamp(u_mid_in, TRANSMITTANCE_QUADRATIC_U_MIN, TRANSMITTANCE_QUADRATIC_U_MAX);
     let d = tau1 - tau0;
     // tau(u) = tau0 + d * u + q * u * (1 - u). q is estimated from one
     // closed-form midpoint. Positive q means the optical depth arches above
     // the endpoint line, which is the problematic low-sun horizon case.
-    let q = (tau_mid - (tau0 + d * u_mid)) / max(u_mid * (1.0 - u_mid), 1.0e-4);
-    if (abs(q) < 1.0e-3) {
+    let q = (tau_mid - (tau0 + d * u_mid)) / max(u_mid * (1.0 - u_mid), MIN_SCALE_HEIGHT_KM);
+    if (abs(q) < TRANSMITTANCE_QUADRATIC_Q_EPS) {
         return average_transmittance_linear_scalar(tau0, tau1);
     }
 
@@ -574,7 +619,7 @@ fn average_transmittance_quadratic_scalar(tau0: f32, tau_mid: f32, tau1: f32, u_
         let sqrt_q = sqrt(q);
         let x0 = -b / (2.0 * sqrt_q);
         let x1 = sqrt_q + x0;
-        let scale = exp(clamp(-tau0 - b * b / (4.0 * q), -80.0, 80.0));
+        let scale = exp(clamp(-tau0 - b * b / (4.0 * q), -OPTICAL_DEPTH_CLAMP, OPTICAL_DEPTH_CLAMP));
         let integral = scale * SQRT_PI * (erfi_approx(x1) - erfi_approx(x0)) / (2.0 * sqrt_q);
         return max(integral, 0.0);
     }
@@ -583,7 +628,7 @@ fn average_transmittance_quadratic_scalar(tau0: f32, tau_mid: f32, tau1: f32, u_
     let sqrt_p = sqrt(p);
     let x0 = b / (2.0 * sqrt_p);
     let x1 = sqrt_p + x0;
-    let scale = exp(clamp(-tau0 + b * b / (4.0 * p), -80.0, 80.0));
+    let scale = exp(clamp(-tau0 + b * b / (4.0 * p), -OPTICAL_DEPTH_CLAMP, OPTICAL_DEPTH_CLAMP));
     let integral = scale * SQRT_PI * (erf_approx(x1) - erf_approx(x0)) / (2.0 * sqrt_p);
     return max(integral, 0.0);
 }
@@ -602,8 +647,9 @@ fn average_transmittance_quadratic(
     );
 }
 
+// Sun disk and spectral display conversion.
 fn spectral_sun_transmittance_to_rec2020(transmittance: vec4<f32>) -> vec3<f32> {
-    let clear_sun = max(white_balanced_linear_rec2020_from_spectral(ap.sun_spectral_irradiance), vec3<f32>(1.0e-6));
+    let clear_sun = max(white_balanced_linear_rec2020_from_spectral(ap.sun_spectral_irradiance), vec3<f32>(COLUMN_RATIO_EPS));
     let attenuated_sun = max(white_balanced_linear_rec2020_from_spectral(ap.sun_spectral_irradiance * transmittance), vec3<f32>(0.0));
     return clamp(attenuated_sun / clear_sun, vec3<f32>(0.0), vec3<f32>(1.0));
 }
@@ -623,6 +669,7 @@ fn sun_disk_eval(direction: vec3<f32>, transmittance: vec3<f32>) -> vec3<f32> {
     return sun.irradiance_rec2020_w_m2 * transmittance / solid_angle;
 }
 
+// Main analytic sky/ground evaluation.
 fn analytic_sky_radiance(direction: vec3<f32>) -> vec3<f32> {
     let origin = vec3<f32>(0.0, eye_radius_km(), 0.0);
     let dir = normalize(direction);
@@ -638,7 +685,7 @@ fn analytic_sky_radiance(direction: vec3<f32>) -> vec3<f32> {
     }
 
     let p_end = origin + dir * t_top;
-    let p_mid = origin + dir * (0.5 * t_top);
+    let p_mid = origin + dir * (SEGMENT_MIDPOINT_U * t_top);
     let view_col_r = column_to_top(origin, dir, RAYLEIGH_SCALE_HEIGHT_KM);
     let view_col_m = column_to_top(origin, dir, MIE_SCALE_HEIGHT_KM);
     let view_col_mid_r = clamp(view_col_r - column_to_top(p_mid, dir, RAYLEIGH_SCALE_HEIGHT_KM), 0.0, view_col_r);
@@ -653,7 +700,7 @@ fn analytic_sky_radiance(direction: vec3<f32>) -> vec3<f32> {
     let sun_col1_m = column_to_top(p_end, sun_dir, MIE_SCALE_HEIGHT_KM);
     let sun_col1_o = ozone_column_to_top(p_end, sun_dir);
     let view_col_o = ozone_triangle_column_segment(origin, dir, t_top);
-    let view_col_mid_o = ozone_triangle_column_segment(origin, dir, 0.5 * t_top);
+    let view_col_mid_o = ozone_triangle_column_segment(origin, dir, SEGMENT_MIDPOINT_U * t_top);
 
     let tau_s0 = optical_depth_from_columns(sun_col0_r, sun_col0_m, sun_col0_o);
     let tau_view_mid = optical_depth_from_columns(view_col_mid_r, view_col_mid_m, view_col_mid_o);
@@ -664,25 +711,25 @@ fn analytic_sky_radiance(direction: vec3<f32>) -> vec3<f32> {
         tau_s0,
         tau_mid,
         tau_s1_v,
-        view_col_mid_r / max(view_col_r, 1.0e-6),
+        view_col_mid_r / max(view_col_r, COLUMN_RATIO_EPS),
     );
     let avg_t_m = average_transmittance_quadratic(
         tau_s0,
         tau_mid,
         tau_s1_v,
-        view_col_mid_m / max(view_col_m, 1.0e-6),
+        view_col_mid_m / max(view_col_m, COLUMN_RATIO_EPS),
     );
     let avg_view_t_r = average_transmittance_quadratic(
         vec4<f32>(0.0),
         tau_view_mid,
         tau_view1,
-        view_col_mid_r / max(view_col_r, 1.0e-6),
+        view_col_mid_r / max(view_col_r, COLUMN_RATIO_EPS),
     );
     let avg_view_t_m = average_transmittance_quadratic(
         vec4<f32>(0.0),
         tau_view_mid,
         tau_view1,
-        view_col_mid_m / max(view_col_m, 1.0e-6),
+        view_col_mid_m / max(view_col_m, COLUMN_RATIO_EPS),
     );
     let mu = dot(sun_dir, dir);
     let rayleigh_scatter = ap.rayleigh_scattering_base * view_col_r * rayleigh_phase(mu) * avg_t_r;
@@ -699,6 +746,7 @@ fn analytic_sky_radiance(direction: vec3<f32>) -> vec3<f32> {
     return rgb;
 }
 
+// Spectral-to-Rec.2020 conversion and white balance.
 fn linear_rec2020_from_spectral(l: vec4<f32>) -> vec3<f32> {
     let m = mat4x3<f32>(
         vec3<f32>(86.3182148, -0.122697755, 0.547224869),
