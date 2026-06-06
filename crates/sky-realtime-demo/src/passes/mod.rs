@@ -1,3 +1,2 @@
-pub mod hillaire_atmosphere;
-pub mod precomputed_atmosphere;
+pub mod common;
 pub mod unreal_atmosphere;

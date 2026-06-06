@@ -10,7 +10,7 @@ use glam::Vec3;
 pub const SUN_IRRADIANCE_REC2020_W_PER_M2: [f32; 3] = [205.0, 205.0, 205.0];
 
 /// 太阳圆盘 WGSL helper。
-pub const SUN_WGSL: &str = include_str!("../wgsl/sun.wgsl");
+pub const SUN_WGSL: &str = include_str!("wgsl/sun.wgsl");
 
 /// 共享太阳光源。
 #[derive(Clone, Copy, Debug, PartialEq)]

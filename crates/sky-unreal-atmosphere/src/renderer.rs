@@ -3,14 +3,15 @@ use std::fmt;
 
 use bytemuck::{Pod, Zeroable};
 use glam::UVec2;
-use sky_realtime_atmosphere::HillaireAtmosphere;
-use sky_realtime_atmosphere::atmo::{Sun, SunGpu};
-use sky_realtime_atmosphere::gpu::{Gpu, RenderTargets, ViewFrame};
-use sky_realtime_atmosphere::params::{
+
+use crate::atmosphere::HillaireAtmosphere;
+use crate::gpu::{Gpu, RenderTargets, SCENE_RADIANCE_FORMAT, ViewFrame};
+use crate::params::{
     AEROSOL_SPECIES, AerosolPreset, HillaireParamsGpu, HillairePhaseMode, HillaireSettings,
     HillaireSpeciesGpu, MOLECULAR_SCATTERING_BASE, OZONE_ABSORPTION_CROSS_SECTION,
     SUN_SPECTRAL_IRRADIANCE, aerosol_preset_defaults, ozone_monthly_dobson,
 };
+use crate::sun::{SUN_WGSL, Sun, SunGpu};
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
 
 const M_TO_KM: f32 = 1.0e-3;
@@ -350,8 +351,8 @@ struct TextureArray {
 
 impl TextureArray {
     fn phase_lut(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
-        let width = sky_realtime_atmosphere::aerosol::PHASE_LUT_COS_BINS_U32;
-        let layers = sky_realtime_atmosphere::aerosol::PHASE_LUT_SPECIES_U32;
+        let width = crate::aerosol::PHASE_LUT_COS_BINS_U32;
+        let layers = crate::aerosol::PHASE_LUT_SPECIES_U32;
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("unreal.aerosol_phase.lut"),
             size: wgpu::Extent3d {
@@ -367,8 +368,7 @@ impl TextureArray {
             view_formats: &[],
         });
 
-        for (z, species_lut) in (0..layers).zip(sky_realtime_atmosphere::aerosol::PHASE_LUTS.iter())
-        {
+        for (z, species_lut) in (0..layers).zip(crate::aerosol::PHASE_LUTS.iter()) {
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &texture,
@@ -556,7 +556,7 @@ fn render_pipeline(device: &wgpu::Device, layout: &wgpu::BindGroupLayout) -> wgp
     let source = format!(
         "{}\n\n{}\n\n{}",
         crate::COMMON_WGSL,
-        sky_realtime_atmosphere::atmo::SUN_WGSL,
+        SUN_WGSL,
         include_str!("wgsl/render_sky.wgsl")
     );
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -582,7 +582,7 @@ fn render_pipeline(device: &wgpu::Device, layout: &wgpu::BindGroupLayout) -> wgp
             entry_point: Some("fragment"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             targets: &[Some(wgpu::ColorTargetState {
-                format: sky_realtime_atmosphere::gpu::SCENE_RADIANCE_FORMAT,
+                format: SCENE_RADIANCE_FORMAT,
                 blend: None,
                 write_mask: wgpu::ColorWrites::ALL,
             })],
@@ -621,9 +621,9 @@ fn unreal_params(params: &UnrealFrameParams) -> HillaireParamsGpu {
 
     for (slot, ((base, bg, scale), (sigma_sca, sigma_abs))) in p.species.iter_mut().zip(
         species_defaults.iter().zip(
-            sky_realtime_atmosphere::aerosol::SIGMA_SCA
+            crate::aerosol::SIGMA_SCA
                 .iter()
-                .zip(sky_realtime_atmosphere::aerosol::SIGMA_ABS.iter()),
+                .zip(crate::aerosol::SIGMA_ABS.iter()),
         ),
     ) {
         *slot = HillaireSpeciesGpu {

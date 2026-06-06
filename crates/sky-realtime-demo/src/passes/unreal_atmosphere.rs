@@ -1,15 +1,14 @@
-use sky_realtime_atmosphere::gpu::{Gpu, NonZeroRenderSize, RenderTargets};
-use sky_realtime_atmosphere::{
-    AerosolPreset, HillaireAtmosphere, HillairePhaseMode, HillaireSettings,
+use sky_unreal_atmosphere::{
+    AerosolPreset, Gpu, HillaireAtmosphere, HillairePhaseMode, HillaireSettings, NonZeroRenderSize,
+    RenderTargets, Sun, UnrealAtmosphereContext, UnrealFrameParams,
 };
-use sky_unreal_atmosphere::{UnrealAtmosphereContext, UnrealFrameParams};
 use winit::dpi::PhysicalSize;
 
 use crate::color::DisplayTransform;
 use crate::experiment::{
     CompareMode, ExperimentInit, FrameContext, RealtimeExperiment, UpdateContext,
 };
-use crate::passes::hillaire_atmosphere::{
+use crate::passes::common::{
     ReferenceTexture, TexturePresentPass, atmosphere_from_asset, sun_from_asset,
     view_frame_from_state,
 };
@@ -23,8 +22,8 @@ pub struct UnrealAtmosphereExperiment {
     size: NonZeroRenderSize,
     view: ViewState,
     compare_mode: CompareMode,
-    sun: sky_realtime_atmosphere::Sun,
-    hillaire_atmosphere: HillaireAtmosphere,
+    sun: Sun,
+    atmosphere_profile: HillaireAtmosphere,
     settings: HillaireSettings,
     aerosol: AerosolPreset,
     phase_mode: HillairePhaseMode,
@@ -55,7 +54,7 @@ impl UnrealAtmosphereExperiment {
             view: ViewState::default(),
             compare_mode: CompareMode::default(),
             sun: sun_from_asset(context.asset),
-            hillaire_atmosphere: atmosphere_from_asset(context.asset),
+            atmosphere_profile: atmosphere_from_asset(context.asset),
             settings: HillaireSettings::default(),
             aerosol: AerosolPreset::default(),
             phase_mode: HillairePhaseMode::default(),
@@ -87,14 +86,14 @@ impl RealtimeExperiment for UnrealAtmosphereExperiment {
         self.view = context.view;
         self.compare_mode = context.compare_mode;
         self.sun = sun_from_asset(context.asset);
-        self.hillaire_atmosphere = atmosphere_from_asset(context.asset);
+        self.atmosphere_profile = atmosphere_from_asset(context.asset);
     }
 
     fn render(&mut self, context: FrameContext<'_>) {
         self.ensure_size(context.device, context.surface_size);
         let frame_params = UnrealFrameParams {
             view: view_frame_from_state(self.view, self.size, self.sun),
-            atmosphere: self.hillaire_atmosphere,
+            atmosphere: self.atmosphere_profile,
             settings: self.settings,
             aerosol: self.aerosol,
             phase_mode: self.phase_mode,

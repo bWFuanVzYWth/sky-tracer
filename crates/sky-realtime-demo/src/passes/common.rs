@@ -1,163 +1,15 @@
 use glam::{Mat4, Vec3, Vec4};
-use sky_realtime_atmosphere::atmo::{
-    SUN_IRRADIANCE_REC2020_W_PER_M2, Sun, voxel_atmosphere_lighting_bind_group_layout,
+use sky_unreal_atmosphere::{
+    HillaireAtmosphere, NonZeroRenderSize, SUN_IRRADIANCE_REC2020_W_PER_M2, Sun, ViewFrame,
 };
-use sky_realtime_atmosphere::gpu::{Gpu, NonZeroRenderSize, RenderTargets, ViewFrame};
-use sky_realtime_atmosphere::{
-    AerosolPreset, HillaireAtmosphere, HillaireAtmosphereContext, HillaireFrameParams,
-    HillairePhaseMode, HillaireSettings,
-};
-use winit::dpi::PhysicalSize;
 
 use crate::assets::RealtimeAsset;
-use crate::color::DisplayTransform;
-use crate::experiment::{
-    CompareMode, ExperimentInit, FrameContext, RealtimeExperiment, UpdateContext,
-};
+use crate::experiment::CompareMode;
 use crate::view::ViewState;
 
 const PRESENT_SHADER: &str = include_str!("../shaders/present_texture.wgsl");
 
-pub struct HillaireAtmosphereExperiment {
-    atmosphere: HillaireAtmosphereContext,
-    targets: RenderTargets,
-    present: TexturePresentPass,
-    reference: ReferenceTexture,
-    size: NonZeroRenderSize,
-    view: ViewState,
-    compare_mode: CompareMode,
-    sun: Sun,
-    hillaire_atmosphere: HillaireAtmosphere,
-    settings: HillaireSettings,
-    aerosol: AerosolPreset,
-    phase_mode: HillairePhaseMode,
-    _display: DisplayTransform,
-}
-
-impl HillaireAtmosphereExperiment {
-    pub fn new(context: ExperimentInit<'_>) -> Result<Self, String> {
-        let size = NonZeroRenderSize::new(1, 1).expect("literal non-zero render size");
-        let targets = RenderTargets::new(context.device, size);
-        let voxel_layout = voxel_atmosphere_lighting_bind_group_layout(context.device);
-        let gpu = Gpu::borrowed(context.device, context.queue);
-        let atmosphere = HillaireAtmosphereContext::new(&gpu, &targets, &voxel_layout)
-            .map_err(|error| error.to_string())?;
-        let reference = ReferenceTexture::from_asset(context.device, context.queue, context.asset);
-        let present = TexturePresentPass::new(
-            context.device,
-            context.surface_format,
-            targets.post_view(),
-            &reference,
-            context.display.exposure,
-        );
-
-        Ok(Self {
-            atmosphere,
-            targets,
-            present,
-            reference,
-            size,
-            view: ViewState::default(),
-            compare_mode: CompareMode::default(),
-            sun: sun_from_asset(context.asset),
-            hillaire_atmosphere: atmosphere_from_asset(context.asset),
-            settings: HillaireSettings::default(),
-            aerosol: AerosolPreset::default(),
-            phase_mode: HillairePhaseMode::default(),
-            _display: context.display,
-        })
-    }
-
-    fn ensure_size(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        surface_size: PhysicalSize<u32>,
-    ) {
-        let Some(size) = NonZeroRenderSize::new(surface_size.width, surface_size.height) else {
-            return;
-        };
-        if size == self.size {
-            return;
-        }
-
-        self.targets.resize(device, size);
-        let gpu = Gpu::borrowed(device, queue);
-        self.atmosphere.retarget(&gpu, &self.targets);
-        self.present
-            .set_source(device, self.targets.post_view(), &self.reference);
-        self.size = size;
-    }
-
-    fn upload_frame_params(&mut self, queue: &wgpu::Queue) {
-        let frame_params = HillaireFrameParams {
-            view: view_frame_from_state(self.view, self.size, self.sun),
-            atmosphere: self.hillaire_atmosphere,
-            settings: self.settings,
-            aerosol: self.aerosol,
-            phase_mode: self.phase_mode,
-            sun: self.sun,
-        };
-        let upload = self.atmosphere.compute_params(&frame_params);
-        queue.write_buffer(
-            &self.atmosphere.params_buffer,
-            0,
-            bytemuck::bytes_of(&upload.hillaire),
-        );
-        queue.write_buffer(
-            &self.atmosphere.sky_view_params_buffer,
-            0,
-            bytemuck::bytes_of(&upload.sky_view),
-        );
-        queue.write_buffer(
-            &self.atmosphere.view_buffer,
-            0,
-            bytemuck::bytes_of(&upload.view),
-        );
-        queue.write_buffer(
-            &self.atmosphere.voxel_lighting_buffer,
-            0,
-            bytemuck::bytes_of(&upload.voxel_lighting),
-        );
-        queue.write_buffer(
-            &self.atmosphere.sun_buffer,
-            0,
-            bytemuck::bytes_of(&upload.sun),
-        );
-    }
-}
-
-impl RealtimeExperiment for HillaireAtmosphereExperiment {
-    fn name(&self) -> &'static str {
-        "hillaire-realtime-atmosphere"
-    }
-
-    fn update(&mut self, context: UpdateContext<'_>) {
-        self.view = context.view;
-        self.compare_mode = context.compare_mode;
-        self.sun = sun_from_asset(context.asset);
-        self.hillaire_atmosphere = atmosphere_from_asset(context.asset);
-    }
-
-    fn render(&mut self, context: FrameContext<'_>) {
-        self.ensure_size(context.device, context.queue, context.surface_size);
-        self.upload_frame_params(context.queue);
-        self.present.update_uniform(
-            context.queue,
-            self.compare_mode,
-            self.view,
-            self.size,
-            self.reference.is_available(),
-        );
-        clear_scene_targets(context.encoder, &self.targets);
-        self.atmosphere.dispatch_compute(context.encoder);
-        self.atmosphere
-            .render_after_scene(context.encoder, &self.targets);
-        self.present.render(context.encoder, context.target);
-    }
-}
-
-pub(super) struct TexturePresentPass {
+pub(crate) struct TexturePresentPass {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
@@ -167,7 +19,7 @@ pub(super) struct TexturePresentPass {
 }
 
 impl TexturePresentPass {
-    pub(super) fn new(
+    pub(crate) fn new(
         device: &wgpu::Device,
         surface_format: wgpu::TextureFormat,
         source: &wgpu::TextureView,
@@ -175,7 +27,7 @@ impl TexturePresentPass {
         exposure: f32,
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("hillaire_present_shader"),
+            label: Some("realtime_present_shader"),
             source: wgpu::ShaderSource::Wgsl(PRESENT_SHADER.into()),
         });
         let reference_projection_sun_observer = reference.projection_sun_observer();
@@ -192,13 +44,13 @@ impl TexturePresentPass {
         let uniform_buffer = wgpu::util::DeviceExt::create_buffer_init(
             device,
             &wgpu::util::BufferInitDescriptor {
-                label: Some("hillaire_present_uniform"),
+                label: Some("realtime_present_uniform"),
                 contents: bytemuck::bytes_of(&uniform),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             },
         );
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("hillaire_present_bgl"),
+            label: Some("realtime_present_bgl"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -231,12 +83,12 @@ impl TexturePresentPass {
         });
         let bind_group = present_bind_group(device, &layout, source, &uniform_buffer, reference);
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("hillaire_present_pipeline_layout"),
+            label: Some("realtime_present_pipeline_layout"),
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("hillaire_present_pipeline"),
+            label: Some("realtime_present_pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -270,7 +122,7 @@ impl TexturePresentPass {
         }
     }
 
-    pub(super) fn set_source(
+    pub(crate) fn set_source(
         &mut self,
         device: &wgpu::Device,
         source: &wgpu::TextureView,
@@ -285,7 +137,7 @@ impl TexturePresentPass {
         );
     }
 
-    pub(super) fn update_uniform(
+    pub(crate) fn update_uniform(
         &self,
         queue: &wgpu::Queue,
         compare_mode: CompareMode,
@@ -307,9 +159,9 @@ impl TexturePresentPass {
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
     }
 
-    pub(super) fn render(&self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView) {
+    pub(crate) fn render(&self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("hillaire_present_pass"),
+            label: Some("realtime_present_pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: target,
                 depth_slice: None,
@@ -338,7 +190,7 @@ fn present_bind_group(
     reference: &ReferenceTexture,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("hillaire_present_bg"),
+        label: Some("realtime_present_bg"),
         layout,
         entries: &[
             wgpu::BindGroupEntry {
@@ -371,7 +223,7 @@ struct PresentUniform {
 
 const _: () = assert!(core::mem::size_of::<PresentUniform>() == 48);
 
-pub(super) struct ReferenceTexture {
+pub(crate) struct ReferenceTexture {
     _texture: wgpu::Texture,
     view: wgpu::TextureView,
     sampler: wgpu::Sampler,
@@ -380,7 +232,7 @@ pub(super) struct ReferenceTexture {
 }
 
 impl ReferenceTexture {
-    pub(super) fn from_asset(
+    pub(crate) fn from_asset(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         asset: &RealtimeAsset,
@@ -493,7 +345,7 @@ impl ReferenceTexture {
         }
     }
 
-    pub(super) fn is_available(&self) -> bool {
+    pub(crate) const fn is_available(&self) -> bool {
         self.available
     }
 
@@ -501,7 +353,7 @@ impl ReferenceTexture {
         if self.available { 1.0 } else { 0.0 }
     }
 
-    fn projection_sun_observer(&self) -> [f32; 4] {
+    const fn projection_sun_observer(&self) -> [f32; 4] {
         self.projection_sun_observer
     }
 }
@@ -551,40 +403,14 @@ const fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-pub(super) fn clear_scene_targets(encoder: &mut wgpu::CommandEncoder, targets: &RenderTargets) {
-    let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-        label: Some("hillaire_clear_scene_targets"),
-        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-            view: targets.scene_view(),
-            depth_slice: None,
-            resolve_target: None,
-            ops: wgpu::Operations {
-                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                store: wgpu::StoreOp::Store,
-            },
-        })],
-        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-            view: targets.depth_view(),
-            depth_ops: Some(wgpu::Operations {
-                load: wgpu::LoadOp::Clear(0.0),
-                store: wgpu::StoreOp::Store,
-            }),
-            stencil_ops: None,
-        }),
-        occlusion_query_set: None,
-        timestamp_writes: None,
-        multiview_mask: None,
-    });
-}
-
-pub(super) fn atmosphere_from_asset(asset: &RealtimeAsset) -> HillaireAtmosphere {
+pub(crate) fn atmosphere_from_asset(asset: &RealtimeAsset) -> HillaireAtmosphere {
     let mut atmosphere = HillaireAtmosphere::default();
     atmosphere.world_y0_radius_m =
         atmosphere.bottom_radius_m + asset.manifest().observer_altitude_km.max(0.0) * 1000.0;
     atmosphere
 }
 
-pub(super) fn sun_from_asset(asset: &RealtimeAsset) -> Sun {
+pub(crate) fn sun_from_asset(asset: &RealtimeAsset) -> Sun {
     let manifest = asset.manifest();
     let to_sun =
         direction_from_azimuth_elevation(manifest.sun_azimuth_deg, manifest.sun_elevation_deg);
@@ -595,7 +421,7 @@ pub(super) fn sun_from_asset(asset: &RealtimeAsset) -> Sun {
     }
 }
 
-pub(super) fn view_frame_from_state(
+pub(crate) fn view_frame_from_state(
     view: ViewState,
     size: NonZeroRenderSize,
     sun: Sun,
@@ -652,7 +478,7 @@ fn direction_from_azimuth_elevation(azimuth_deg: f32, elevation_deg: f32) -> Vec
 
 #[cfg(test)]
 mod tests {
-    use sky_realtime_atmosphere::gpu::NonZeroRenderSize;
+    use sky_unreal_atmosphere::NonZeroRenderSize;
 
     use super::{Sun, Vec3, ViewState, view_frame_from_state};
 

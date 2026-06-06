@@ -6,7 +6,6 @@ edition.workspace = true
 [dependencies]
 bytemuck = { workspace = true }
 glam = { workspace = true }
-sky-realtime-atmosphere = { path = "../sky-realtime-atmosphere" }
 wgpu = { workspace = true }
 
 [dev-dependencies]

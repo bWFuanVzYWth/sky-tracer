@@ -27,7 +27,7 @@ impl GpuContext {
             })
             .await
             .map_err(|error| error.to_string())?;
-        let required_features = sky_realtime_atmosphere::REQUIRED_FEATURES;
+        let required_features = sky_unreal_atmosphere::REQUIRED_FEATURES;
         if !adapter.features().contains(required_features) {
             return Err(format!(
                 "adapter does not support required realtime atmosphere features: {required_features:?}"

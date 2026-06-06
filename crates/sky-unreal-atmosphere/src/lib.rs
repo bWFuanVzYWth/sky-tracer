@@ -5,9 +5,21 @@
 //! transmittance, a direct plus single-scattered ground irradiance LUT, a 2D
 //! multiple-scattering LUT, and a sky-view LUT.
 
-mod renderer;
+pub mod aerosol;
+pub mod gpu;
+pub mod params;
 
+mod atmosphere;
+mod renderer;
+mod sun;
+
+pub use atmosphere::HillaireAtmosphere;
+pub use gpu::{Gpu, NonZeroRenderSize, RenderTargets, ViewFrame};
+pub use params::{AerosolPreset, HillairePhaseMode, HillaireSettings};
 pub use renderer::{UnrealAtmosphereContext, UnrealFrameParams, UnrealRendererError};
+pub use sun::{SUN_IRRADIANCE_REC2020_W_PER_M2, SUN_WGSL, Sun, SunGpu};
+
+pub const REQUIRED_FEATURES: wgpu::Features = wgpu::Features::FLOAT32_FILTERABLE;
 
 pub const COMMON_WGSL: &str = include_str!("wgsl/common.wgsl");
 pub const INSCATTER_WGSL: &str = include_str!("wgsl/inscatter.wgsl");
@@ -75,7 +87,7 @@ mod tests {
         let source = format!(
             "{}\n\n{}\n\n{}",
             crate::COMMON_WGSL,
-            sky_realtime_atmosphere::atmo::SUN_WGSL,
+            crate::SUN_WGSL,
             include_str!("wgsl/render_sky.wgsl")
         );
         compose_wgsl(&source, "unreal/render_sky_combined.wgsl")
