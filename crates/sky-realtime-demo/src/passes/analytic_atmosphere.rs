@@ -65,7 +65,7 @@ impl AnalyticAtmosphereExperiment {
 
 impl RealtimeExperiment for AnalyticAtmosphereExperiment {
     fn name(&self) -> &'static str {
-        "analytic-chapman-single-scattering"
+        "analytic-radial-quadratic-atmosphere"
     }
 
     fn update(&mut self, context: UpdateContext<'_>) {

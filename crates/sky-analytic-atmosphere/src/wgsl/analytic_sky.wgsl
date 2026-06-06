@@ -5,21 +5,21 @@ const INV_PI: f32 = 0.31830988618379067;
 const INV_4PI: f32 = 0.07957747154594767;
 const RAYLEIGH_PHASE_SCALE: f32 = 0.05968310365946075;
 
-// Physical model knobs for this analytic approximation.
-const RAYLEIGH_SCALE_HEIGHT_KM: f32 = 8.0;
-const MIE_SCALE_HEIGHT_KM: f32 = 1.2;
+// Physical model knobs for this analytic approximation. Rayleigh and Mie use
+// a radial quadratic exponential density:
+//   rho(r) = exp(-(r^2 - Rg^2) / (2 * Rg * H)).
+// H is the near-ground equivalent scale height, fitted from the offline data
+// as vertical column / surface density rather than the usual 8 km / 1.2 km
+// textbook exponential model.
+const RAYLEIGH_EQUIVALENT_HEIGHT_KM: f32 = 8.4675;
+const MIE_EQUIVALENT_HEIGHT_KM: f32 = 1.6670;
 const MIE_HACK_PHASE_E: f32 = 3500.0;
 const OZONE_CENTER_ALTITUDE_KM: f32 = 22.0;
 const OZONE_HALF_WIDTH_KM: f32 = 22.0;
 const GROUND_ALBEDO: f32 = 0.18;
 
 // Numerical and quality controls.
-const FINITE_SEGMENT_STEPS: u32 = 8u;
 const SEGMENT_MIDPOINT_U: f32 = 0.5;
-const SIMPSON_ENDPOINT_WEIGHT: f32 = 1.0;
-const SIMPSON_EVEN_WEIGHT: f32 = 2.0;
-const SIMPSON_ODD_WEIGHT: f32 = 4.0;
-const SIMPSON_NORMALIZATION: f32 = 3.0;
 const PLANET_RADIUS_EPS_KM: f32 = 1.0e-3;
 const MIN_SCALE_HEIGHT_KM: f32 = 1.0e-4;
 const DISTANCE_EPS_KM: f32 = 1.0e-6;
@@ -28,11 +28,6 @@ const LOG_ARG_EPS: f32 = 1.0e-20;
 const NO_INTERSECTION: f32 = -1.0;
 const OPAQUE_COLUMN: f32 = 1.0e8;
 const SUN_DIRECTIONAL_COS_RADIUS: f32 = 0.999999;
-const CHAPMAN_VERTICAL_MU: f32 = 0.9999;
-const CHAPMAN_HORIZON_BLEND_BEGIN_MU: f32 = 8.0e-3;
-const CHAPMAN_HORIZON_BLEND_END_MU: f32 = 2.0e-2;
-const CHAPMAN_HORIZON_DAMPING: f32 = 0.8;
-const CHAPMAN_MIN_MU: f32 = 1.0e-4;
 const ERFCX_MAX_X: f32 = 100.0;
 const ERFCX_RATIONAL_SWITCH_X: f32 = 8.0;
 const ERFI_SERIES_SWITCH_X: f32 = 2.5;
@@ -157,6 +152,8 @@ fn opac_like_mie_phase_hack(mu: f32) -> f32 {
 // Source: Vasylyev et al. 2021, "Approximate Chapman function for high zenith angles",
 // Earth, Planets and Space, Eq. 37. The erfcx rational form evaluates
 // exp(x * x) * erfc(x) using the Smith and Smith approximation cited there.
+// We reuse only the stable erfcx approximation here; the density model below
+// is radial quadratic exponential rather than a Chapman standard exponential.
 // https://doi.org/10.1186/s40623-021-01435-y
 fn erfcx_vasylyev(x_in: f32) -> f32 {
     let x = clamp(x_in, 0.0, ERFCX_MAX_X);
@@ -166,61 +163,73 @@ fn erfcx_vasylyev(x_in: f32) -> f32 {
     return 0.56498823 / (0.06651874 + x);
 }
 
-fn chapman_vasylyev_upward(radius_km: f32, mu_in: f32, scale_height_km: f32) -> f32 {
-    let x = max(radius_km / max(scale_height_km, MIN_SCALE_HEIGHT_KM), 1.0);
-    let mu = clamp(mu_in, 0.0, 1.0);
-    if (mu > CHAPMAN_VERTICAL_MU) {
-        return 1.0 / max(mu, CHAPMAN_MIN_MU);
+// Analytic column-density approximation for radial quadratic exponential
+// density. This avoids the unstable "column to space A - column to space B"
+// difference and has fixed cost for every view direction.
+fn ray_sphere_exit_distance(ro: vec3<f32>, rd: vec3<f32>, radius: f32) -> f32 {
+    let b = dot(ro, rd);
+    let c = dot(ro, ro) - radius * radius;
+    let d = b * b - c;
+    if (d < 0.0) {
+        return NO_INTERSECTION;
     }
-    let horizon = sqrt(0.5 * PI * x) * (1.0 + 0.375 / x);
-    // Eq. 37 contains strong cancellation as mu approaches 0. In f32 this
-    // creates visible horizon spikes/bands, so keep the same asymptote and
-    // use a stable rational form before blending back to the Vasylyev fit.
-    let stable_horizon = horizon / (1.0 + CHAPMAN_HORIZON_DAMPING * horizon * mu);
-    if (mu < CHAPMAN_HORIZON_BLEND_BEGIN_MU) {
-        return stable_horizon;
+    let root = sqrt(d);
+    let t0 = -b - root;
+    let t1 = -b + root;
+    if (t1 >= 0.0) {
+        return t1;
     }
-
-    let sin_z = sqrt(max(1.0 - mu * mu, 0.0));
-    let x_sin = max(x * sin_z, MIN_SCALE_HEIGHT_KM);
-    let erfcx_arg = sqrt(max(x * (1.0 - sin_z), 0.0));
-    let first = sqrt(0.5 * PI)
-        * sqrt(x_sin)
-        * (1.0 + 0.375 / x_sin)
-        * erfcx_vasylyev(erfcx_arg);
-
-    let cos2 = max(1.0 - sin_z * sin_z, COLUMN_RATIO_EPS);
-    let t = sqrt(max(0.5 * sin_z * (1.0 + sin_z), 0.0));
-    let bracket = sin_z * sin_z * sin_z - t * t * t + 0.375 * t * cos2;
-    let second = (1.0 - t - bracket / max(x_sin * cos2 * cos2, COLUMN_RATIO_EPS)) / sqrt(cos2);
-    let vasylyev = max(first + second, 0.0);
-    let horizon_blend_t = clamp(
-        (mu - CHAPMAN_HORIZON_BLEND_BEGIN_MU) / (CHAPMAN_HORIZON_BLEND_END_MU - CHAPMAN_HORIZON_BLEND_BEGIN_MU),
-        0.0,
-        1.0,
-    );
-    let horizon_blend = horizon_blend_t * horizon_blend_t * (3.0 - 2.0 * horizon_blend_t);
-    return stable_horizon + (vasylyev - stable_horizon) * horizon_blend;
+    if (t0 >= 0.0) {
+        return t0;
+    }
+    return NO_INTERSECTION;
 }
 
-// Analytic column-density approximations.
-fn column_to_space(pos_km: vec3<f32>, dir: vec3<f32>, scale_height_km: f32) -> f32 {
-    let radius = max(length(pos_km), bottom_radius_km() + PLANET_RADIUS_EPS_KM);
-    let altitude = max(radius - bottom_radius_km(), 0.0);
-    let up = pos_km / radius;
-    let mu = dot(normalize(dir), up);
-    return scale_height_km * exp(-altitude / scale_height_km)
-        * chapman_vasylyev_upward(radius, max(mu, 0.0), scale_height_km);
+fn radial_quadratic_column_positive_side(c: f32, b: f32, distance: f32, a: f32) -> f32 {
+    let sqrt_a = sqrt(a);
+    let x0 = max(b, 0.0) * sqrt_a;
+    let x1 = x0 + distance * sqrt_a;
+    let attenuation = exp(clamp(-(x1 * x1 - x0 * x0), -OPTICAL_DEPTH_CLAMP, 0.0));
+    let erfcx_delta = max(erfcx_vasylyev(x0) - attenuation * erfcx_vasylyev(x1), 0.0);
+    let density_base = exp(clamp(-a * max(c, 0.0), -OPTICAL_DEPTH_CLAMP, 0.0));
+    return density_base * SQRT_PI * erfcx_delta / (2.0 * sqrt_a);
 }
 
-fn column_to_top_unblocked(pos_km: vec3<f32>, dir: vec3<f32>, scale_height_km: f32) -> f32 {
-    let d = normalize(dir);
-    let t_top = ray_sphere_intersection(pos_km, d, top_radius_km());
-    if (t_top < 0.0) {
+fn radial_quadratic_density_column_segment(
+    pos_km: vec3<f32>,
+    dir: vec3<f32>,
+    distance_km: f32,
+    scale_height_km: f32,
+) -> f32 {
+    let distance = max(distance_km, 0.0);
+    if (distance <= DISTANCE_EPS_KM) {
         return 0.0;
     }
-    let p_top = pos_km + d * t_top;
-    return max(column_to_space(pos_km, d, scale_height_km) - column_to_space(p_top, d, scale_height_km), 0.0);
+
+    let d = normalize(dir);
+    let ground_radius = bottom_radius_km();
+    let h = max(scale_height_km, MIN_SCALE_HEIGHT_KM);
+    let a = 1.0 / (2.0 * ground_radius * h);
+    let c = max(dot(pos_km, pos_km) - ground_radius * ground_radius, 0.0);
+    let b = dot(pos_km, d);
+
+    if (b >= 0.0) {
+        return radial_quadratic_column_positive_side(c, b, distance, a);
+    }
+
+    let b_end = b + distance;
+    if (b_end <= 0.0) {
+        let end_pos = pos_km + d * distance;
+        let end_c = max(dot(end_pos, end_pos) - ground_radius * ground_radius, 0.0);
+        return radial_quadratic_column_positive_side(end_c, -b_end, distance, a);
+    }
+
+    let sqrt_a = sqrt(a);
+    let x0 = b * sqrt_a;
+    let x1 = b_end * sqrt_a;
+    let tangent_excess_radius2 = max(c - b * b, 0.0);
+    let tangent_density = exp(clamp(-a * tangent_excess_radius2, -OPTICAL_DEPTH_CLAMP, 0.0));
+    return max(tangent_density * SQRT_PI * (erf_approx(x1) - erf_approx(x0)) / (2.0 * sqrt_a), 0.0);
 }
 
 fn column_to_top(pos_km: vec3<f32>, dir: vec3<f32>, scale_height_km: f32) -> f32 {
@@ -228,17 +237,11 @@ fn column_to_top(pos_km: vec3<f32>, dir: vec3<f32>, scale_height_km: f32) -> f32
     if (ray_sphere_intersection(pos_km, d, bottom_radius_km()) >= 0.0) {
         return OPAQUE_COLUMN;
     }
-    let radius = max(length(pos_km), bottom_radius_km() + PLANET_RADIUS_EPS_KM);
-    let mu = dot(d, pos_km / radius);
-    if (mu < 0.0) {
-        let near_side = column_to_top_unblocked(pos_km, -d, scale_height_km);
-        let tangent_radius = radius * sqrt(max(1.0 - mu * mu, 0.0));
-        let tangent_altitude = max(tangent_radius - bottom_radius_km(), 0.0);
-        let tangent_to_space = scale_height_km * exp(-tangent_altitude / scale_height_km)
-            * chapman_vasylyev_upward(max(tangent_radius, bottom_radius_km()), 0.0, scale_height_km);
-        return max(2.0 * tangent_to_space - near_side, 0.0);
+    let t_top = ray_sphere_exit_distance(pos_km, d, top_radius_km());
+    if (t_top < 0.0) {
+        return 0.0;
     }
-    return column_to_top_unblocked(pos_km, d, scale_height_km);
+    return radial_quadratic_density_column_segment(pos_km, d, t_top, scale_height_km);
 }
 
 // Closed-form triangular ozone layer.
@@ -324,7 +327,7 @@ fn ozone_column_to_top(pos_km: vec3<f32>, dir: vec3<f32>) -> f32 {
     if (ray_sphere_intersection(pos_km, d, bottom_radius_km()) >= 0.0) {
         return OPAQUE_COLUMN;
     }
-    let t_top = ray_sphere_intersection(pos_km, d, top_radius_km());
+    let t_top = ray_sphere_exit_distance(pos_km, d, top_radius_km());
     if (t_top < 0.0) {
         return 0.0;
     }
@@ -337,35 +340,11 @@ fn optical_depth_from_columns(rayleigh_col: f32, mie_col: f32, ozone_col: f32) -
         + ap.ozone_absorption_base * ozone_col;
 }
 
-// Stable finite-segment optical depth for visible ground rays.
-fn exp_density(pos_km: vec3<f32>, scale_height_km: f32) -> f32 {
-    let altitude = max(length(pos_km) - bottom_radius_km(), 0.0);
-    return exp(-altitude / scale_height_km);
-}
-
-fn exp_density_column_segment(pos_km: vec3<f32>, dir: vec3<f32>, distance_km: f32, scale_height_km: f32) -> f32 {
-    let distance = max(distance_km, 0.0);
-    if (distance <= DISTANCE_EPS_KM) {
-        return 0.0;
-    }
-
-    let d = normalize(dir);
-    let dt = distance / f32(FINITE_SEGMENT_STEPS);
-    var sum = 0.0;
-    for (var i = 0u; i <= FINITE_SEGMENT_STEPS; i = i + 1u) {
-        let endpoint = i == 0u || i == FINITE_SEGMENT_STEPS;
-        let odd = (i & 1u) == 1u;
-        let weight = select(select(SIMPSON_EVEN_WEIGHT, SIMPSON_ODD_WEIGHT, odd), SIMPSON_ENDPOINT_WEIGHT, endpoint);
-        sum += weight * exp_density(pos_km + d * (f32(i) * dt), scale_height_km);
-    }
-    return sum * dt / SIMPSON_NORMALIZATION;
-}
-
 fn optical_depth_segment(pos_km: vec3<f32>, dir: vec3<f32>, distance_km: f32) -> vec4<f32> {
     let d = normalize(dir);
     let distance = max(distance_km, 0.0);
-    let rayleigh_col = exp_density_column_segment(pos_km, d, distance, RAYLEIGH_SCALE_HEIGHT_KM);
-    let mie_col = exp_density_column_segment(pos_km, d, distance, MIE_SCALE_HEIGHT_KM);
+    let rayleigh_col = radial_quadratic_density_column_segment(pos_km, d, distance, RAYLEIGH_EQUIVALENT_HEIGHT_KM);
+    let mie_col = radial_quadratic_density_column_segment(pos_km, d, distance, MIE_EQUIVALENT_HEIGHT_KM);
     let ozone_col = ozone_triangle_column_segment(pos_km, d, distance);
     return optical_depth_from_columns(rayleigh_col, mie_col, ozone_col);
 }
@@ -386,19 +365,21 @@ fn ground_bounce_transfer(pos_km: vec3<f32>, sun_dir: vec3<f32>) -> vec4<f32> {
     let planet_solid_angle = 2.0 * PI * (1.0 - horizon / radius);
 
     let sun_ground_tau = optical_depth_from_columns(
-        column_to_top(ground_pos, sun_dir, RAYLEIGH_SCALE_HEIGHT_KM),
-        column_to_top(ground_pos, sun_dir, MIE_SCALE_HEIGHT_KM),
+        column_to_top(ground_pos, sun_dir, RAYLEIGH_EQUIVALENT_HEIGHT_KM),
+        column_to_top(ground_pos, sun_dir, MIE_EQUIVALENT_HEIGHT_KM),
         ozone_column_to_top(ground_pos, sun_dir),
     );
-    let ground_to_sample_r = max(
-        column_to_top(ground_pos, up, RAYLEIGH_SCALE_HEIGHT_KM)
-            - column_to_top(pos_km, up, RAYLEIGH_SCALE_HEIGHT_KM),
-        0.0,
+    let ground_to_sample_r = radial_quadratic_density_column_segment(
+        ground_pos,
+        up,
+        ground_to_sample_distance,
+        RAYLEIGH_EQUIVALENT_HEIGHT_KM,
     );
-    let ground_to_sample_m = max(
-        column_to_top(ground_pos, up, MIE_SCALE_HEIGHT_KM)
-            - column_to_top(pos_km, up, MIE_SCALE_HEIGHT_KM),
-        0.0,
+    let ground_to_sample_m = radial_quadratic_density_column_segment(
+        ground_pos,
+        up,
+        ground_to_sample_distance,
+        MIE_EQUIVALENT_HEIGHT_KM,
     );
     let ground_to_sample_o = ozone_triangle_column_segment(ground_pos, up, ground_to_sample_distance);
     let ground_to_sample_tau = optical_depth_from_columns(
@@ -417,8 +398,8 @@ fn ground_direct_irradiance_transfer(ground_pos_km: vec3<f32>, normal: vec3<f32>
         return vec4<f32>(0.0);
     }
     let sun_tau = optical_depth_from_columns(
-        column_to_top(ground_pos_km, sun_dir, RAYLEIGH_SCALE_HEIGHT_KM),
-        column_to_top(ground_pos_km, sun_dir, MIE_SCALE_HEIGHT_KM),
+        column_to_top(ground_pos_km, sun_dir, RAYLEIGH_EQUIVALENT_HEIGHT_KM),
+        column_to_top(ground_pos_km, sun_dir, MIE_EQUIVALENT_HEIGHT_KM),
         ozone_column_to_top(ground_pos_km, sun_dir),
     );
     return vec4<f32>(sun_cos) * exp(-sun_tau);
@@ -437,21 +418,31 @@ fn ground_sky_irradiance_transfer_approx(ground_pos_km: vec3<f32>, normal: vec3<
 
     let p_mid = ground_pos_km + normal * (SEGMENT_MIDPOINT_U * t_top);
     let p_end = ground_pos_km + normal * t_top;
-    let view_col_r = column_to_top(ground_pos_km, normal, RAYLEIGH_SCALE_HEIGHT_KM);
-    let view_col_m = column_to_top(ground_pos_km, normal, MIE_SCALE_HEIGHT_KM);
-    let view_col_mid_r = clamp(view_col_r - column_to_top(p_mid, normal, RAYLEIGH_SCALE_HEIGHT_KM), 0.0, view_col_r);
-    let view_col_mid_m = clamp(view_col_m - column_to_top(p_mid, normal, MIE_SCALE_HEIGHT_KM), 0.0, view_col_m);
+    let view_col_r = column_to_top(ground_pos_km, normal, RAYLEIGH_EQUIVALENT_HEIGHT_KM);
+    let view_col_m = column_to_top(ground_pos_km, normal, MIE_EQUIVALENT_HEIGHT_KM);
+    let view_col_mid_r = radial_quadratic_density_column_segment(
+        ground_pos_km,
+        normal,
+        SEGMENT_MIDPOINT_U * t_top,
+        RAYLEIGH_EQUIVALENT_HEIGHT_KM,
+    );
+    let view_col_mid_m = radial_quadratic_density_column_segment(
+        ground_pos_km,
+        normal,
+        SEGMENT_MIDPOINT_U * t_top,
+        MIE_EQUIVALENT_HEIGHT_KM,
+    );
     let view_col_o = ozone_triangle_column_segment(ground_pos_km, normal, t_top);
     let view_col_mid_o = ozone_triangle_column_segment(ground_pos_km, normal, SEGMENT_MIDPOINT_U * t_top);
 
-    let sun_col0_r = column_to_top(ground_pos_km, sun_dir, RAYLEIGH_SCALE_HEIGHT_KM);
-    let sun_col0_m = column_to_top(ground_pos_km, sun_dir, MIE_SCALE_HEIGHT_KM);
+    let sun_col0_r = column_to_top(ground_pos_km, sun_dir, RAYLEIGH_EQUIVALENT_HEIGHT_KM);
+    let sun_col0_m = column_to_top(ground_pos_km, sun_dir, MIE_EQUIVALENT_HEIGHT_KM);
     let sun_col0_o = ozone_column_to_top(ground_pos_km, sun_dir);
-    let sun_col_mid_r = column_to_top(p_mid, sun_dir, RAYLEIGH_SCALE_HEIGHT_KM);
-    let sun_col_mid_m = column_to_top(p_mid, sun_dir, MIE_SCALE_HEIGHT_KM);
+    let sun_col_mid_r = column_to_top(p_mid, sun_dir, RAYLEIGH_EQUIVALENT_HEIGHT_KM);
+    let sun_col_mid_m = column_to_top(p_mid, sun_dir, MIE_EQUIVALENT_HEIGHT_KM);
     let sun_col_mid_o = ozone_column_to_top(p_mid, sun_dir);
-    let sun_col1_r = column_to_top(p_end, sun_dir, RAYLEIGH_SCALE_HEIGHT_KM);
-    let sun_col1_m = column_to_top(p_end, sun_dir, MIE_SCALE_HEIGHT_KM);
+    let sun_col1_r = column_to_top(p_end, sun_dir, RAYLEIGH_EQUIVALENT_HEIGHT_KM);
+    let sun_col1_m = column_to_top(p_end, sun_dir, MIE_EQUIVALENT_HEIGHT_KM);
     let sun_col1_o = ozone_column_to_top(p_end, sun_dir);
 
     let tau_s0 = optical_depth_from_columns(sun_col0_r, sun_col0_m, sun_col0_o);
@@ -493,21 +484,21 @@ fn view_segment_scatter_to_ground(
     }
 
     let p_mid = origin + ray_dir * (SEGMENT_MIDPOINT_U * distance);
-    let view_col_r = exp_density_column_segment(origin, ray_dir, distance, RAYLEIGH_SCALE_HEIGHT_KM);
-    let view_col_m = exp_density_column_segment(origin, ray_dir, distance, MIE_SCALE_HEIGHT_KM);
-    let view_col_mid_r = exp_density_column_segment(origin, ray_dir, SEGMENT_MIDPOINT_U * distance, RAYLEIGH_SCALE_HEIGHT_KM);
-    let view_col_mid_m = exp_density_column_segment(origin, ray_dir, SEGMENT_MIDPOINT_U * distance, MIE_SCALE_HEIGHT_KM);
+    let view_col_r = radial_quadratic_density_column_segment(origin, ray_dir, distance, RAYLEIGH_EQUIVALENT_HEIGHT_KM);
+    let view_col_m = radial_quadratic_density_column_segment(origin, ray_dir, distance, MIE_EQUIVALENT_HEIGHT_KM);
+    let view_col_mid_r = radial_quadratic_density_column_segment(origin, ray_dir, SEGMENT_MIDPOINT_U * distance, RAYLEIGH_EQUIVALENT_HEIGHT_KM);
+    let view_col_mid_m = radial_quadratic_density_column_segment(origin, ray_dir, SEGMENT_MIDPOINT_U * distance, MIE_EQUIVALENT_HEIGHT_KM);
     let view_col_o = ozone_triangle_column_segment(origin, ray_dir, distance);
     let view_col_mid_o = ozone_triangle_column_segment(origin, ray_dir, SEGMENT_MIDPOINT_U * distance);
 
-    let sun_col0_r = column_to_top(origin, sun_dir, RAYLEIGH_SCALE_HEIGHT_KM);
-    let sun_col0_m = column_to_top(origin, sun_dir, MIE_SCALE_HEIGHT_KM);
+    let sun_col0_r = column_to_top(origin, sun_dir, RAYLEIGH_EQUIVALENT_HEIGHT_KM);
+    let sun_col0_m = column_to_top(origin, sun_dir, MIE_EQUIVALENT_HEIGHT_KM);
     let sun_col0_o = ozone_column_to_top(origin, sun_dir);
-    let sun_col_mid_r = column_to_top(p_mid, sun_dir, RAYLEIGH_SCALE_HEIGHT_KM);
-    let sun_col_mid_m = column_to_top(p_mid, sun_dir, MIE_SCALE_HEIGHT_KM);
+    let sun_col_mid_r = column_to_top(p_mid, sun_dir, RAYLEIGH_EQUIVALENT_HEIGHT_KM);
+    let sun_col_mid_m = column_to_top(p_mid, sun_dir, MIE_EQUIVALENT_HEIGHT_KM);
     let sun_col_mid_o = ozone_column_to_top(p_mid, sun_dir);
-    let sun_col1_r = column_to_top(ground_pos_km, sun_dir, RAYLEIGH_SCALE_HEIGHT_KM);
-    let sun_col1_m = column_to_top(ground_pos_km, sun_dir, MIE_SCALE_HEIGHT_KM);
+    let sun_col1_r = column_to_top(ground_pos_km, sun_dir, RAYLEIGH_EQUIVALENT_HEIGHT_KM);
+    let sun_col1_m = column_to_top(ground_pos_km, sun_dir, MIE_EQUIVALENT_HEIGHT_KM);
     let sun_col1_o = ozone_column_to_top(ground_pos_km, sun_dir);
 
     let tau_s0 = optical_depth_from_columns(sun_col0_r, sun_col0_m, sun_col0_o);
@@ -686,18 +677,28 @@ fn analytic_sky_radiance(direction: vec3<f32>) -> vec3<f32> {
 
     let p_end = origin + dir * t_top;
     let p_mid = origin + dir * (SEGMENT_MIDPOINT_U * t_top);
-    let view_col_r = column_to_top(origin, dir, RAYLEIGH_SCALE_HEIGHT_KM);
-    let view_col_m = column_to_top(origin, dir, MIE_SCALE_HEIGHT_KM);
-    let view_col_mid_r = clamp(view_col_r - column_to_top(p_mid, dir, RAYLEIGH_SCALE_HEIGHT_KM), 0.0, view_col_r);
-    let view_col_mid_m = clamp(view_col_m - column_to_top(p_mid, dir, MIE_SCALE_HEIGHT_KM), 0.0, view_col_m);
-    let sun_col0_r = column_to_top(origin, sun_dir, RAYLEIGH_SCALE_HEIGHT_KM);
-    let sun_col0_m = column_to_top(origin, sun_dir, MIE_SCALE_HEIGHT_KM);
+    let view_col_r = column_to_top(origin, dir, RAYLEIGH_EQUIVALENT_HEIGHT_KM);
+    let view_col_m = column_to_top(origin, dir, MIE_EQUIVALENT_HEIGHT_KM);
+    let view_col_mid_r = radial_quadratic_density_column_segment(
+        origin,
+        dir,
+        SEGMENT_MIDPOINT_U * t_top,
+        RAYLEIGH_EQUIVALENT_HEIGHT_KM,
+    );
+    let view_col_mid_m = radial_quadratic_density_column_segment(
+        origin,
+        dir,
+        SEGMENT_MIDPOINT_U * t_top,
+        MIE_EQUIVALENT_HEIGHT_KM,
+    );
+    let sun_col0_r = column_to_top(origin, sun_dir, RAYLEIGH_EQUIVALENT_HEIGHT_KM);
+    let sun_col0_m = column_to_top(origin, sun_dir, MIE_EQUIVALENT_HEIGHT_KM);
     let sun_col0_o = ozone_column_to_top(origin, sun_dir);
-    let sun_col_mid_r = column_to_top(p_mid, sun_dir, RAYLEIGH_SCALE_HEIGHT_KM);
-    let sun_col_mid_m = column_to_top(p_mid, sun_dir, MIE_SCALE_HEIGHT_KM);
+    let sun_col_mid_r = column_to_top(p_mid, sun_dir, RAYLEIGH_EQUIVALENT_HEIGHT_KM);
+    let sun_col_mid_m = column_to_top(p_mid, sun_dir, MIE_EQUIVALENT_HEIGHT_KM);
     let sun_col_mid_o = ozone_column_to_top(p_mid, sun_dir);
-    let sun_col1_r = column_to_top(p_end, sun_dir, RAYLEIGH_SCALE_HEIGHT_KM);
-    let sun_col1_m = column_to_top(p_end, sun_dir, MIE_SCALE_HEIGHT_KM);
+    let sun_col1_r = column_to_top(p_end, sun_dir, RAYLEIGH_EQUIVALENT_HEIGHT_KM);
+    let sun_col1_m = column_to_top(p_end, sun_dir, MIE_EQUIVALENT_HEIGHT_KM);
     let sun_col1_o = ozone_column_to_top(p_end, sun_dir);
     let view_col_o = ozone_triangle_column_segment(origin, dir, t_top);
     let view_col_mid_o = ozone_triangle_column_segment(origin, dir, SEGMENT_MIDPOINT_U * t_top);
