@@ -7,6 +7,8 @@ const RAYLEIGH_SCALE_HEIGHT_KM: f32 = 8.0;
 const MIE_SCALE_HEIGHT_KM: f32 = 1.2;
 const MIE_G: f32 = 0.8;
 const SUN_DIRECTIONAL_COS_RADIUS: f32 = 0.999999;
+const OZONE_CENTER_ALTITUDE_KM: f32 = 22.0;
+const OZONE_HALF_WIDTH_KM: f32 = 22.0;
 
 struct AnalyticParams {
     planet: vec4<f32>,
@@ -15,6 +17,7 @@ struct AnalyticParams {
     rayleigh_scattering_base: vec4<f32>,
     mie_scattering_base: vec4<f32>,
     mie_extinction_base: vec4<f32>,
+    ozone_absorption_base: vec4<f32>,
 }
 
 struct AnalyticView {
@@ -180,6 +183,95 @@ fn column_to_top(pos_km: vec3<f32>, dir: vec3<f32>, scale_height_km: f32) -> f32
     return column_to_top_unblocked(pos_km, d, scale_height_km);
 }
 
+fn radial_ramp_primitive(pos_km: vec3<f32>, dir: vec3<f32>, s: f32, threshold_radius_km: f32) -> f32 {
+    let b = dot(pos_km, dir);
+    let p2 = max(dot(pos_km, pos_km) - b * b, 1.0e-8);
+    let p = sqrt(p2);
+    let x = s + b;
+    let radius = sqrt(x * x + p2);
+    let sqrt_integral = 0.5 * (x * radius + p2 * log(max((x + radius) / p, 1.0e-20)));
+    return sqrt_integral - threshold_radius_km * x;
+}
+
+fn radial_ramp_interval(
+    pos_km: vec3<f32>,
+    dir: vec3<f32>,
+    lo: f32,
+    hi: f32,
+    threshold_radius_km: f32,
+) -> f32 {
+    if (hi <= lo) {
+        return 0.0;
+    }
+
+    let b = dot(pos_km, dir);
+    let p2 = max(dot(pos_km, pos_km) - b * b, 0.0);
+    let threshold2 = threshold_radius_km * threshold_radius_km;
+    var mass = 0.0;
+    if (p2 >= threshold2) {
+        mass = radial_ramp_primitive(pos_km, dir, hi, threshold_radius_km)
+            - radial_ramp_primitive(pos_km, dir, lo, threshold_radius_km);
+    } else {
+        let root = sqrt(max(threshold2 - p2, 0.0));
+        let enter = -b - root;
+        let exit = -b + root;
+        let hi0 = min(hi, enter);
+        if (hi0 > lo) {
+            mass += radial_ramp_primitive(pos_km, dir, hi0, threshold_radius_km)
+                - radial_ramp_primitive(pos_km, dir, lo, threshold_radius_km);
+        }
+        let lo1 = max(lo, exit);
+        if (hi > lo1) {
+            mass += radial_ramp_primitive(pos_km, dir, hi, threshold_radius_km)
+                - radial_ramp_primitive(pos_km, dir, lo1, threshold_radius_km);
+        }
+    }
+    return max(mass, 0.0);
+}
+
+fn ozone_triangle_column_segment(pos_km: vec3<f32>, dir: vec3<f32>, t_max_km: f32) -> f32 {
+    if (t_max_km <= 0.0) {
+        return 0.0;
+    }
+
+    let d = normalize(dir);
+    let bottom = bottom_radius_km();
+    let r0 = bottom + max(OZONE_CENTER_ALTITUDE_KM - OZONE_HALF_WIDTH_KM, 0.0);
+    let r1 = bottom + OZONE_CENTER_ALTITUDE_KM;
+    let r2 = bottom + OZONE_CENTER_ALTITUDE_KM + OZONE_HALF_WIDTH_KM;
+
+    let b = dot(pos_km, d);
+    let p2 = max(dot(pos_km, pos_km) - b * b, 0.0);
+    let disc = r2 * r2 - p2;
+    if (disc <= 0.0) {
+        return 0.0;
+    }
+
+    let root = sqrt(disc);
+    let lo = max(0.0, -b - root);
+    let hi = min(t_max_km, -b + root);
+    if (hi <= lo) {
+        return 0.0;
+    }
+
+    let mass = radial_ramp_interval(pos_km, d, lo, hi, r0)
+        - 2.0 * radial_ramp_interval(pos_km, d, lo, hi, r1)
+        + radial_ramp_interval(pos_km, d, lo, hi, r2);
+    return max(mass / max(OZONE_HALF_WIDTH_KM, 1.0e-4), 0.0);
+}
+
+fn ozone_column_to_top(pos_km: vec3<f32>, dir: vec3<f32>) -> f32 {
+    let d = normalize(dir);
+    if (ray_sphere_intersection(pos_km, d, bottom_radius_km()) >= 0.0) {
+        return 1.0e8;
+    }
+    let t_top = ray_sphere_intersection(pos_km, d, top_radius_km());
+    if (t_top < 0.0) {
+        return 0.0;
+    }
+    return ozone_triangle_column_segment(pos_km, d, t_top);
+}
+
 fn erf_approx(x_in: f32) -> f32 {
     let s = select(-1.0, 1.0, x_in >= 0.0);
     let x = abs(x_in);
@@ -221,6 +313,12 @@ fn average_transmittance_linear_scalar(tau0: f32, tau1: f32) -> f32 {
 }
 
 fn average_transmittance_quadratic_scalar(tau0: f32, tau_mid: f32, tau1: f32, u_mid_in: f32) -> f32 {
+    if (tau_mid > 80.0) {
+        return 0.0;
+    }
+    if (tau0 > 80.0 || tau1 > 80.0) {
+        return average_transmittance_linear_scalar(tau0, tau1);
+    }
     if (u_mid_in <= 0.05 || u_mid_in >= 0.95) {
         return average_transmittance_linear_scalar(tau0, tau1);
     }
@@ -310,16 +408,25 @@ fn analytic_sky_radiance(direction: vec3<f32>) -> vec3<f32> {
     let view_col_mid_m = clamp(view_col_m - column_to_top(p_mid, dir, MIE_SCALE_HEIGHT_KM), 0.0, view_col_m);
     let sun_col0_r = column_to_top(origin, sun_dir, RAYLEIGH_SCALE_HEIGHT_KM);
     let sun_col0_m = column_to_top(origin, sun_dir, MIE_SCALE_HEIGHT_KM);
+    let sun_col0_o = ozone_column_to_top(origin, sun_dir);
     let sun_col_mid_r = column_to_top(p_mid, sun_dir, RAYLEIGH_SCALE_HEIGHT_KM);
     let sun_col_mid_m = column_to_top(p_mid, sun_dir, MIE_SCALE_HEIGHT_KM);
+    let sun_col_mid_o = ozone_column_to_top(p_mid, sun_dir);
     let sun_col1_r = column_to_top(p_end, sun_dir, RAYLEIGH_SCALE_HEIGHT_KM);
     let sun_col1_m = column_to_top(p_end, sun_dir, MIE_SCALE_HEIGHT_KM);
+    let sun_col1_o = ozone_column_to_top(p_end, sun_dir);
+    let view_col_o = ozone_triangle_column_segment(origin, dir, t_top);
+    let view_col_mid_o = ozone_triangle_column_segment(origin, dir, 0.5 * t_top);
 
-    let tau_s0 = ap.rayleigh_scattering_base * sun_col0_r + ap.mie_extinction_base * sun_col0_m;
+    let tau_s0 = ap.rayleigh_scattering_base * sun_col0_r
+        + ap.mie_extinction_base * sun_col0_m
+        + ap.ozone_absorption_base * sun_col0_o;
     let tau_mid = ap.rayleigh_scattering_base * (sun_col_mid_r + view_col_mid_r)
-        + ap.mie_extinction_base * (sun_col_mid_m + view_col_mid_m);
+        + ap.mie_extinction_base * (sun_col_mid_m + view_col_mid_m)
+        + ap.ozone_absorption_base * (sun_col_mid_o + view_col_mid_o);
     let tau_s1_v = ap.rayleigh_scattering_base * (sun_col1_r + view_col_r)
-        + ap.mie_extinction_base * (sun_col1_m + view_col_m);
+        + ap.mie_extinction_base * (sun_col1_m + view_col_m)
+        + ap.ozone_absorption_base * (sun_col1_o + view_col_o);
     let avg_t_r = average_transmittance_quadratic(
         tau_s0,
         tau_mid,
@@ -338,7 +445,9 @@ fn analytic_sky_radiance(direction: vec3<f32>) -> vec3<f32> {
     let sky_spectral = ap.sun_spectral_irradiance * (rayleigh_scatter + mie_scatter);
     var rgb = max(white_balanced_linear_rec2020_from_spectral(sky_spectral), vec3<f32>(0.0));
 
-    let sun_tau = ap.rayleigh_scattering_base * sun_col0_r + ap.mie_extinction_base * sun_col0_m;
+    let sun_tau = ap.rayleigh_scattering_base * sun_col0_r
+        + ap.mie_extinction_base * sun_col0_m
+        + ap.ozone_absorption_base * sun_col0_o;
     let sun_t = spectral_sun_transmittance_to_rec2020(exp(-sun_tau));
     rgb += sun_disk_eval(dir, sun_t);
     return rgb;

@@ -9,7 +9,11 @@ const SUN_IRRADIANCE_REC2020_W_PER_M2: [f32; 3] = [205.0, 205.0, 205.0];
 const SUN_SPECTRAL_IRRADIANCE: [f32; 4] = [1.679, 1.828, 1.986, 1.307];
 const RAYLEIGH_SCATTERING_BASE_KM_INV: [f32; 4] = [6.605e-3, 1.067e-2, 1.842e-2, 3.156e-2];
 const MIE_SCATTERING_BASE_KM_INV: [f32; 4] = [1.25e-3, 1.69e-3, 2.53e-3, 3.40e-3];
+const MIE_CONCENTRATION_SCALE: f32 = 10.0;
 const MIE_EXTINCTION_SCALE: f32 = 1.11;
+// 630/560/490/430 nm ozone peak absorption for a 0..44 km triangular layer
+// centered at 22 km, matched to the vertical ozone column in data/atmosphere_profile.csv.
+const OZONE_ABSORPTION_PEAK_KM_INV: [f32; 4] = [1.373_34e-3, 1.390_23e-3, 5.150_03e-4, 1.684_31e-5];
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AnalyticAtmosphere {
@@ -158,6 +162,7 @@ struct AnalyticParamsGpu {
     rayleigh_scattering_base: [f32; 4],
     mie_scattering_base: [f32; 4],
     mie_extinction_base: [f32; 4],
+    ozone_absorption_base: [f32; 4],
 }
 
 impl AnalyticParamsGpu {
@@ -167,12 +172,16 @@ impl AnalyticParamsGpu {
         let top_radius_km = atmosphere.top_radius_m * M_TO_KM;
         let eye_radius_km = view_radius_from_position(params.view.world_position, atmosphere);
         let eye_altitude_km = eye_radius_km - bottom_radius_km;
+        let mut mie_scattering = [0.0; 4];
         let mut mie_extinction = [0.0; 4];
-        for (out, scattering) in mie_extinction
+        for ((scattering_out, extinction_out), scattering) in mie_scattering
             .iter_mut()
+            .zip(mie_extinction.iter_mut())
             .zip(MIE_SCATTERING_BASE_KM_INV.iter())
         {
-            *out = scattering * MIE_EXTINCTION_SCALE;
+            let scaled_scattering = scattering * MIE_CONCENTRATION_SCALE;
+            *scattering_out = scaled_scattering;
+            *extinction_out = scaled_scattering * MIE_EXTINCTION_SCALE;
         }
 
         Self {
@@ -190,8 +199,9 @@ impl AnalyticParamsGpu {
                 .to_array(),
             sun_spectral_irradiance: SUN_SPECTRAL_IRRADIANCE,
             rayleigh_scattering_base: RAYLEIGH_SCATTERING_BASE_KM_INV,
-            mie_scattering_base: MIE_SCATTERING_BASE_KM_INV,
+            mie_scattering_base: mie_scattering,
             mie_extinction_base: mie_extinction,
+            ozone_absorption_base: OZONE_ABSORPTION_PEAK_KM_INV,
         }
     }
 }
@@ -322,5 +332,5 @@ fn render_pipeline(device: &wgpu::Device, layout: &wgpu::BindGroupLayout) -> wgp
 }
 
 const _: () = assert!(core::mem::size_of::<AnalyticView>() == 80);
-const _: () = assert!(core::mem::size_of::<AnalyticParamsGpu>() == 96);
+const _: () = assert!(core::mem::size_of::<AnalyticParamsGpu>() == 112);
 const _: () = assert!(core::mem::size_of::<AnalyticSunGpu>() == 32);
