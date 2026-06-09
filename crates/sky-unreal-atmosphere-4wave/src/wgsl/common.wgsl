@@ -265,22 +265,23 @@ fn ground_irradiance_from_lut(
 }
 
 fn linear_rec2020_from_spectral(l: vec4<f32>) -> vec3<f32> {
-    // 420/480/570/670 nm -> scene-linear Rec.2020. The columns are direct
-    // CIE 1931 2 degree CMF samples transformed to Rec.2020 and multiplied by
-    // the physical Voronoi widths found by the sky-view primary search:
-    // 75/75/95/165 nm.
+    // 410/480/560/630 nm -> scene-linear Rec.2020. The columns are direct CIE 1931
+    // 2 degree CMF samples transformed to Rec.2020 and multiplied by the
+    // cmf-mass fixed-sum quadrature weights:
+    // 176.941/85.8237/76.2946/70.9408 nm.
     let m = mat4x3<f32>(
-        vec3<f32>(4.92657242, -5.47072088, 45.7815852),
-        vec3<f32>(-6.84292324, 13.0335428, 57.1217949),
-        vec3<f32>(92.0672754, 97.9300951, -2.40310783),
-        vec3<f32>(22.8778850, -1.07923411, 0.0285555462),
+        vec3<f32>(3.841910401, -4.207847549, 34.699506104),
+        vec3<f32>(-7.830465365, 14.914489331, 65.365373942),
+        vec3<f32>(50.786945459, 92.47799295, -2.16643693),
+        vec3<f32>(71.544621425, 0.006405143, 0.003173681),
     );
     return m * l;
 }
 
 fn white_balance_rec2020(rgb: vec3<f32>) -> vec3<f32> {
     // Bradford 41-band solar-white-to-D65 adaptation expressed in Rec.2020 RGB.
-    // This matches the offline reference colorimetry.
+    // This matches the offline reference colorimetry instead of neutralizing
+    // the sparse 410/480/560/630 nm solar samples.
     let m = mat3x3<f32>(
         vec3<f32>(0.973450179, -0.00110537346, 0.000549268697),
         vec3<f32>(-0.0199533690, 1.01471724, -0.000413338668),

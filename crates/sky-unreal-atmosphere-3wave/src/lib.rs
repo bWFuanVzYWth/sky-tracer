@@ -1,7 +1,7 @@
 //! Unreal SkyAtmosphere style three-wavelength spectral renderer.
 //!
 //! This crate keeps the copied Unreal/Hillaire LUT structure but samples only
-//! the optimized 480/570/660 nm wavelengths. The fourth RGBA channel is kept
+//! the cmf-mass 410/490/590 nm wavelengths. The fourth RGBA channel is kept
 //! unused so the renderer can preserve the original GPU ABI.
 
 pub mod aerosol;

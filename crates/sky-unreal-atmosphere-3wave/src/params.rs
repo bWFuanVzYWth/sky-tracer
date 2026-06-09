@@ -143,12 +143,12 @@ pub const fn ozone_monthly_dobson(month: u32) -> f32 {
 
 /// Wavelength order used by every 4-channel spectral GPU constant.
 ///
-/// RGB store the optimized 480/570/660 nm samples; A is intentionally unused
+/// RGB store the 410/490/590 nm samples; A is intentionally unused
 /// and kept at zero so the copied renderer can preserve the existing RGBA ABI.
-pub const SPECTRAL_SAMPLE_WAVELENGTHS_NM: [f32; 4] = [480.0, 570.0, 660.0, 0.0];
-pub const SUN_SPECTRAL_IRRADIANCE: [f32; 4] = [2.056_643_2, 1.859_502_1, 1.542_136_2, 0.0];
-pub const MOLECULAR_SCATTERING_BASE: [f32; 4] = [2.545_312_8e-2, 1.279_990_3e-2, 7.120_826e-3, 0.0];
-pub const OZONE_ABSORPTION_CROSS_SECTION: [f32; 4] = [7.11e-26, 4.67e-25, 2.02e-25, 0.0];
+pub const SPECTRAL_SAMPLE_WAVELENGTHS_NM: [f32; 4] = [410.0, 490.0, 590.0, 0.0];
+pub const SUN_SPECTRAL_IRRADIANCE: [f32; 4] = [1.74773457, 1.96990812, 1.80185766, 0.0];
+pub const MOLECULAR_SCATTERING_BASE: [f32; 4] = [0.047815718, 0.023438067, 0.011150595, 0.0];
+pub const OZONE_ABSORPTION_CROSS_SECTION: [f32; 4] = [2.91e-27, 8.28e-26, 4.42e-25, 0.0];
 
 const AP_SLICE_COUNT: u32 = 32;
 pub const AP_LUT_DIM: UVec3 = UVec3::new(AP_SLICE_COUNT, AP_SLICE_COUNT, AP_SLICE_COUNT);

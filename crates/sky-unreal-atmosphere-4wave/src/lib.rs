@@ -1,7 +1,7 @@
 //! Unreal SkyAtmosphere style optimized four-wavelength spectral renderer.
 //!
 //! This crate keeps the copied Unreal/Hillaire LUT structure but replaces the
-//! baseline four channels with the searched 420/480/570/670 nm wavelengths.
+//! baseline four channels with the cmf-mass 410/480/560/630 nm wavelengths.
 
 pub mod aerosol;
 pub mod gpu;

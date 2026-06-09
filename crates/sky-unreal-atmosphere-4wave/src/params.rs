@@ -142,15 +142,11 @@ pub const fn ozone_monthly_dobson(month: u32) -> f32 {
 }
 
 /// Wavelength order used by every 4-channel spectral GPU constant.
-pub const SPECTRAL_SAMPLE_WAVELENGTHS_NM: [f32; 4] = [420.0, 480.0, 570.0, 670.0];
-pub const SUN_SPECTRAL_IRRADIANCE: [f32; 4] = [1.707_052_1, 2.056_643_2, 1.859_502_1, 1.536_504_3];
-pub const MOLECULAR_SCATTERING_BASE: [f32; 4] = [
-    4.342_191_2e-2,
-    2.545_312_8e-2,
-    1.279_990_3e-2,
-    6.705_125_2e-3,
-];
-pub const OZONE_ABSORPTION_CROSS_SECTION: [f32; 4] = [3.99e-27, 7.11e-26, 4.67e-25, 1.67e-25];
+pub const SPECTRAL_SAMPLE_WAVELENGTHS_NM: [f32; 4] = [410.0, 480.0, 560.0, 630.0];
+pub const SUN_SPECTRAL_IRRADIANCE: [f32; 4] = [1.74773457, 2.05664327, 1.85349142, 1.65416915];
+pub const MOLECULAR_SCATTERING_BASE: [f32; 4] =
+    [0.047815718, 0.025453128, 0.013738964, 0.008577168];
+pub const OZONE_ABSORPTION_CROSS_SECTION: [f32; 4] = [2.91e-27, 7.11e-26, 3.88e-25, 3.43e-25];
 
 const AP_SLICE_COUNT: u32 = 32;
 pub const AP_LUT_DIM: UVec3 = UVec3::new(AP_SLICE_COUNT, AP_SLICE_COUNT, AP_SLICE_COUNT);

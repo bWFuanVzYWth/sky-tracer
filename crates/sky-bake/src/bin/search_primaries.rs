@@ -27,11 +27,49 @@ struct Cli {
     top: usize,
     #[arg(long, default_value_t = 0)]
     threads: usize,
+    #[arg(long, value_enum, default_value_t = WeightStrategy::Voronoi)]
+    weight_strategy: WeightStrategy,
     #[arg(long, default_value = "target/primary_search")]
     out_dir: PathBuf,
 }
 
 const MAX_PRIMARY_COUNT: usize = 4;
+const MAX_WEIGHT_ROWS: usize = 9;
+const KKT_DIM: usize = MAX_PRIMARY_COUNT + 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+enum WeightStrategy {
+    /// Wavelength-axis Voronoi width, the original physical quadrature rule.
+    Voronoi,
+    /// Fit CIE XYZ response to a flat spectrum with non-negative fixed-sum weights.
+    CmfMass,
+    /// Fit CIE XYZ response multiplied by 1, lambda, and lambda^2 moments.
+    CmfMoments,
+}
+
+impl WeightStrategy {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Voronoi => "voronoi",
+            Self::CmfMass => "cmf-mass",
+            Self::CmfMoments => "cmf-moments",
+        }
+    }
+
+    const fn description(self) -> &'static str {
+        match self {
+            Self::Voronoi => {
+                "Wavelength-axis Voronoi widths. Each sampled wavelength represents the nearest interval in nm."
+            }
+            Self::CmfMass => {
+                "Non-negative fixed-sum least squares matching integrated CIE XYZ response for a flat spectrum."
+            }
+            Self::CmfMoments => {
+                "Non-negative fixed-sum least squares matching integrated CIE XYZ response times normalized 1, lambda, and lambda^2 moments."
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Xyz {
@@ -115,13 +153,21 @@ fn main() -> Result<(), Box<dyn Error>> {
         cli.primary_count
     );
     println!(
-        "screening with {} deterministic samples, refining top {} on all samples, threads={}",
+        "screening with {} deterministic samples, refining top {} on all samples, threads={}, weight_strategy={}",
         sample_indices.len(),
         cli.refine_top,
-        threads
+        threads,
+        cli.weight_strategy.label()
     );
 
-    let mut screened = evaluate_combos(&dataset, &combos, Some(&sample_indices), false, threads);
+    let mut screened = evaluate_combos(
+        &dataset,
+        &combos,
+        Some(&sample_indices),
+        false,
+        threads,
+        cli.weight_strategy,
+    );
     screened.sort_by(|a, b| a.score.total_cmp(&b.score));
 
     let refine_count = cli.refine_top.min(screened.len());
@@ -130,7 +176,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         .take(refine_count)
         .map(|result| result.combo)
         .collect::<Vec<_>>();
-    let mut refined = evaluate_combos(&dataset, &refine_combos, None, true, threads);
+    let mut refined = evaluate_combos(
+        &dataset,
+        &refine_combos,
+        None,
+        true,
+        threads,
+        cli.weight_strategy,
+    );
     refined.sort_by(|a, b| a.score.total_cmp(&b.score));
 
     let top_count = cli.top.min(refined.len());
@@ -139,6 +192,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         &cli.out_dir.join("ranking_by_elevation.csv"),
         &dataset,
         &refined[..top_count],
+        cli.weight_strategy,
     )?;
     write_report(
         &cli.out_dir.join("report.md"),
@@ -146,6 +200,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         &sample_indices,
         refine_count,
         &refined[..top_count],
+        cli.weight_strategy,
     )?;
 
     println!("top {}:", top_count);
@@ -339,8 +394,14 @@ fn evaluate_combo(
     combo: Combo,
     indices: Option<&[usize]>,
     exact_percentiles: bool,
+    weight_strategy: WeightStrategy,
 ) -> ComboResult {
-    let weights_nm = quadrature_weights(&dataset.wavelengths_nm, &dataset.band_width_nm, combo);
+    let weights_nm = quadrature_weights(
+        &dataset.wavelengths_nm,
+        &dataset.band_width_nm,
+        combo,
+        weight_strategy,
+    );
     let mut wavelengths_nm = [0.0; MAX_PRIMARY_COUNT];
     let mut cie = [sky_core::spectrum::Xyz::default(); MAX_PRIMARY_COUNT];
     let mut band_widths = [0.0; MAX_PRIMARY_COUNT];
@@ -410,13 +471,16 @@ fn evaluate_combos(
     indices: Option<&[usize]>,
     exact_percentiles: bool,
     threads: usize,
+    weight_strategy: WeightStrategy,
 ) -> Vec<ComboResult> {
     let thread_count = threads.max(1).min(combos.len().max(1));
     if thread_count == 1 || combos.len() <= 1 {
         return combos
             .iter()
             .copied()
-            .map(|combo| evaluate_combo(dataset, combo, indices, exact_percentiles))
+            .map(|combo| {
+                evaluate_combo(dataset, combo, indices, exact_percentiles, weight_strategy)
+            })
             .collect();
     }
 
@@ -428,7 +492,9 @@ fn evaluate_combos(
                 chunk
                     .iter()
                     .copied()
-                    .map(|combo| evaluate_combo(dataset, combo, indices, exact_percentiles))
+                    .map(|combo| {
+                        evaluate_combo(dataset, combo, indices, exact_percentiles, weight_strategy)
+                    })
                     .collect::<Vec<_>>()
             }));
         }
@@ -502,6 +568,19 @@ fn quadrature_weights(
     wavelengths_nm: &[f32],
     band_widths_nm: &[f64],
     combo: Combo,
+    strategy: WeightStrategy,
+) -> [f64; MAX_PRIMARY_COUNT] {
+    match strategy {
+        WeightStrategy::Voronoi => voronoi_weights(wavelengths_nm, band_widths_nm, combo),
+        WeightStrategy::CmfMass => cmf_fit_weights(wavelengths_nm, band_widths_nm, combo, false),
+        WeightStrategy::CmfMoments => cmf_fit_weights(wavelengths_nm, band_widths_nm, combo, true),
+    }
+}
+
+fn voronoi_weights(
+    wavelengths_nm: &[f32],
+    band_widths_nm: &[f64],
+    combo: Combo,
 ) -> [f64; MAX_PRIMARY_COUNT] {
     let first_center = wavelengths_nm[0] as f64;
     let last_center = wavelengths_nm[wavelengths_nm.len() - 1] as f64;
@@ -529,6 +608,269 @@ fn quadrature_weights(
     }
     weights[combo.count - 1] = hi_bound - splits[combo.count - 2];
     weights
+}
+
+fn cmf_fit_weights(
+    wavelengths_nm: &[f32],
+    band_widths_nm: &[f64],
+    combo: Combo,
+    include_moments: bool,
+) -> [f64; MAX_PRIMARY_COUNT] {
+    let row_count = if include_moments { 9 } else { 3 };
+    let total_width = spectral_total_width(wavelengths_nm, band_widths_nm);
+    let mut columns = [[0.0; MAX_PRIMARY_COUNT]; MAX_WEIGHT_ROWS];
+    for channel in 0..combo.count {
+        let lambda = wavelengths_nm[combo.indices[channel]] as f64;
+        let cie = cie_1931_2deg(lambda as f32);
+        fill_cmf_rows(
+            &mut columns,
+            channel,
+            row_count,
+            lambda,
+            Xyz {
+                x: cie.x as f64,
+                y: cie.y as f64,
+                z: cie.z as f64,
+            },
+            wavelengths_nm,
+            band_widths_nm,
+        );
+    }
+
+    let mut target = [0.0; MAX_WEIGHT_ROWS];
+    for (lambda, width) in wavelengths_nm.iter().zip(band_widths_nm.iter()) {
+        let cie = cie_1931_2deg(*lambda);
+        let mut rows = [0.0; MAX_WEIGHT_ROWS];
+        fill_cmf_target_rows(
+            &mut rows,
+            row_count,
+            *lambda as f64,
+            Xyz {
+                x: cie.x as f64,
+                y: cie.y as f64,
+                z: cie.z as f64,
+            },
+            wavelengths_nm,
+            band_widths_nm,
+        );
+        for row in 0..row_count {
+            target[row] += width * rows[row];
+        }
+    }
+
+    solve_nonnegative_fixed_sum_weights(&columns, &target, row_count, combo.count, total_width)
+        .unwrap_or_else(|| voronoi_weights(wavelengths_nm, band_widths_nm, combo))
+}
+
+fn fill_cmf_rows(
+    columns: &mut [[f64; MAX_PRIMARY_COUNT]; MAX_WEIGHT_ROWS],
+    channel: usize,
+    row_count: usize,
+    lambda_nm: f64,
+    cie: Xyz,
+    wavelengths_nm: &[f32],
+    band_widths_nm: &[f64],
+) {
+    let mut rows = [0.0; MAX_WEIGHT_ROWS];
+    fill_cmf_target_rows(
+        &mut rows,
+        row_count,
+        lambda_nm,
+        cie,
+        wavelengths_nm,
+        band_widths_nm,
+    );
+    for row in 0..row_count {
+        columns[row][channel] = rows[row];
+    }
+}
+
+fn fill_cmf_target_rows(
+    rows: &mut [f64; MAX_WEIGHT_ROWS],
+    row_count: usize,
+    lambda_nm: f64,
+    cie: Xyz,
+    wavelengths_nm: &[f32],
+    band_widths_nm: &[f64],
+) {
+    let moment = normalized_wavelength_moment(lambda_nm, wavelengths_nm, band_widths_nm);
+    let bases = [1.0, moment, moment * moment];
+    let values = [cie.x, cie.y, cie.z];
+    let basis_count = row_count / 3;
+    for basis in 0..basis_count {
+        for component in 0..3 {
+            rows[basis * 3 + component] = bases[basis] * values[component];
+        }
+    }
+}
+
+fn normalized_wavelength_moment(
+    lambda_nm: f64,
+    wavelengths_nm: &[f32],
+    band_widths_nm: &[f64],
+) -> f64 {
+    let first_center = wavelengths_nm[0] as f64;
+    let last_center = wavelengths_nm[wavelengths_nm.len() - 1] as f64;
+    let lo_bound = first_center - 0.5 * band_widths_nm[0];
+    let hi_bound = last_center + 0.5 * band_widths_nm[band_widths_nm.len() - 1];
+    let center = 0.5 * (lo_bound + hi_bound);
+    let half_width = 0.5 * (hi_bound - lo_bound);
+    (lambda_nm - center) / half_width.max(1.0e-6)
+}
+
+fn spectral_total_width(wavelengths_nm: &[f32], band_widths_nm: &[f64]) -> f64 {
+    let first_center = wavelengths_nm[0] as f64;
+    let last_center = wavelengths_nm[wavelengths_nm.len() - 1] as f64;
+    let lo_bound = first_center - 0.5 * band_widths_nm[0];
+    let hi_bound = last_center + 0.5 * band_widths_nm[band_widths_nm.len() - 1];
+    hi_bound - lo_bound
+}
+
+fn solve_nonnegative_fixed_sum_weights(
+    columns: &[[f64; MAX_PRIMARY_COUNT]; MAX_WEIGHT_ROWS],
+    target: &[f64; MAX_WEIGHT_ROWS],
+    row_count: usize,
+    count: usize,
+    total_width: f64,
+) -> Option<[f64; MAX_PRIMARY_COUNT]> {
+    let mut best = None;
+    let mut best_error = f64::INFINITY;
+    for mask in 1usize..(1usize << count) {
+        let mut subset = [0usize; MAX_PRIMARY_COUNT];
+        let mut subset_count = 0;
+        for channel in 0..count {
+            if (mask & (1usize << channel)) != 0 {
+                subset[subset_count] = channel;
+                subset_count += 1;
+            }
+        }
+        let Some(weights) = solve_fixed_sum_subset(
+            columns,
+            target,
+            row_count,
+            &subset[..subset_count],
+            total_width,
+        ) else {
+            continue;
+        };
+        if weights[..count]
+            .iter()
+            .any(|weight| *weight < -1.0e-7 * total_width)
+        {
+            continue;
+        }
+        let mut clipped = weights;
+        for weight in &mut clipped[..count] {
+            if *weight < 0.0 {
+                *weight = 0.0;
+            }
+        }
+        let error = weight_fit_error(columns, target, row_count, &clipped);
+        if error < best_error {
+            best_error = error;
+            best = Some(clipped);
+        }
+    }
+    best
+}
+
+fn solve_fixed_sum_subset(
+    columns: &[[f64; MAX_PRIMARY_COUNT]; MAX_WEIGHT_ROWS],
+    target: &[f64; MAX_WEIGHT_ROWS],
+    row_count: usize,
+    subset: &[usize],
+    total_width: f64,
+) -> Option<[f64; MAX_PRIMARY_COUNT]> {
+    let variable_count = subset.len();
+    let dim = variable_count + 1;
+    let mut matrix = [[0.0; KKT_DIM]; KKT_DIM];
+    let mut rhs = [0.0; KKT_DIM];
+
+    for local_i in 0..variable_count {
+        let channel_i = subset[local_i];
+        for local_j in 0..variable_count {
+            let channel_j = subset[local_j];
+            matrix[local_i][local_j] = (0..row_count)
+                .map(|row| columns[row][channel_i] * columns[row][channel_j])
+                .sum();
+        }
+        matrix[local_i][variable_count] = 1.0;
+        matrix[variable_count][local_i] = 1.0;
+        rhs[local_i] = (0..row_count)
+            .map(|row| columns[row][channel_i] * target[row])
+            .sum();
+    }
+    rhs[variable_count] = total_width;
+
+    let solution = solve_linear_system(matrix, rhs, dim)?;
+    let mut weights = [0.0; MAX_PRIMARY_COUNT];
+    for local_i in 0..variable_count {
+        weights[subset[local_i]] = solution[local_i];
+    }
+    Some(weights)
+}
+
+fn solve_linear_system(
+    mut matrix: [[f64; KKT_DIM]; KKT_DIM],
+    mut rhs: [f64; KKT_DIM],
+    dim: usize,
+) -> Option<[f64; KKT_DIM]> {
+    for pivot in 0..dim {
+        let mut best_row = pivot;
+        let mut best_value = matrix[pivot][pivot].abs();
+        for row in pivot + 1..dim {
+            let value = matrix[row][pivot].abs();
+            if value > best_value {
+                best_value = value;
+                best_row = row;
+            }
+        }
+        if best_value <= 1.0e-12 {
+            return None;
+        }
+        if best_row != pivot {
+            matrix.swap(pivot, best_row);
+            rhs.swap(pivot, best_row);
+        }
+
+        let pivot_value = matrix[pivot][pivot];
+        for col in pivot..dim {
+            matrix[pivot][col] /= pivot_value;
+        }
+        rhs[pivot] /= pivot_value;
+
+        for row in 0..dim {
+            if row == pivot {
+                continue;
+            }
+            let factor = matrix[row][pivot];
+            if factor.abs() <= 1.0e-18 {
+                continue;
+            }
+            for col in pivot..dim {
+                matrix[row][col] -= factor * matrix[pivot][col];
+            }
+            rhs[row] -= factor * rhs[pivot];
+        }
+    }
+    Some(rhs)
+}
+
+fn weight_fit_error(
+    columns: &[[f64; MAX_PRIMARY_COUNT]; MAX_WEIGHT_ROWS],
+    target: &[f64; MAX_WEIGHT_ROWS],
+    row_count: usize,
+    weights: &[f64; MAX_PRIMARY_COUNT],
+) -> f64 {
+    let mut error = 0.0;
+    for row in 0..row_count {
+        let value = (0..MAX_PRIMARY_COUNT)
+            .map(|channel| columns[row][channel] * weights[channel])
+            .sum::<f64>();
+        let d = value - target[row];
+        error += d * d;
+    }
+    error
 }
 
 fn screening_indices(sample_count: usize, requested: usize) -> Vec<usize> {
@@ -659,6 +1001,7 @@ fn write_per_elevation_csv(
     path: &Path,
     dataset: &Dataset,
     results: &[ComboResult],
+    weight_strategy: WeightStrategy,
 ) -> Result<(), Box<dyn Error>> {
     let mut file = File::create(path)?;
     let primary_count = primary_count_from_results(results);
@@ -670,7 +1013,8 @@ fn write_per_elevation_csv(
     for (rank, result) in results.iter().enumerate() {
         for asset in &dataset.asset_summaries {
             let indices = asset_sample_indices(asset);
-            let per_asset = evaluate_combo(dataset, result.combo, Some(&indices), true);
+            let per_asset =
+                evaluate_combo(dataset, result.combo, Some(&indices), true, weight_strategy);
             writeln!(
                 file,
                 "{},{:.6},{},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{}",
@@ -702,6 +1046,7 @@ fn write_report(
     screen_indices: &[usize],
     refine_count: usize,
     results: &[ComboResult],
+    weight_strategy: WeightStrategy,
 ) -> Result<(), Box<dyn Error>> {
     let mut file = File::create(path)?;
     let primary_count = primary_count_from_results(results);
@@ -717,6 +1062,12 @@ fn write_report(
         dataset.wavelengths_nm.len(),
         dataset.wavelengths_nm[0],
         dataset.wavelengths_nm[dataset.wavelengths_nm.len() - 1]
+    )?;
+    writeln!(file, "- Weight strategy: `{}`", weight_strategy.label())?;
+    writeln!(
+        file,
+        "- Weight strategy description: {}",
+        weight_strategy.description()
     )?;
     writeln!(
         file,
@@ -792,7 +1143,7 @@ fn write_report(
         writeln!(file, "| ---: | ---: | ---: | ---: | ---: | ---: | ---: |")?;
         for asset in &dataset.asset_summaries {
             let indices = asset_sample_indices(asset);
-            let result = evaluate_combo(dataset, best.combo, Some(&indices), true);
+            let result = evaluate_combo(dataset, best.combo, Some(&indices), true, weight_strategy);
             writeln!(
                 file,
                 "| {:.2} | {:.6} | {:.6} | {:.6} | {:.6} | {:.6} | {:.6} |",
@@ -823,5 +1174,81 @@ impl std::ops::Div<f64> for Xyz {
             y: self.y / rhs,
             z: self.z / rhs,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn visible_grid() -> (Vec<f32>, Vec<f64>) {
+        let wavelengths_nm = (380..=780)
+            .step_by(10)
+            .map(|wavelength| wavelength as f32)
+            .collect::<Vec<_>>();
+        let band_widths_nm = band_widths_from_centers(&wavelengths_nm);
+        (wavelengths_nm, band_widths_nm)
+    }
+
+    #[test]
+    fn voronoi_weights_preserve_existing_four_wave_baseline() {
+        let (wavelengths_nm, band_widths_nm) = visible_grid();
+        let combo = Combo {
+            indices: [4, 10, 19, 29],
+            count: 4,
+        };
+
+        let weights = quadrature_weights(
+            &wavelengths_nm,
+            &band_widths_nm,
+            combo,
+            WeightStrategy::Voronoi,
+        );
+
+        assert_eq!(weights, [75.0, 75.0, 95.0, 165.0]);
+    }
+
+    #[test]
+    fn cmf_fit_weights_preserve_nonnegative_fixed_sum() {
+        let (wavelengths_nm, band_widths_nm) = visible_grid();
+        let combo = Combo {
+            indices: [3, 10, 18, 25],
+            count: 4,
+        };
+        let total_width = spectral_total_width(&wavelengths_nm, &band_widths_nm);
+
+        for strategy in [WeightStrategy::CmfMass, WeightStrategy::CmfMoments] {
+            let weights = quadrature_weights(&wavelengths_nm, &band_widths_nm, combo, strategy);
+            let sum = weights[..combo.count].iter().sum::<f64>();
+
+            assert!(
+                weights[..combo.count]
+                    .iter()
+                    .all(|weight| *weight >= -1.0e-9),
+                "{strategy:?} produced negative weights: {weights:?}"
+            );
+            assert!(
+                (sum - total_width).abs() < 1.0e-6,
+                "{strategy:?} sum {sum} does not match total width {total_width}"
+            );
+        }
+    }
+
+    #[test]
+    fn cmf_fit_weights_leave_unused_primary_slots_zero() {
+        let (wavelengths_nm, band_widths_nm) = visible_grid();
+        let combo = Combo {
+            indices: [4, 12, 29, 0],
+            count: 3,
+        };
+
+        let weights = quadrature_weights(
+            &wavelengths_nm,
+            &band_widths_nm,
+            combo,
+            WeightStrategy::CmfMass,
+        );
+
+        assert_eq!(weights[3], 0.0);
     }
 }
