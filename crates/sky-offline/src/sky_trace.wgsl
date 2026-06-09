@@ -10,6 +10,8 @@ const GROUND_ALBEDO: f32 = 0.18;
 const ISOTROPIC_PDF: f32 = 0.07957747154594766788;
 const OUTPUT_PROJECTION_PANORAMA: u32 = 0u;
 const OUTPUT_PROJECTION_SKY_VIEW_LUT: u32 = 1u;
+const SKY_VIEW_SKY_FRACTION: f32 = 0.75;
+const SKY_VIEW_GROUND_FRACTION: f32 = 0.25;
 
 struct Constants {
     width: u32,
@@ -647,14 +649,14 @@ fn sky_view_lut_dir(u_in: f32, v_in: f32) -> vec3f {
     let beta = angles.y;
 
     var view_zenith_cos_angle: f32;
-    if uv.y < 0.5 {
-        var coord = 2.0 * uv.y;
+    if uv.y < SKY_VIEW_SKY_FRACTION {
+        var coord = uv.y / SKY_VIEW_SKY_FRACTION;
         coord = 1.0 - coord;
         coord = coord * coord;
         coord = 1.0 - coord;
         view_zenith_cos_angle = cos(zenith_horizon_angle * coord);
     } else {
-        var coord = uv.y * 2.0 - 1.0;
+        var coord = (uv.y - SKY_VIEW_SKY_FRACTION) / SKY_VIEW_GROUND_FRACTION;
         coord = coord * coord;
         view_zenith_cos_angle = cos(zenith_horizon_angle + beta * coord);
     }

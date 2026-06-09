@@ -21,10 +21,10 @@ use sky_offline::integrator::render;
 #[derive(Parser, Debug)]
 #[command(version, about = "Offline spectral OPAC atmosphere path tracer")]
 struct Cli {
-    #[arg(long, default_value_t = 2048)]
-    width: usize,
-    #[arg(long, default_value_t = 1024)]
-    height: usize,
+    #[arg(long)]
+    width: Option<usize>,
+    #[arg(long)]
+    height: Option<usize>,
     #[arg(long, default_value_t = 1024)]
     spp: usize,
     #[arg(long, default_value_t = 0x5EC7_2026_0430_u64)]
@@ -49,12 +49,18 @@ struct Cli {
     rebuild_rgb_only: bool,
 }
 
+const PANORAMA_DEFAULT_WIDTH: usize = 2048;
+const PANORAMA_DEFAULT_HEIGHT: usize = 1024;
+const SKY_VIEW_LUT_DEFAULT_WIDTH: usize = 256;
+const SKY_VIEW_LUT_DEFAULT_HEIGHT: usize = 256;
+
 fn main() -> Result<(), Box<dyn Error>> {
     let total_start = Instant::now();
     let cli = Cli::parse();
+    let (width, height) = resolve_dimensions(cli.width, cli.height, cli.sky_view_lut);
     let config = RenderConfig {
-        width: cli.width,
-        height: cli.height,
+        width,
+        height,
         spp: cli.spp,
         seed: cli.seed,
         out_dir: cli.out,
@@ -132,6 +138,22 @@ fn main() -> Result<(), Box<dyn Error>> {
         format_duration(total_elapsed)
     );
     Ok(())
+}
+
+fn resolve_dimensions(
+    width: Option<usize>,
+    height: Option<usize>,
+    sky_view_lut: bool,
+) -> (usize, usize) {
+    let (default_width, default_height) = if sky_view_lut {
+        (SKY_VIEW_LUT_DEFAULT_WIDTH, SKY_VIEW_LUT_DEFAULT_HEIGHT)
+    } else {
+        (PANORAMA_DEFAULT_WIDTH, PANORAMA_DEFAULT_HEIGHT)
+    };
+    (
+        width.unwrap_or(default_width),
+        height.unwrap_or(default_height),
+    )
 }
 
 fn read_film_from_band_exrs(
@@ -284,5 +306,34 @@ fn format_duration(duration: Duration) -> String {
         let minutes = (secs / 60.0).floor();
         let seconds = secs - minutes * 60.0;
         format!("{minutes:.0}m{seconds:.1}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        PANORAMA_DEFAULT_HEIGHT, PANORAMA_DEFAULT_WIDTH, SKY_VIEW_LUT_DEFAULT_HEIGHT,
+        SKY_VIEW_LUT_DEFAULT_WIDTH, resolve_dimensions,
+    };
+
+    #[test]
+    fn panorama_dimensions_default_to_existing_cli_values() {
+        assert_eq!(
+            resolve_dimensions(None, None, false),
+            (PANORAMA_DEFAULT_WIDTH, PANORAMA_DEFAULT_HEIGHT)
+        );
+    }
+
+    #[test]
+    fn sky_view_lut_dimensions_default_to_square_lut() {
+        assert_eq!(
+            resolve_dimensions(None, None, true),
+            (SKY_VIEW_LUT_DEFAULT_WIDTH, SKY_VIEW_LUT_DEFAULT_HEIGHT)
+        );
+    }
+
+    #[test]
+    fn explicit_dimensions_override_projection_defaults() {
+        assert_eq!(resolve_dimensions(Some(320), Some(180), true), (320, 180));
     }
 }

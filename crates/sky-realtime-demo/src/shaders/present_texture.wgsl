@@ -22,6 +22,8 @@ const DEG_TO_RAD: f32 = 0.017453292519943295;
 const SQRT3: f32 = 1.7320508075688772;
 const SKY_VIEW_REFERENCE_PROJECTION: f32 = 1.0;
 const SKY_VIEW_GROUND_RADIUS_KM: f32 = 6360.0;
+const SKY_VIEW_SKY_FRACTION: f32 = 0.75;
+const SKY_VIEW_GROUND_FRACTION: f32 = 0.25;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -263,11 +265,11 @@ fn sky_view_params_to_uv(
         coord = 1.0 - coord;
         coord = sqrt(max(coord, 0.0));
         coord = 1.0 - coord;
-        v = coord * 0.5;
+        v = coord * SKY_VIEW_SKY_FRACTION;
     } else {
         var coord = clamp((view_angle - zenith_horizon_angle) / beta, 0.0, 1.0);
         coord = sqrt(max(coord, 0.0));
-        v = coord * 0.5 + 0.5;
+        v = coord * SKY_VIEW_GROUND_FRACTION + SKY_VIEW_SKY_FRACTION;
     }
 
     var u = clamp(-light_view_cos_angle * 0.5 + 0.5, 0.0, 1.0);
