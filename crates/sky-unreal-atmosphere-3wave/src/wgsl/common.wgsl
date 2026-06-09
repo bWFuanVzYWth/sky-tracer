@@ -279,11 +279,13 @@ fn linear_rec2020_from_spectral(l: vec4<f32>) -> vec3<f32> {
 }
 
 fn white_balance_rec2020(rgb: vec3<f32>) -> vec3<f32> {
-    // Bradford sparse-solar-white-to-D65 adaptation expressed in Rec.2020 RGB.
+    // Bradford 41-band solar-white-to-D65 adaptation expressed in Rec.2020 RGB.
+    // This matches the offline reference colorimetry instead of neutralizing
+    // the sparse 480/570/660 nm solar samples.
     let m = mat3x3<f32>(
-        vec3<f32>(1.04256674, 0.00178470963, -0.000580181985),
-        vec3<f32>(0.0322782379, 0.975798165, 0.000126713067),
-        vec3<f32>(-0.000825389816, 0.000361657150, 0.945785157),
+        vec3<f32>(0.973450179, -0.00110537346, 0.000549268697),
+        vec3<f32>(-0.0199533690, 1.01471724, -0.000413338668),
+        vec3<f32>(0.000904216012, -0.000617879953, 1.06404848),
     );
     return m * rgb;
 }
