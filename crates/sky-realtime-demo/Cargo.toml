@@ -14,6 +14,7 @@ sky-core = { path = "../sky-core" }
 sky-analytic-atmosphere = { path = "../sky-analytic-atmosphere" }
 sky-unreal-atmosphere = { path = "../sky-unreal-atmosphere" }
 sky-unreal-atmosphere-3wave = { path = "../sky-unreal-atmosphere-3wave" }
+sky-unreal-atmosphere-4wave = { path = "../sky-unreal-atmosphere-4wave" }
 wgpu = { workspace = true }
 winit = { workspace = true }
 

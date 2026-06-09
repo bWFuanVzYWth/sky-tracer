@@ -2,6 +2,7 @@ use std::error::Error;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::thread;
 
 use clap::Parser;
 use exr::prelude::read_first_rgba_layer_from_file;
@@ -11,20 +12,26 @@ use sky_core::spectrum::{BAND_COUNT, cie_1931_2deg};
 #[derive(Parser, Debug)]
 #[command(
     version,
-    about = "Search physically weighted three-wavelength sky-view LUT primaries"
+    about = "Search physically weighted sparse-wavelength sky-view LUT primaries"
 )]
 struct Cli {
     #[arg(long = "asset-dir", required = true)]
     asset_dirs: Vec<PathBuf>,
+    #[arg(long, default_value_t = 3)]
+    primary_count: usize,
     #[arg(long, default_value_t = 65_536)]
     screen_samples: usize,
     #[arg(long, default_value_t = 512)]
     refine_top: usize,
     #[arg(long, default_value_t = 11)]
     top: usize,
+    #[arg(long, default_value_t = 0)]
+    threads: usize,
     #[arg(long, default_value = "target/primary_search")]
     out_dir: PathBuf,
 }
+
+const MAX_PRIMARY_COUNT: usize = 4;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Xyz {
@@ -42,16 +49,15 @@ struct Oklab {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Combo {
-    a: usize,
-    b: usize,
-    c: usize,
+    indices: [usize; MAX_PRIMARY_COUNT],
+    count: usize,
 }
 
 #[derive(Clone, Debug)]
 struct ComboResult {
     combo: Combo,
-    wavelengths_nm: [f32; 3],
-    weights_nm: [f64; 3],
+    wavelengths_nm: [f32; MAX_PRIMARY_COUNT],
+    weights_nm: [f64; MAX_PRIMARY_COUNT],
     sample_count: usize,
     mean: f64,
     rmse: f64,
@@ -93,37 +99,38 @@ struct LinearImage {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
+    validate_primary_count(cli.primary_count)?;
     fs::create_dir_all(&cli.out_dir)?;
 
     let dataset = Dataset::load(&cli.asset_dirs)?;
     let sample_indices = screening_indices(dataset.sample_count(), cli.screen_samples);
-    let combos = all_combos(dataset.wavelengths_nm.len());
+    let combos = all_combos(dataset.wavelengths_nm.len(), cli.primary_count);
+    let threads = resolve_thread_count(cli.threads);
     println!(
-        "loaded {} assets, {} samples, {} bands, {} wavelength triples",
+        "loaded {} assets, {} samples, {} bands, {} {}-wavelength combos",
         dataset.asset_summaries.len(),
         dataset.sample_count(),
         dataset.wavelengths_nm.len(),
-        combos.len()
+        combos.len(),
+        cli.primary_count
     );
     println!(
-        "screening with {} deterministic samples, refining top {} on all samples",
+        "screening with {} deterministic samples, refining top {} on all samples, threads={}",
         sample_indices.len(),
-        cli.refine_top
+        cli.refine_top,
+        threads
     );
 
-    let mut screened = combos
-        .iter()
-        .copied()
-        .map(|combo| evaluate_combo(&dataset, combo, Some(&sample_indices), false))
-        .collect::<Vec<_>>();
+    let mut screened = evaluate_combos(&dataset, &combos, Some(&sample_indices), false, threads);
     screened.sort_by(|a, b| a.score.total_cmp(&b.score));
 
     let refine_count = cli.refine_top.min(screened.len());
-    let mut refined = screened
+    let refine_combos = screened
         .iter()
         .take(refine_count)
-        .map(|result| evaluate_combo(&dataset, result.combo, None, true))
+        .map(|result| result.combo)
         .collect::<Vec<_>>();
+    let mut refined = evaluate_combos(&dataset, &refine_combos, None, true, threads);
     refined.sort_by(|a, b| a.score.total_cmp(&b.score));
 
     let top_count = cli.top.min(refined.len());
@@ -144,11 +151,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("top {}:", top_count);
     for (rank, result) in refined.iter().take(top_count).enumerate() {
         println!(
-            "#{:<2} {:>5.0}/{:>5.0}/{:>5.0}nm score={:.6} rmse={:.6} p95={:.6} max={:.6}",
+            "#{:<2} {:>19}nm score={:.6} rmse={:.6} p95={:.6} max={:.6}",
             rank + 1,
-            result.wavelengths_nm[0],
-            result.wavelengths_nm[1],
-            result.wavelengths_nm[2],
+            format_wavelengths_slash(result),
             result.score,
             result.rmse,
             result.p95,
@@ -157,6 +162,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     println!("wrote {}", cli.out_dir.display());
     Ok(())
+}
+
+fn validate_primary_count(primary_count: usize) -> Result<(), Box<dyn Error>> {
+    if (1..=MAX_PRIMARY_COUNT).contains(&primary_count) {
+        return Ok(());
+    }
+    Err(format!("--primary-count must be in 1..={MAX_PRIMARY_COUNT}").into())
+}
+
+fn resolve_thread_count(requested: usize) -> usize {
+    if requested == 0 {
+        return thread::available_parallelism().map_or(1, usize::from);
+    }
+    requested.max(1)
 }
 
 impl Dataset {
@@ -322,37 +341,27 @@ fn evaluate_combo(
     exact_percentiles: bool,
 ) -> ComboResult {
     let weights_nm = quadrature_weights(&dataset.wavelengths_nm, &dataset.band_width_nm, combo);
-    let wavelengths_nm = [
-        dataset.wavelengths_nm[combo.a],
-        dataset.wavelengths_nm[combo.b],
-        dataset.wavelengths_nm[combo.c],
-    ];
-    let cie = [
-        cie_1931_2deg(wavelengths_nm[0]),
-        cie_1931_2deg(wavelengths_nm[1]),
-        cie_1931_2deg(wavelengths_nm[2]),
-    ];
-    let selected = [
-        &dataset.bands[combo.a],
-        &dataset.bands[combo.b],
-        &dataset.bands[combo.c],
-    ];
-    let band_widths = [
-        dataset.band_width_nm[combo.a],
-        dataset.band_width_nm[combo.b],
-        dataset.band_width_nm[combo.c],
-    ];
+    let mut wavelengths_nm = [0.0; MAX_PRIMARY_COUNT];
+    let mut cie = [sky_core::spectrum::Xyz::default(); MAX_PRIMARY_COUNT];
+    let mut band_widths = [0.0; MAX_PRIMARY_COUNT];
+    for channel in 0..combo.count {
+        let index = combo.indices[channel];
+        wavelengths_nm[channel] = dataset.wavelengths_nm[index];
+        cie[channel] = cie_1931_2deg(wavelengths_nm[channel]);
+        band_widths[channel] = dataset.band_width_nm[index];
+    }
     let sample_count = indices.map_or_else(|| dataset.sample_count(), <[usize]>::len);
     let mut errors = exact_percentiles.then(|| Vec::with_capacity(sample_count));
     let mut sum = 0.0;
     let mut sum_squares = 0.0;
     for sample in sample_iterator(dataset.sample_count(), indices) {
         let mut xyz = Xyz::default();
-        for channel in 0..3 {
+        for channel in 0..combo.count {
+            let selected = &dataset.bands[combo.indices[channel]];
             // Baked band EXRs are already integrated over their source band.
             // Scale by physical Voronoi width to approximate the larger sparse bin.
             let spectral_value =
-                selected[channel][sample] as f64 * weights_nm[channel] / band_widths[channel];
+                selected[sample] as f64 * weights_nm[channel] / band_widths[channel];
             xyz.x += spectral_value * cie[channel].x as f64;
             xyz.y += spectral_value * cie[channel].y as f64;
             xyz.z += spectral_value * cie[channel].z as f64;
@@ -395,6 +404,43 @@ fn evaluate_combo(
     }
 }
 
+fn evaluate_combos(
+    dataset: &Dataset,
+    combos: &[Combo],
+    indices: Option<&[usize]>,
+    exact_percentiles: bool,
+    threads: usize,
+) -> Vec<ComboResult> {
+    let thread_count = threads.max(1).min(combos.len().max(1));
+    if thread_count == 1 || combos.len() <= 1 {
+        return combos
+            .iter()
+            .copied()
+            .map(|combo| evaluate_combo(dataset, combo, indices, exact_percentiles))
+            .collect();
+    }
+
+    let chunk_size = combos.len().div_ceil(thread_count);
+    thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for chunk in combos.chunks(chunk_size) {
+            handles.push(scope.spawn(move || {
+                chunk
+                    .iter()
+                    .copied()
+                    .map(|combo| evaluate_combo(dataset, combo, indices, exact_percentiles))
+                    .collect::<Vec<_>>()
+            }));
+        }
+
+        let mut results = Vec::with_capacity(combos.len());
+        for handle in handles {
+            results.extend(handle.join().expect("primary search worker panicked"));
+        }
+        results
+    })
+}
+
 fn sample_iterator<'a>(
     sample_count: usize,
     indices: Option<&'a [usize]>,
@@ -405,16 +451,33 @@ fn sample_iterator<'a>(
     }
 }
 
-fn all_combos(len: usize) -> Vec<Combo> {
+fn all_combos(len: usize, count: usize) -> Vec<Combo> {
     let mut combos = Vec::new();
-    for a in 0..len {
-        for b in a + 1..len {
-            for c in b + 1..len {
-                combos.push(Combo { a, b, c });
-            }
-        }
-    }
+    let mut current = [0; MAX_PRIMARY_COUNT];
+    collect_combos(len, count, 0, 0, &mut current, &mut combos);
     combos
+}
+
+fn collect_combos(
+    len: usize,
+    count: usize,
+    depth: usize,
+    start: usize,
+    current: &mut [usize; MAX_PRIMARY_COUNT],
+    combos: &mut Vec<Combo>,
+) {
+    if depth == count {
+        combos.push(Combo {
+            indices: *current,
+            count,
+        });
+        return;
+    }
+    let remaining = count - depth;
+    for index in start..=len - remaining {
+        current[depth] = index;
+        collect_combos(len, count, depth + 1, index + 1, current, combos);
+    }
 }
 
 fn band_widths_from_centers(wavelengths_nm: &[f32]) -> Vec<f64> {
@@ -435,20 +498,37 @@ fn band_widths_from_centers(wavelengths_nm: &[f32]) -> Vec<f64> {
     widths
 }
 
-fn quadrature_weights(wavelengths_nm: &[f32], band_widths_nm: &[f64], combo: Combo) -> [f64; 3] {
-    let indices = [combo.a, combo.b, combo.c];
+fn quadrature_weights(
+    wavelengths_nm: &[f32],
+    band_widths_nm: &[f64],
+    combo: Combo,
+) -> [f64; MAX_PRIMARY_COUNT] {
     let first_center = wavelengths_nm[0] as f64;
     let last_center = wavelengths_nm[wavelengths_nm.len() - 1] as f64;
     let lo_bound = first_center - 0.5 * band_widths_nm[0];
     let hi_bound = last_center + 0.5 * band_widths_nm[band_widths_nm.len() - 1];
-    let centers = [
-        wavelengths_nm[indices[0]] as f64,
-        wavelengths_nm[indices[1]] as f64,
-        wavelengths_nm[indices[2]] as f64,
-    ];
-    let split01 = 0.5 * (centers[0] + centers[1]);
-    let split12 = 0.5 * (centers[1] + centers[2]);
-    [split01 - lo_bound, split12 - split01, hi_bound - split12]
+    let mut centers = [0.0; MAX_PRIMARY_COUNT];
+    for channel in 0..combo.count {
+        centers[channel] = wavelengths_nm[combo.indices[channel]] as f64;
+    }
+    if combo.count == 1 {
+        let mut weights = [0.0; MAX_PRIMARY_COUNT];
+        weights[0] = hi_bound - lo_bound;
+        return weights;
+    }
+
+    let mut splits = [0.0; MAX_PRIMARY_COUNT - 1];
+    for channel in 0..combo.count - 1 {
+        splits[channel] = 0.5 * (centers[channel] + centers[channel + 1]);
+    }
+
+    let mut weights = [0.0; MAX_PRIMARY_COUNT];
+    weights[0] = splits[0] - lo_bound;
+    for channel in 1..combo.count - 1 {
+        weights[channel] = splits[channel] - splits[channel - 1];
+    }
+    weights[combo.count - 1] = hi_bound - splits[combo.count - 2];
+    weights
 }
 
 fn screening_indices(sample_count: usize, requested: usize) -> Vec<usize> {
@@ -499,23 +579,68 @@ fn percentile_sorted(values: &[f64], q: f64) -> f64 {
     values[index]
 }
 
+fn primary_count_from_results(results: &[ComboResult]) -> usize {
+    results.first().map_or(0, |result| result.combo.count)
+}
+
+fn format_wavelengths_csv(result: &ComboResult) -> String {
+    (0..result.combo.count)
+        .map(|index| format!("{:.0}", result.wavelengths_nm[index]))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_weights_csv(result: &ComboResult) -> String {
+    (0..result.combo.count)
+        .map(|index| format!("{:.6}", result.weights_nm[index]))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_wavelengths_display(result: &ComboResult) -> String {
+    (0..result.combo.count)
+        .map(|index| format!("{:.0}", result.wavelengths_nm[index]))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_wavelengths_slash(result: &ComboResult) -> String {
+    (0..result.combo.count)
+        .map(|index| format!("{:.0}", result.wavelengths_nm[index]))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn format_weights_display(result: &ComboResult) -> String {
+    (0..result.combo.count)
+        .map(|index| format!("{:.1}", result.weights_nm[index]))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn numbered_headers(prefix: &str, suffix: &str, count: usize) -> String {
+    (0..count)
+        .map(|index| format!("{prefix}{index}{suffix}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn write_csv(path: &Path, results: &[ComboResult]) -> Result<(), Box<dyn Error>> {
     let mut file = File::create(path)?;
+    let primary_count = primary_count_from_results(results);
     writeln!(
         file,
-        "rank,lambda0_nm,lambda1_nm,lambda2_nm,weight0_nm,weight1_nm,weight2_nm,score,mean,rmse,p50,p90,p95,p99,max,sample_count"
+        "rank,{},{},score,mean,rmse,p50,p90,p95,p99,max,sample_count",
+        numbered_headers("lambda", "_nm", primary_count),
+        numbered_headers("weight", "_nm", primary_count)
     )?;
     for (rank, result) in results.iter().enumerate() {
         writeln!(
             file,
-            "{},{:.0},{:.0},{:.0},{:.6},{:.6},{:.6},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{}",
+            "{},{},{},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{}",
             rank + 1,
-            result.wavelengths_nm[0],
-            result.wavelengths_nm[1],
-            result.wavelengths_nm[2],
-            result.weights_nm[0],
-            result.weights_nm[1],
-            result.weights_nm[2],
+            format_wavelengths_csv(result),
+            format_weights_csv(result),
             result.score,
             result.mean,
             result.rmse,
@@ -536,9 +661,11 @@ fn write_per_elevation_csv(
     results: &[ComboResult],
 ) -> Result<(), Box<dyn Error>> {
     let mut file = File::create(path)?;
+    let primary_count = primary_count_from_results(results);
     writeln!(
         file,
-        "rank,elevation_deg,lambda0_nm,lambda1_nm,lambda2_nm,score,mean,rmse,p50,p90,p95,p99,max,sample_count"
+        "rank,elevation_deg,{},score,mean,rmse,p50,p90,p95,p99,max,sample_count",
+        numbered_headers("lambda", "_nm", primary_count)
     )?;
     for (rank, result) in results.iter().enumerate() {
         for asset in &dataset.asset_summaries {
@@ -546,12 +673,10 @@ fn write_per_elevation_csv(
             let per_asset = evaluate_combo(dataset, result.combo, Some(&indices), true);
             writeln!(
                 file,
-                "{},{:.6},{:.0},{:.0},{:.0},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{}",
+                "{},{:.6},{},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{}",
                 rank + 1,
                 asset.sun_elevation_deg,
-                result.wavelengths_nm[0],
-                result.wavelengths_nm[1],
-                result.wavelengths_nm[2],
+                format_wavelengths_csv(result),
                 per_asset.score,
                 per_asset.mean,
                 per_asset.rmse,
@@ -579,7 +704,8 @@ fn write_report(
     results: &[ComboResult],
 ) -> Result<(), Box<dyn Error>> {
     let mut file = File::create(path)?;
-    writeln!(file, "# Sky-View Three-Wavelength Search")?;
+    let primary_count = primary_count_from_results(results);
+    writeln!(file, "# Sky-View {primary_count}-Wavelength Search")?;
     writeln!(file)?;
     writeln!(file, "## Dataset")?;
     writeln!(file)?;
@@ -623,7 +749,7 @@ fn write_report(
     writeln!(file)?;
     writeln!(
         file,
-        "Screening ranks all triples by deterministic-subsample RMSE. Final score is `RMSE_OK + 0.25 * P95_OK`, computed on all loaded LUT samples after direct physical XYZ quadrature and Oklab conversion."
+        "Screening ranks all {primary_count}-wavelength combos by deterministic-subsample RMSE. Final score is `RMSE_OK + 0.25 * P95_OK`, computed on all loaded LUT samples after direct physical XYZ quadrature and Oklab conversion."
     )?;
     writeln!(file)?;
     writeln!(
@@ -637,14 +763,10 @@ fn write_report(
     for (rank, result) in results.iter().enumerate() {
         writeln!(
             file,
-            "| {} | {:.0}, {:.0}, {:.0} | {:.1}, {:.1}, {:.1} | {:.6} | {:.6} | {:.6} | {:.6} | {:.6} | {:.6} |",
+            "| {} | {} | {} | {:.6} | {:.6} | {:.6} | {:.6} | {:.6} | {:.6} |",
             rank + 1,
-            result.wavelengths_nm[0],
-            result.wavelengths_nm[1],
-            result.wavelengths_nm[2],
-            result.weights_nm[0],
-            result.weights_nm[1],
-            result.weights_nm[2],
+            format_wavelengths_display(result),
+            format_weights_display(result),
             result.score,
             result.rmse,
             result.mean,
@@ -659,8 +781,8 @@ fn write_report(
         writeln!(file)?;
         writeln!(
             file,
-            "Best overall combo: `{:.0}, {:.0}, {:.0} nm`.",
-            best.wavelengths_nm[0], best.wavelengths_nm[1], best.wavelengths_nm[2]
+            "Best overall combo: `{} nm`.",
+            format_wavelengths_display(best)
         )?;
         writeln!(file)?;
         writeln!(

@@ -18,6 +18,7 @@ use crate::gpu::{GpuContext, SurfaceFrameStatus};
 use crate::passes::analytic_atmosphere::AnalyticAtmosphereExperiment;
 use crate::passes::unreal_atmosphere::UnrealAtmosphereExperiment;
 use crate::passes::unreal_atmosphere_3wave::UnrealAtmosphere3WaveExperiment;
+use crate::passes::unreal_atmosphere_4wave::UnrealAtmosphere4WaveExperiment;
 use crate::view::ViewController;
 
 pub struct RunConfig {
@@ -31,6 +32,8 @@ pub enum ExperimentKind {
     Unreal,
     #[value(name = "unreal-3wave", alias = "unreal3-wave")]
     Unreal3Wave,
+    #[value(name = "unreal-4wave", alias = "unreal4-wave")]
+    Unreal4Wave,
 }
 
 pub fn run(config: RunConfig) -> Result<(), Box<dyn Error>> {
@@ -192,6 +195,7 @@ impl ApplicationHandler for DemoApp {
             ExperimentKind::Analytic => wgpu::Features::empty(),
             ExperimentKind::Unreal => sky_unreal_atmosphere::REQUIRED_FEATURES,
             ExperimentKind::Unreal3Wave => sky_unreal_atmosphere_3wave::REQUIRED_FEATURES,
+            ExperimentKind::Unreal4Wave => sky_unreal_atmosphere_4wave::REQUIRED_FEATURES,
         };
         let gpu = match pollster::block_on(GpuContext::new(window, required_features)) {
             Ok(gpu) => gpu,
@@ -234,6 +238,14 @@ impl ApplicationHandler for DemoApp {
                 }
             },
             ExperimentKind::Unreal3Wave => match UnrealAtmosphere3WaveExperiment::new(init) {
+                Ok(experiment) => Box::new(experiment),
+                Err(error) => {
+                    self.init_error = Some(error);
+                    event_loop.exit();
+                    return;
+                }
+            },
+            ExperimentKind::Unreal4Wave => match UnrealAtmosphere4WaveExperiment::new(init) {
                 Ok(experiment) => Box::new(experiment),
                 Err(error) => {
                     self.init_error = Some(error);
