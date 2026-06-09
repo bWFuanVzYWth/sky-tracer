@@ -1,5 +1,7 @@
 target/
 out/
 out_skyview/
+out_skyview_search/
+target/primary_search*/
 
 run_deepseek*
