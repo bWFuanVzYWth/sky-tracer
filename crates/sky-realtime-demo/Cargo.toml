@@ -13,6 +13,7 @@ serde_json = { workspace = true }
 sky-core = { path = "../sky-core" }
 sky-analytic-atmosphere = { path = "../sky-analytic-atmosphere" }
 sky-unreal-atmosphere = { path = "../sky-unreal-atmosphere" }
+sky-unreal-atmosphere-3wave = { path = "../sky-unreal-atmosphere-3wave" }
 wgpu = { workspace = true }
 winit = { workspace = true }
 

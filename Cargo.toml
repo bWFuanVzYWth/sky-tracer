@@ -5,6 +5,7 @@ members = [
     "crates/sky-bake",
     "crates/sky-analytic-atmosphere",
     "crates/sky-unreal-atmosphere",
+    "crates/sky-unreal-atmosphere-3wave",
     "crates/sky-realtime-demo",
 ]
 resolver = "3"

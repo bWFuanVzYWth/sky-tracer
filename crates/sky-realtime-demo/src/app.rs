@@ -17,6 +17,7 @@ use crate::experiment::{
 use crate::gpu::{GpuContext, SurfaceFrameStatus};
 use crate::passes::analytic_atmosphere::AnalyticAtmosphereExperiment;
 use crate::passes::unreal_atmosphere::UnrealAtmosphereExperiment;
+use crate::passes::unreal_atmosphere_3wave::UnrealAtmosphere3WaveExperiment;
 use crate::view::ViewController;
 
 pub struct RunConfig {
@@ -28,6 +29,8 @@ pub struct RunConfig {
 pub enum ExperimentKind {
     Analytic,
     Unreal,
+    #[value(name = "unreal-3wave", alias = "unreal3-wave")]
+    Unreal3Wave,
 }
 
 pub fn run(config: RunConfig) -> Result<(), Box<dyn Error>> {
@@ -40,7 +43,7 @@ pub fn run(config: RunConfig) -> Result<(), Box<dyn Error>> {
         );
     }
 
-    let sun_elevation_deg = asset.manifest().sun_elevation_deg.clamp(-10.0, 90.0);
+    let sun_elevation_deg = asset.manifest().sun_elevation_deg;
     let event_loop = EventLoop::new()?;
     let mut app = DemoApp {
         asset,
@@ -134,7 +137,7 @@ impl DemoApp {
     }
 
     fn handle_compare_key(&mut self, event: &KeyEvent) -> bool {
-        if event.state != ElementState::Pressed || event.repeat {
+        if event.state != ElementState::Pressed {
             return false;
         }
         let mode = match event.physical_key {
@@ -162,7 +165,7 @@ impl DemoApp {
             PhysicalKey::Code(KeyCode::BracketRight) => 1.0,
             _ => return false,
         };
-        self.sun_elevation_deg = (self.sun_elevation_deg + delta).clamp(-10.0, 90.0);
+        self.sun_elevation_deg += delta;
         println!("sun elevation: {:.1} deg", self.sun_elevation_deg);
         true
     }
@@ -188,6 +191,7 @@ impl ApplicationHandler for DemoApp {
         let required_features = match self.experiment_kind {
             ExperimentKind::Analytic => wgpu::Features::empty(),
             ExperimentKind::Unreal => sky_unreal_atmosphere::REQUIRED_FEATURES,
+            ExperimentKind::Unreal3Wave => sky_unreal_atmosphere_3wave::REQUIRED_FEATURES,
         };
         let gpu = match pollster::block_on(GpuContext::new(window, required_features)) {
             Ok(gpu) => gpu,
@@ -200,7 +204,7 @@ impl ApplicationHandler for DemoApp {
         let display = DisplayTransform::default();
         println!("display transform: {}", display.output_space.label());
         println!("view controls: left drag = yaw/pitch, mouse wheel = fov, R = reset");
-        println!("sun controls: [ lower elevation, ] raise elevation (-10..90 deg)");
+        println!("sun controls: [ lower elevation, ] raise elevation");
         println!(
             "comparison controls: 1 realtime, 2 reference, 3 abs diff, 4 signed diff, D cycle"
         );
@@ -222,6 +226,14 @@ impl ApplicationHandler for DemoApp {
                 }
             },
             ExperimentKind::Unreal => match UnrealAtmosphereExperiment::new(init) {
+                Ok(experiment) => Box::new(experiment),
+                Err(error) => {
+                    self.init_error = Some(error);
+                    event_loop.exit();
+                    return;
+                }
+            },
+            ExperimentKind::Unreal3Wave => match UnrealAtmosphere3WaveExperiment::new(init) {
                 Ok(experiment) => Box::new(experiment),
                 Err(error) => {
                     self.init_error = Some(error);
