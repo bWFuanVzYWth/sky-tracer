@@ -1,8 +1,3 @@
-use glam::{Mat4, Vec3, Vec4};
-use sky_unreal_atmosphere::{
-    HillaireAtmosphere, NonZeroRenderSize, SUN_IRRADIANCE_REC2020_W_PER_M2, Sun, ViewFrame,
-};
-
 use crate::assets::RealtimeAsset;
 use crate::experiment::CompareMode;
 use crate::view::ViewState;
@@ -404,97 +399,8 @@ const fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-pub(crate) fn atmosphere_from_asset(asset: &RealtimeAsset) -> HillaireAtmosphere {
-    let mut atmosphere = HillaireAtmosphere::default();
-    atmosphere.world_y0_radius_m =
-        atmosphere.bottom_radius_m + asset.manifest().observer_altitude_km.max(0.0) * 1000.0;
-    atmosphere
-}
-
-pub(crate) fn sun_from_asset(asset: &RealtimeAsset, elevation_deg: f32) -> Sun {
-    let manifest = asset.manifest();
-    let to_sun = direction_from_azimuth_elevation(manifest.sun_azimuth_deg, elevation_deg);
-    Sun {
-        sun_to_scene: -to_sun,
-        irradiance_rec2020_w_m2: Vec3::from_array(SUN_IRRADIANCE_REC2020_W_PER_M2),
-        angular_radius_rad: Sun::default().angular_radius_rad,
-    }
-}
-
-pub(crate) fn view_frame_from_state(
-    view: ViewState,
-    size: NonZeroRenderSize,
-    sun: Sun,
-) -> ViewFrame {
-    let aspect = size.width() as f32 / size.height() as f32;
-    let yaw = view.yaw_deg.to_radians();
-    let pitch = view.pitch_deg.to_radians();
-    let fov_tan = (0.5 * view.fov_y_deg.to_radians()).tan();
-    let forward = Vec3::new(
-        yaw.sin() * pitch.cos(),
-        pitch.sin(),
-        yaw.cos() * pitch.cos(),
-    )
-    .normalize();
-    let right = Vec3::new(yaw.cos(), 0.0, -yaw.sin()).normalize();
-    let up = forward.cross(right).normalize();
-    let relative_world_from_clip = Mat4::from_cols(
-        (right * aspect * fov_tan).extend(0.0),
-        (up * fov_tan).extend(0.0),
-        Vec4::ZERO,
-        forward.extend(1.0),
-    );
-
-    ViewFrame {
-        clip_from_world: Mat4::IDENTITY.to_cols_array_2d(),
-        world_from_clip: Mat4::IDENTITY.to_cols_array_2d(),
-        clip_from_relative_world: Mat4::IDENTITY.to_cols_array_2d(),
-        relative_world_from_clip: relative_world_from_clip.to_cols_array_2d(),
-        world_position: [0.0, 0.0, 0.0, 1.0],
-        world_forward: forward.extend(0.0).to_array(),
-        world_right: right.extend(0.0).to_array(),
-        world_up: up.extend(0.0).to_array(),
-        view_params: [fov_tan, aspect, 0.1, 0.0],
-        light_dir: sun.to_sun().extend(0.0).to_array(),
-        viewport: [
-            size.width() as f32,
-            size.height() as f32,
-            1.0 / size.width() as f32,
-            1.0 / size.height() as f32,
-        ],
-    }
-}
-
-fn direction_from_azimuth_elevation(azimuth_deg: f32, elevation_deg: f32) -> Vec3 {
-    let azimuth = azimuth_deg.to_radians();
-    let elevation = elevation_deg.to_radians();
-    Vec3::new(
-        azimuth.sin() * elevation.cos(),
-        elevation.sin(),
-        azimuth.cos() * elevation.cos(),
-    )
-    .normalize()
-}
-
 #[cfg(test)]
 mod tests {
-    use sky_unreal_atmosphere::NonZeroRenderSize;
-
-    use super::{Sun, Vec3, ViewState, view_frame_from_state};
-
-    #[test]
-    fn default_view_frame_points_forward_at_center() {
-        let size = NonZeroRenderSize::new(16, 9).expect("size");
-        let frame = view_frame_from_state(ViewState::default(), size, Sun::default());
-        let center_ray = Vec3::from_array([
-            frame.relative_world_from_clip[3][0],
-            frame.relative_world_from_clip[3][1],
-            frame.relative_world_from_clip[3][2],
-        ])
-        .normalize();
-        assert!(center_ray.z > 0.9);
-    }
-
     #[test]
     fn present_shader_is_valid_wgsl() {
         let module =

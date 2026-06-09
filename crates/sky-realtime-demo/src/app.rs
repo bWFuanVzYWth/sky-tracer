@@ -15,8 +15,6 @@ use crate::experiment::{
     CompareMode, ExperimentInit, FrameContext, RealtimeExperiment, UpdateContext,
 };
 use crate::gpu::{GpuContext, SurfaceFrameStatus};
-use crate::passes::analytic_atmosphere::AnalyticAtmosphereExperiment;
-use crate::passes::unreal_atmosphere::UnrealAtmosphereExperiment;
 use crate::passes::unreal_atmosphere_3wave::UnrealAtmosphere3WaveExperiment;
 use crate::passes::unreal_atmosphere_4wave::UnrealAtmosphere4WaveExperiment;
 use crate::view::ViewController;
@@ -28,8 +26,6 @@ pub struct RunConfig {
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 pub enum ExperimentKind {
-    Analytic,
-    Unreal,
     #[value(name = "unreal-3wave", alias = "unreal3-wave")]
     Unreal3Wave,
     #[value(name = "unreal-4wave", alias = "unreal4-wave")]
@@ -192,8 +188,6 @@ impl ApplicationHandler for DemoApp {
         };
 
         let required_features = match self.experiment_kind {
-            ExperimentKind::Analytic => wgpu::Features::empty(),
-            ExperimentKind::Unreal => sky_unreal_atmosphere::REQUIRED_FEATURES,
             ExperimentKind::Unreal3Wave => sky_unreal_atmosphere_3wave::REQUIRED_FEATURES,
             ExperimentKind::Unreal4Wave => sky_unreal_atmosphere_4wave::REQUIRED_FEATURES,
         };
@@ -221,22 +215,6 @@ impl ApplicationHandler for DemoApp {
             display,
         };
         let mut experiment: Box<dyn RealtimeExperiment> = match self.experiment_kind {
-            ExperimentKind::Analytic => match AnalyticAtmosphereExperiment::new(init) {
-                Ok(experiment) => Box::new(experiment),
-                Err(error) => {
-                    self.init_error = Some(error);
-                    event_loop.exit();
-                    return;
-                }
-            },
-            ExperimentKind::Unreal => match UnrealAtmosphereExperiment::new(init) {
-                Ok(experiment) => Box::new(experiment),
-                Err(error) => {
-                    self.init_error = Some(error);
-                    event_loop.exit();
-                    return;
-                }
-            },
             ExperimentKind::Unreal3Wave => match UnrealAtmosphere3WaveExperiment::new(init) {
                 Ok(experiment) => Box::new(experiment),
                 Err(error) => {

@@ -3,8 +3,6 @@ members = [
     "crates/sky-core",
     "crates/sky-offline",
     "crates/sky-bake",
-    "crates/sky-analytic-atmosphere",
-    "crates/sky-unreal-atmosphere",
     "crates/sky-unreal-atmosphere-3wave",
     "crates/sky-unreal-atmosphere-4wave",
     "crates/sky-realtime-demo",

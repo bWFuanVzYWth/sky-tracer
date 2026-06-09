@@ -15,7 +15,7 @@ use clap::Parser;
 struct Cli {
     #[arg(long, default_value = "out/asset.json")]
     asset: PathBuf,
-    #[arg(long, value_enum, default_value_t = app::ExperimentKind::Analytic)]
+    #[arg(long, value_enum, default_value_t = app::ExperimentKind::Unreal4Wave)]
     experiment: app::ExperimentKind,
 }
 
