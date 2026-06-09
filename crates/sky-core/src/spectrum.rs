@@ -2,7 +2,7 @@ use std::sync::OnceLock;
 
 use crate::math::Rgb;
 
-pub const BAND_COUNT: usize = 15;
+pub const BAND_COUNT: usize = 41;
 pub const CIE_1931_2DEG_CMF_NAME: &str = "CIE 1931 2 degree standard observer";
 pub const CIE_1931_2DEG_CMF_SOURCE: &str = "data/CIE_xyz_1931_2deg.csv";
 pub const LINEAR_SRGB_D65_NAME: &str = "linear sRGB D65";
@@ -166,11 +166,10 @@ impl SpectralRgbConverter {
 pub fn default_band_centers() -> [f32; BAND_COUNT] {
     let mut bands = [0.0; BAND_COUNT];
     let start = 380.0_f32;
-    let end = 780.0_f32;
-    let step = (end - start) / BAND_COUNT as f32;
+    let step = 10.0_f32;
     let mut i = 0;
     while i < BAND_COUNT {
-        bands[i] = start + (i as f32 + 0.5) * step;
+        bands[i] = start + i as f32 * step;
         i += 1;
     }
     bands
@@ -360,11 +359,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_bands_cover_visible_range() {
+    fn default_bands_use_10nm_visible_bins() {
         let centers = default_band_centers();
         assert_eq!(centers.len(), BAND_COUNT);
-        assert!(centers[0] > 380.0);
-        assert!(centers[BAND_COUNT - 1] < 780.0);
+        assert_eq!(centers[0], 380.0);
+        assert_eq!(centers[BAND_COUNT - 1], 780.0);
+        assert!(
+            centers
+                .windows(2)
+                .all(|window| (window[1] - window[0] - 10.0).abs() <= f32::EPSILON)
+        );
     }
 
     #[test]

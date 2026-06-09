@@ -41,7 +41,7 @@ struct Cli {
     observer_altitude_km: f32,
     #[arg(long, default_value_t = 1)]
     direct_light_samples: usize,
-    #[arg(long, default_value_t = 0.1)]
+    #[arg(long, default_value_t = 0.05)]
     png_exposure: f32,
     #[arg(long)]
     sky_view_lut: bool,

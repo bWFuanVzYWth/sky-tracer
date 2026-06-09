@@ -8,7 +8,7 @@ impl Default for DisplayTransform {
     fn default() -> Self {
         Self {
             output_space: OutputColorSpace::SrgbOpenDrtDebug,
-            exposure: 0.1,
+            exposure: 0.05,
         }
     }
 }

@@ -53,10 +53,11 @@ SPECIES = {
 }
 
 
-def band_edges(n_bands: int, start_nm: float, end_nm: float):
-    edges = np.linspace(start_nm, end_nm, n_bands + 1)
-    centers = 0.5 * (edges[:-1] + edges[1:])
-    return centers, edges[:-1], edges[1:]
+def band_edges(start_nm: float, end_nm: float, step_nm: float):
+    centers = np.arange(start_nm, end_nm + step_nm * 0.5, step_nm)
+    lows = centers - step_nm * 0.5
+    highs = centers + step_nm * 0.5
+    return centers, lows, highs
 
 
 def read_columns(path: Path) -> np.ndarray:
@@ -147,7 +148,7 @@ def bake(args):
     out = Path(args.out).resolve()
     opac = root / "data/aerosol/OPAC"
 
-    centers, lows, highs = band_edges(args.bands, args.start_nm, args.end_nm)
+    centers, lows, highs = band_edges(args.start_nm, args.end_nm, args.step_nm)
     solar = read_columns(root / "data/solar_flux/rgb")
     solar_nm = solar[:, 0]
     solar_mw_m2_nm = solar[:, 1]
@@ -163,7 +164,7 @@ def bake(args):
             f"{interp_integral(solar_nm, solar_mw_m2_nm, lows[i], highs[i]) * 1.0e-3:.8e}",
             f"{ozone_cross_section(ozone_path, centers[i]):.8e}",
         ]
-        for i in range(args.bands)
+        for i in range(len(centers))
     ]
     write_csv(out / "bands.csv", band_rows)
 
@@ -207,9 +208,9 @@ def bake(args):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--libradtran", default=r"C:\WorkSpace\cellular_automata\ref\libRadtran-2.0.6")
+    parser.add_argument("--libradtran", default=r"C:\WorkSpace\_ref\libRadtran-2.0.6")
     parser.add_argument("--out", default="data")
-    parser.add_argument("--bands", type=int, default=15)
+    parser.add_argument("--step-nm", type=float, default=10.0)
     parser.add_argument("--phase-bins", type=int, default=1024)
     parser.add_argument("--radii", type=int, default=300)
     parser.add_argument("--start-nm", type=float, default=380.0)
