@@ -421,11 +421,12 @@ fn sky_view_uv_from_dir(dir_in: vec3<f32>, dims: vec2<f32>) -> vec2<f32> {
     return sky_view_params_to_uv(view_zenith_cos_angle, light_view_cos_angle, intersect_ground, dims);
 }
 
-const ATM_SCATTERING_MU_S_SIZE: u32 = 256u;
-const ATM_SCATTERING_NU_SIZE: u32 = 32u;
+const ATM_SCATTERING_MU_S_SIZE: u32 = 128u;
+const ATM_SCATTERING_NU_SIZE: u32 = 64u;
 const ATM_SCATTERING_SKY_FRACTION: f32 = 0.75;
 const ATM_SCATTERING_GROUND_FRACTION: f32 = 0.25;
 const ATM_SCATTERING_NU_PACK_POWER: f32 = 3.0;
+const ATM_SCATTERING_R_SCALE_HEIGHT_KM: f32 = 8.0;
 
 struct BrunetonScatteringParams {
     r: f32,
@@ -451,16 +452,21 @@ fn bruneton_index_to_unit(index: u32, resolution: u32) -> f32 {
 fn bruneton_radius_from_unit(u: f32) -> f32 {
     let bottom = hp.earth_radius_km + ATM_PLANET_RADIUS_OFFSET_KM;
     let top = hp.earth_radius_km + hp.atmosphere_thickness_km - ATM_PLANET_RADIUS_OFFSET_KM;
-    let bottom2 = bottom * bottom;
-    let top2 = top * top;
-    return sqrt(mix(bottom2, top2, clamp(u, 0.0, 1.0)));
+    let thickness = max(top - bottom, 1.0e-6);
+    let mass_extent = 1.0 - exp(-thickness / ATM_SCATTERING_R_SCALE_HEIGHT_KM);
+    let h = -ATM_SCATTERING_R_SCALE_HEIGHT_KM
+        * log(max(1.0 - clamp(u, 0.0, 1.0) * mass_extent, 1.0e-6));
+    return bottom + clamp(h, 0.0, thickness);
 }
 
 fn bruneton_unit_from_radius(r_in: f32) -> f32 {
     let bottom = hp.earth_radius_km + ATM_PLANET_RADIUS_OFFSET_KM;
     let top = hp.earth_radius_km + hp.atmosphere_thickness_km - ATM_PLANET_RADIUS_OFFSET_KM;
-    let r = clamp(r_in, bottom, top);
-    return clamp((r * r - bottom * bottom) / max(top * top - bottom * bottom, 1.0e-6), 0.0, 1.0);
+    let thickness = max(top - bottom, 1.0e-6);
+    let h = clamp(r_in, bottom, top) - bottom;
+    let mass_extent = 1.0 - exp(-thickness / ATM_SCATTERING_R_SCALE_HEIGHT_KM);
+    let mass = 1.0 - exp(-h / ATM_SCATTERING_R_SCALE_HEIGHT_KM);
+    return clamp(mass / max(mass_extent, 1.0e-6), 0.0, 1.0);
 }
 
 fn bruneton_horizon_angles(radius_km: f32) -> vec2<f32> {

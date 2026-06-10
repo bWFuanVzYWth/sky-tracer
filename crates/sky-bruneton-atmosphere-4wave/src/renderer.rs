@@ -17,10 +17,10 @@ use wgpu::util::{BufferInitDescriptor, DeviceExt};
 const M_TO_KM: f32 = 1.0e-3;
 const TRANSMITTANCE_SIZE: UVec2 = UVec2::new(512, 128);
 const IRRADIANCE_SIZE: UVec2 = UVec2::new(128, 32);
-const SCATTERING_R_SIZE: u32 = 32;
-const SCATTERING_MU_SIZE: u32 = 256;
-const SCATTERING_MU_S_SIZE: u32 = 256;
-const SCATTERING_NU_SIZE: u32 = 32;
+const SCATTERING_R_SIZE: u32 = 64;
+const SCATTERING_MU_SIZE: u32 = 128;
+const SCATTERING_MU_S_SIZE: u32 = 128;
+const SCATTERING_NU_SIZE: u32 = 64;
 const SCATTERING_SIZE: UVec3 = UVec3::new(
     SCATTERING_MU_S_SIZE * SCATTERING_NU_SIZE,
     SCATTERING_MU_SIZE,
