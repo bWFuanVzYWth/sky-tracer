@@ -12,6 +12,7 @@ pollster = { workspace = true }
 serde_json = { workspace = true }
 sky-core = { path = "../sky-core" }
 sky-bruneton-atmosphere-4wave = { path = "../sky-bruneton-atmosphere-4wave" }
+sky-bruneton-atmosphere-8wave = { path = "../sky-bruneton-atmosphere-8wave" }
 sky-unreal-atmosphere-3wave = { path = "../sky-unreal-atmosphere-3wave" }
 sky-unreal-atmosphere-4wave = { path = "../sky-unreal-atmosphere-4wave" }
 wgpu = { workspace = true }

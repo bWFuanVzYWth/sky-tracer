@@ -6,6 +6,7 @@ members = [
     "crates/sky-unreal-atmosphere-3wave",
     "crates/sky-unreal-atmosphere-4wave",
     "crates/sky-bruneton-atmosphere-4wave",
+    "crates/sky-bruneton-atmosphere-8wave",
     "crates/sky-realtime-demo",
 ]
 resolver = "3"

@@ -1831,6 +1831,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sky-bruneton-atmosphere-8wave"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "glam",
+ "naga",
+ "wgpu",
+]
+
+[[package]]
 name = "sky-core"
 version = "0.1.0"
 dependencies = [
@@ -1861,6 +1871,7 @@ dependencies = [
  "pollster",
  "serde_json",
  "sky-bruneton-atmosphere-4wave",
+ "sky-bruneton-atmosphere-8wave",
  "sky-core",
  "sky-unreal-atmosphere-3wave",
  "sky-unreal-atmosphere-4wave",
