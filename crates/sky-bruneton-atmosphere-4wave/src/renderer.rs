@@ -19,13 +19,14 @@ const TRANSMITTANCE_SIZE: UVec2 = UVec2::new(512, 128);
 const IRRADIANCE_SIZE: UVec2 = UVec2::new(128, 32);
 const SCATTERING_R_SIZE: u32 = 64;
 const SCATTERING_MU_SIZE: u32 = 128;
-const SCATTERING_MU_S_SIZE: u32 = 128;
+const SCATTERING_MU_S_SIZE: u32 = 64;
 const SCATTERING_NU_SIZE: u32 = 64;
 const SCATTERING_SIZE: UVec3 = UVec3::new(
     SCATTERING_MU_S_SIZE * SCATTERING_NU_SIZE,
     SCATTERING_MU_SIZE,
     SCATTERING_R_SIZE,
 );
+const SKY_VIEW_SIZE: UVec2 = UVec2::new(256, 256);
 const LUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 const SCATTERING_ORDER_COUNT: u32 = 4;
 
@@ -114,11 +115,8 @@ impl BrunetonAtmosphereContext {
                 view: &view_buffer,
                 sun: &sun_buffer,
                 transmittance: &resources.transmittance.view,
-                irradiance: &resources.irradiance.view,
-                scattering: &resources.scattering.view,
-                single_rayleigh: &resources.single_rayleigh.view,
                 sampler: &sampler,
-                phase_lut: &resources.phase_lut.view,
+                sky_view: &resources.sky_view.view,
             },
         );
         Ok(Self {
@@ -160,6 +158,7 @@ impl BrunetonAtmosphereContext {
             self.dispatch_precompute(device, encoder);
             self.precompute_key = Some(key);
         }
+        self.dispatch_sky_view(device, encoder);
     }
 
     pub fn render(&self, encoder: &mut wgpu::CommandEncoder, targets: &RenderTargets) {
@@ -311,6 +310,29 @@ impl BrunetonAtmosphereContext {
             );
         }
     }
+
+    fn dispatch_sky_view(&self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder) {
+        dispatch_compute_2d(
+            encoder,
+            &self.pipelines.sky_view,
+            &sky_view_bind_group(
+                device,
+                &self.layouts.sky_view,
+                SkyViewBindGroupInput {
+                    params: &self.params_buffer,
+                    transmittance: &self.resources.transmittance.view,
+                    irradiance: &self.resources.irradiance.view,
+                    scattering: &self.resources.scattering.view,
+                    single_rayleigh: &self.resources.single_rayleigh.view,
+                    sampler: &self.sampler,
+                    phase_lut: &self.resources.phase_lut.view,
+                    sky_view: &self.resources.sky_view.view,
+                },
+            ),
+            SKY_VIEW_SIZE,
+            "bruneton.sky_view.pass",
+        );
+    }
 }
 
 #[repr(C)]
@@ -379,6 +401,7 @@ struct Resources {
     single_mie: Texture3d,
     delta_scattering: Texture3d,
     scattering_density: Texture3d,
+    sky_view: Texture2d,
     phase_lut: TextureArray,
 }
 
@@ -399,6 +422,7 @@ impl Resources {
                 SCATTERING_SIZE,
                 "bruneton.scattering_density",
             ),
+            sky_view: Texture2d::new(device, SKY_VIEW_SIZE, "bruneton.sky_view"),
             phase_lut: TextureArray::phase_lut(device, queue),
         }
     }
@@ -534,6 +558,7 @@ struct Layouts {
     indirect_irradiance: wgpu::BindGroupLayout,
     scattering_density: wgpu::BindGroupLayout,
     multiple_scattering: wgpu::BindGroupLayout,
+    sky_view: wgpu::BindGroupLayout,
     render: wgpu::BindGroupLayout,
 }
 
@@ -614,6 +639,19 @@ impl Layouts {
                     ],
                 },
             ),
+            sky_view: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("bruneton.sky_view.bgl"),
+                entries: &[
+                    uniform_entry(0, wgpu::ShaderStages::COMPUTE),
+                    texture_2d_entry(1, wgpu::ShaderStages::COMPUTE),
+                    texture_2d_entry(2, wgpu::ShaderStages::COMPUTE),
+                    texture_3d_entry(3, wgpu::ShaderStages::COMPUTE),
+                    texture_3d_entry(4, wgpu::ShaderStages::COMPUTE),
+                    sampler_entry(5, wgpu::ShaderStages::COMPUTE),
+                    texture_2d_array_entry(6, wgpu::ShaderStages::COMPUTE),
+                    storage_2d_entry(7),
+                ],
+            }),
             render: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("bruneton.render.bgl"),
                 entries: &[
@@ -621,11 +659,8 @@ impl Layouts {
                     uniform_entry(1, wgpu::ShaderStages::FRAGMENT),
                     uniform_entry(2, wgpu::ShaderStages::FRAGMENT),
                     texture_2d_entry(3, wgpu::ShaderStages::FRAGMENT),
-                    texture_2d_entry(4, wgpu::ShaderStages::FRAGMENT),
-                    texture_3d_entry(5, wgpu::ShaderStages::FRAGMENT),
-                    texture_3d_entry(6, wgpu::ShaderStages::FRAGMENT),
-                    sampler_entry(7, wgpu::ShaderStages::FRAGMENT),
-                    texture_2d_array_entry(8, wgpu::ShaderStages::FRAGMENT),
+                    sampler_entry(4, wgpu::ShaderStages::FRAGMENT),
+                    texture_2d_entry(5, wgpu::ShaderStages::FRAGMENT),
                 ],
             }),
         }
@@ -639,6 +674,7 @@ struct Pipelines {
     indirect_irradiance: wgpu::ComputePipeline,
     scattering_density: wgpu::ComputePipeline,
     multiple_scattering: wgpu::ComputePipeline,
+    sky_view: wgpu::ComputePipeline,
     render: wgpu::RenderPipeline,
 }
 
@@ -705,6 +741,16 @@ impl Pipelines {
                     "{}\n\n{}",
                     crate::COMMON_WGSL,
                     include_str!("wgsl/multiple_scattering_4d.comp.wgsl")
+                ),
+            ),
+            sky_view: compute_pipeline(
+                device,
+                &layouts.sky_view,
+                "bruneton.sky_view.pipeline",
+                &format!(
+                    "{}\n\n{}",
+                    crate::COMMON_WGSL,
+                    include_str!("wgsl/sky_view.comp.wgsl")
                 ),
             ),
             render: render_pipeline(device, &layouts.render),
@@ -1206,16 +1252,45 @@ fn multiple_scattering_bind_group(
     })
 }
 
-struct RenderBindGroupInput<'a> {
+struct SkyViewBindGroupInput<'a> {
     params: &'a wgpu::Buffer,
-    view: &'a wgpu::Buffer,
-    sun: &'a wgpu::Buffer,
     transmittance: &'a wgpu::TextureView,
     irradiance: &'a wgpu::TextureView,
     scattering: &'a wgpu::TextureView,
     single_rayleigh: &'a wgpu::TextureView,
     sampler: &'a wgpu::Sampler,
     phase_lut: &'a wgpu::TextureView,
+    sky_view: &'a wgpu::TextureView,
+}
+
+fn sky_view_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    input: SkyViewBindGroupInput<'_>,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("bruneton.sky_view.bg"),
+        layout,
+        entries: &[
+            buffer_binding(0, input.params),
+            texture_binding(1, input.transmittance),
+            texture_binding(2, input.irradiance),
+            texture_binding(3, input.scattering),
+            texture_binding(4, input.single_rayleigh),
+            sampler_binding(5, input.sampler),
+            texture_binding(6, input.phase_lut),
+            texture_binding(7, input.sky_view),
+        ],
+    })
+}
+
+struct RenderBindGroupInput<'a> {
+    params: &'a wgpu::Buffer,
+    view: &'a wgpu::Buffer,
+    sun: &'a wgpu::Buffer,
+    transmittance: &'a wgpu::TextureView,
+    sampler: &'a wgpu::Sampler,
+    sky_view: &'a wgpu::TextureView,
 }
 
 fn render_bind_group(
@@ -1231,11 +1306,8 @@ fn render_bind_group(
             buffer_binding(1, input.view),
             buffer_binding(2, input.sun),
             texture_binding(3, input.transmittance),
-            texture_binding(4, input.irradiance),
-            texture_binding(5, input.scattering),
-            texture_binding(6, input.single_rayleigh),
-            sampler_binding(7, input.sampler),
-            texture_binding(8, input.phase_lut),
+            sampler_binding(4, input.sampler),
+            texture_binding(5, input.sky_view),
         ],
     })
 }

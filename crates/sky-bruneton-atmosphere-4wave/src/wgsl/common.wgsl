@@ -421,7 +421,7 @@ fn sky_view_uv_from_dir(dir_in: vec3<f32>, dims: vec2<f32>) -> vec2<f32> {
     return sky_view_params_to_uv(view_zenith_cos_angle, light_view_cos_angle, intersect_ground, dims);
 }
 
-const ATM_SCATTERING_MU_S_SIZE: u32 = 128u;
+const ATM_SCATTERING_MU_S_SIZE: u32 = 64u;
 const ATM_SCATTERING_NU_SIZE: u32 = 64u;
 const ATM_SCATTERING_SKY_FRACTION: f32 = 0.75;
 const ATM_SCATTERING_GROUND_FRACTION: f32 = 0.25;

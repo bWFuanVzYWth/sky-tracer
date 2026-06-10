@@ -101,6 +101,16 @@ mod tests {
     }
 
     #[test]
+    fn sky_view_wgsl_composes() -> Result<(), String> {
+        let source = format!(
+            "{}\n\n{}",
+            crate::COMMON_WGSL,
+            include_str!("wgsl/sky_view.comp.wgsl")
+        );
+        compose_wgsl(&source, "bruneton/sky_view_combined.wgsl")
+    }
+
+    #[test]
     fn render_sky_wgsl_composes() -> Result<(), String> {
         let source = format!(
             "{}\n\n{}\n\n{}",
