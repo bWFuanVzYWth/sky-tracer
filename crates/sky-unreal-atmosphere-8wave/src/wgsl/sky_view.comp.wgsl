@@ -2,9 +2,8 @@
 @group(0) @binding(1) var transmittance_lut: texture_2d<f32>;
 @group(0) @binding(2) var lut_sampler: sampler;
 @group(0) @binding(3) var multi_scattering_lut: texture_2d<f32>;
-@group(0) @binding(4) var ground_irradiance_lut: texture_2d<f32>;
-@group(0) @binding(5) var sky_view_out: texture_storage_2d<rgba16float, write>;
-@group(0) @binding(6) var aerosol_phase_lut: texture_2d_array<f32>;
+@group(0) @binding(4) var sky_view_out: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(5) var aerosol_phase_lut: texture_2d_array<f32>;
 
 const SKY_VIEW_STEPS: u32 = 32u;
 
@@ -42,16 +41,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (segment.hits_ground) {
         let ground_pos = origin + ray_dir * segment.t_ground_km;
         let ground_normal = normalize(ground_pos);
-        let ground_irradiance_transfer = ground_irradiance_from_lut(
-            ground_irradiance_lut,
+        let ground_sun_mu = dot(ground_normal, hp.sun_dir);
+        let sun_cos = max(ground_sun_mu, 0.0);
+        var ground_radiance = vec4<f32>(0.0);
+        if (sun_cos > 0.0) {
+            ground_radiance += transmittance_from_lut(
+                transmittance_lut,
+                lut_sampler,
+                sun_cos,
+                0.0,
+            ) * (sun_cos * ATM_INV_PI);
+        }
+        ground_radiance += multi_scattering_from_lut(
+            multi_scattering_lut,
             lut_sampler,
-            hp.earth_radius_km,
-            dot(ground_normal, hp.sun_dir),
+            ground_sun_mu,
+            0.0,
         );
         radiance += hp.sun_spectral_irradiance
-            * ground_irradiance_transfer
+            * ground_radiance
             * hp.ground_albedo_spectral
-            * ATM_INV_PI
             * scatter.transmittance;
     }
 

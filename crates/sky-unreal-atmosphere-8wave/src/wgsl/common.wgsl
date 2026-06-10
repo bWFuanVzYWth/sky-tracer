@@ -242,28 +242,6 @@ fn multi_scattering_from_lut(
     return textureSampleLevel(lut, samp, uv, 0.0);
 }
 
-fn ground_irradiance_uv_from_r_mu_s(r: f32, mu_s: f32, dims: vec2<f32>) -> vec2<f32> {
-    let bottom = hp.earth_radius_km + ATM_PLANET_RADIUS_OFFSET_KM;
-    let top = hp.earth_radius_km + hp.atmosphere_thickness_km - ATM_PLANET_RADIUS_OFFSET_KM;
-    let x_mu_s = clamp(mu_s * 0.5 + 0.5, 0.0, 1.0);
-    let x_r = clamp((r - bottom) / max(top - bottom, 1.0e-6), 0.0, 1.0);
-    return vec2<f32>(
-        atm_from_unit_to_sub_uvs(x_mu_s, dims.x),
-        atm_from_unit_to_sub_uvs(x_r, dims.y),
-    );
-}
-
-fn ground_irradiance_from_lut(
-    lut: texture_2d<f32>,
-    samp: sampler,
-    r: f32,
-    mu_s: f32,
-) -> vec4<f32> {
-    let dims = vec2<f32>(textureDimensions(lut));
-    let uv = ground_irradiance_uv_from_r_mu_s(r, mu_s, dims);
-    return textureSampleLevel(lut, samp, uv, 0.0);
-}
-
 fn linear_rec2020_from_spectral(l: vec4<f32>) -> vec3<f32> {
     // 410/440/480/520 nm low group -> scene-linear Rec.2020. The columns are direct CIE 1931
     // 2 degree CMF samples transformed to Rec.2020 and multiplied by the

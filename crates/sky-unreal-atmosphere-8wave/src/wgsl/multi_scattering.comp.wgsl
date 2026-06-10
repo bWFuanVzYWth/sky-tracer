@@ -3,7 +3,6 @@
 @group(0) @binding(2) var lut_sampler: sampler;
 @group(0) @binding(3) var multi_scattering_out: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(4) var aerosol_phase_lut: texture_2d_array<f32>;
-@group(0) @binding(5) var ground_irradiance_lut: texture_2d<f32>;
 
 const MULTI_SCATTERING_RAY_STEPS: u32 = 20u;
 const MULTI_SCATTERING_SQRT_DIR_SAMPLES: u32 = 8u;
@@ -44,13 +43,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     var multi_scat_as1_sum = vec4<f32>(0.0);
     var in_scattered_luminance_sum = vec4<f32>(0.0);
+    var ground_feedback_sum = vec4<f32>(0.0);
     for (var i: u32 = 0u; i < MULTI_SCATTERING_DIR_SAMPLES; i = i + 1u) {
         let dir = uniform_sphere_dir_y_up(i);
         let segment = atmosphere_ray_limit(origin, dir);
         if (segment.t_max_km >= 0.0) {
-            let result = integrate_scattered_luminance_direct_with_ground_irradiance(
+            let result = integrate_scattered_luminance_direct(
                 transmittance_lut,
-                ground_irradiance_lut,
                 lut_sampler,
                 origin,
                 dir,
@@ -63,6 +62,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             );
             multi_scat_as1_sum += result.multi_scat_as1;
             in_scattered_luminance_sum += result.radiance;
+            if (segment.hits_ground) {
+                ground_feedback_sum += result.transmittance * hp.ground_albedo_spectral;
+            }
         }
     }
 
@@ -70,7 +72,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let inv_sample_count = 1.0 / f32(MULTI_SCATTERING_DIR_SAMPLES);
     let multi_scat_as1 = multi_scat_as1_sum * (sphere_solid_angle * inv_sample_count * ATM_PHASE_ISOTROPIC);
     let in_scattered = in_scattered_luminance_sum * (sphere_solid_angle * inv_sample_count * ATM_PHASE_ISOTROPIC);
-    let transfer = in_scattered / max(vec4<f32>(1.0) - multi_scat_as1, vec4<f32>(1.0e-3));
+    let ground_feedback = ground_feedback_sum * (sphere_solid_angle * inv_sample_count * ATM_PHASE_ISOTROPIC);
+    let feedback = min(multi_scat_as1 + ground_feedback, vec4<f32>(0.9));
+    let transfer = in_scattered / max(vec4<f32>(1.0) - feedback, vec4<f32>(0.1));
 
     textureStore(multi_scattering_out, vec2<i32>(gid.xy), vec4<f32>(max(transfer.rgb, vec3<f32>(0.0)), max(transfer.a, 0.0)));
 }
