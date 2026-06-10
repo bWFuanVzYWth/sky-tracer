@@ -115,7 +115,8 @@ impl BrunetonAtmosphereContext {
                 sun: &sun_buffer,
                 transmittance: &resources.transmittance.view,
                 irradiance: &resources.irradiance.view,
-                multiple_density: &resources.scattering_density_accum.view,
+                scattering: &resources.scattering.view,
+                single_rayleigh: &resources.single_rayleigh.view,
                 sampler: &sampler,
                 phase_lut: &resources.phase_lut.view,
             },
@@ -255,28 +256,6 @@ impl BrunetonAtmosphereContext {
                 SCATTERING_SIZE,
                 "bruneton.scattering_density.pass",
             );
-            dispatch_compute_3d(
-                encoder,
-                &self.pipelines.scattering_density_accumulation,
-                &scattering_density_accumulation_bind_group(
-                    device,
-                    &self.layouts.scattering_density_accumulation,
-                    ScatteringDensityAccumulationBindGroupInput {
-                        order: order_buffer,
-                        density: &self.resources.scattering_density.view,
-                        density_accum: &self.resources.scattering_density_accum.view,
-                        density_accum_out: &self.resources.scattering_density_accum_next.view,
-                    },
-                ),
-                SCATTERING_SIZE,
-                "bruneton.scattering_density_accumulation.pass",
-            );
-            copy_texture_3d(
-                encoder,
-                &self.resources.scattering_density_accum_next.texture,
-                &self.resources.scattering_density_accum.texture,
-                SCATTERING_SIZE,
-            );
             dispatch_compute_2d(
                 encoder,
                 &self.pipelines.indirect_irradiance,
@@ -400,8 +379,6 @@ struct Resources {
     single_mie: Texture3d,
     delta_scattering: Texture3d,
     scattering_density: Texture3d,
-    scattering_density_accum: Texture3d,
-    scattering_density_accum_next: Texture3d,
     phase_lut: TextureArray,
 }
 
@@ -421,16 +398,6 @@ impl Resources {
                 device,
                 SCATTERING_SIZE,
                 "bruneton.scattering_density",
-            ),
-            scattering_density_accum: Texture3d::new(
-                device,
-                SCATTERING_SIZE,
-                "bruneton.scattering_density_accum",
-            ),
-            scattering_density_accum_next: Texture3d::new(
-                device,
-                SCATTERING_SIZE,
-                "bruneton.scattering_density_accum_next",
             ),
             phase_lut: TextureArray::phase_lut(device, queue),
         }
@@ -566,7 +533,6 @@ struct Layouts {
     single_scattering: wgpu::BindGroupLayout,
     indirect_irradiance: wgpu::BindGroupLayout,
     scattering_density: wgpu::BindGroupLayout,
-    scattering_density_accumulation: wgpu::BindGroupLayout,
     multiple_scattering: wgpu::BindGroupLayout,
     render: wgpu::BindGroupLayout,
 }
@@ -634,17 +600,6 @@ impl Layouts {
                     storage_3d_entry(8),
                 ],
             }),
-            scattering_density_accumulation: device.create_bind_group_layout(
-                &wgpu::BindGroupLayoutDescriptor {
-                    label: Some("bruneton.scattering_density_accumulation.bgl"),
-                    entries: &[
-                        uniform_entry(0, wgpu::ShaderStages::COMPUTE),
-                        texture_3d_entry(1, wgpu::ShaderStages::COMPUTE),
-                        texture_3d_entry(2, wgpu::ShaderStages::COMPUTE),
-                        storage_3d_entry(3),
-                    ],
-                },
-            ),
             multiple_scattering: device.create_bind_group_layout(
                 &wgpu::BindGroupLayoutDescriptor {
                     label: Some("bruneton.multiple_scattering.bgl"),
@@ -668,8 +623,9 @@ impl Layouts {
                     texture_2d_entry(3, wgpu::ShaderStages::FRAGMENT),
                     texture_2d_entry(4, wgpu::ShaderStages::FRAGMENT),
                     texture_3d_entry(5, wgpu::ShaderStages::FRAGMENT),
-                    sampler_entry(6, wgpu::ShaderStages::FRAGMENT),
-                    texture_2d_array_entry(7, wgpu::ShaderStages::FRAGMENT),
+                    texture_3d_entry(6, wgpu::ShaderStages::FRAGMENT),
+                    sampler_entry(7, wgpu::ShaderStages::FRAGMENT),
+                    texture_2d_array_entry(8, wgpu::ShaderStages::FRAGMENT),
                 ],
             }),
         }
@@ -682,7 +638,6 @@ struct Pipelines {
     single_scattering: wgpu::ComputePipeline,
     indirect_irradiance: wgpu::ComputePipeline,
     scattering_density: wgpu::ComputePipeline,
-    scattering_density_accumulation: wgpu::ComputePipeline,
     multiple_scattering: wgpu::ComputePipeline,
     render: wgpu::RenderPipeline,
 }
@@ -741,12 +696,6 @@ impl Pipelines {
                     crate::INSCATTER_WGSL,
                     include_str!("wgsl/scattering_density.comp.wgsl")
                 ),
-            ),
-            scattering_density_accumulation: compute_pipeline(
-                device,
-                &layouts.scattering_density_accumulation,
-                "bruneton.scattering_density_accumulation.pipeline",
-                include_str!("wgsl/scattering_density_accumulation.comp.wgsl"),
             ),
             multiple_scattering: compute_pipeline(
                 device,
@@ -1227,30 +1176,6 @@ fn scattering_density_bind_group(
     })
 }
 
-struct ScatteringDensityAccumulationBindGroupInput<'a> {
-    order: &'a wgpu::Buffer,
-    density: &'a wgpu::TextureView,
-    density_accum: &'a wgpu::TextureView,
-    density_accum_out: &'a wgpu::TextureView,
-}
-
-fn scattering_density_accumulation_bind_group(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    input: ScatteringDensityAccumulationBindGroupInput<'_>,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("bruneton.scattering_density_accumulation.bg"),
-        layout,
-        entries: &[
-            buffer_binding(0, input.order),
-            texture_binding(1, input.density),
-            texture_binding(2, input.density_accum),
-            texture_binding(3, input.density_accum_out),
-        ],
-    })
-}
-
 struct MultipleScatteringBindGroupInput<'a> {
     params: &'a wgpu::Buffer,
     transmittance: &'a wgpu::TextureView,
@@ -1287,7 +1212,8 @@ struct RenderBindGroupInput<'a> {
     sun: &'a wgpu::Buffer,
     transmittance: &'a wgpu::TextureView,
     irradiance: &'a wgpu::TextureView,
-    multiple_density: &'a wgpu::TextureView,
+    scattering: &'a wgpu::TextureView,
+    single_rayleigh: &'a wgpu::TextureView,
     sampler: &'a wgpu::Sampler,
     phase_lut: &'a wgpu::TextureView,
 }
@@ -1306,9 +1232,10 @@ fn render_bind_group(
             buffer_binding(2, input.sun),
             texture_binding(3, input.transmittance),
             texture_binding(4, input.irradiance),
-            texture_binding(5, input.multiple_density),
-            sampler_binding(6, input.sampler),
-            texture_binding(7, input.phase_lut),
+            texture_binding(5, input.scattering),
+            texture_binding(6, input.single_rayleigh),
+            sampler_binding(7, input.sampler),
+            texture_binding(8, input.phase_lut),
         ],
     })
 }

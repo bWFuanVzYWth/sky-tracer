@@ -8,13 +8,13 @@ struct VertexOutput {
 @group(0) @binding(2) var<uniform> sun: CaSun;
 @group(0) @binding(3) var transmittance_lut: texture_2d<f32>;
 @group(0) @binding(4) var irradiance_lut: texture_2d<f32>;
-@group(0) @binding(5) var multiple_density_lut: texture_3d<f32>;
-@group(0) @binding(6) var lut_sampler: sampler;
-@group(0) @binding(7) var aerosol_phase_lut: texture_2d_array<f32>;
+@group(0) @binding(5) var scattering_lut: texture_3d<f32>;
+@group(0) @binding(6) var single_rayleigh_lut: texture_3d<f32>;
+@group(0) @binding(7) var lut_sampler: sampler;
+@group(0) @binding(8) var aerosol_phase_lut: texture_2d_array<f32>;
 
 const BRUNETON_RENDER_TRANSMITTANCE_STEPS: u32 = 32u;
 const BRUNETON_RENDER_SINGLE_MIE_STEPS: u32 = 64u;
-const BRUNETON_RENDER_MULTIPLE_SCATTERING_STEPS: u32 = 64u;
 
 @vertex
 fn vertex(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
@@ -95,39 +95,6 @@ fn bruneton_runtime_single_scattering(
     return radiance;
 }
 
-fn bruneton_runtime_multiple_scattering(
-    ray_origin_km: vec3<f32>,
-    ray_dir: vec3<f32>,
-    sun_dir: vec3<f32>,
-    t_max_km: f32,
-) -> vec4<f32> {
-    let dt = max(t_max_km, 0.0) / f32(BRUNETON_RENDER_MULTIPLE_SCATTERING_STEPS);
-    var transmittance_to_sample = vec4<f32>(1.0);
-    var radiance = vec4<f32>(0.0);
-
-    for (var i: u32 = 0u; i < BRUNETON_RENDER_MULTIPLE_SCATTERING_STEPS; i = i + 1u) {
-        let t = (f32(i) + 0.5) * dt;
-        let pos = ray_origin_km + ray_dir * min(t, t_max_km);
-        let r = length(pos);
-        let up = pos / max(r, 1.0e-6);
-        let altitude = max(r - hp.earth_radius_km, 0.0);
-        let mu = dot(up, ray_dir);
-        let mu_s = dot(up, sun_dir);
-        let nu = dot(ray_dir, sun_dir);
-
-        let coeffs = get_atmosphere_collision_coefficients(hp, altitude);
-        let step_t = exp(-dt * coeffs.extinction);
-        let safe_ext = max(coeffs.extinction, vec4<f32>(1.0e-7));
-        let segment_weight = (vec4<f32>(1.0) - step_t) / safe_ext;
-        let source = bruneton_scattering_from_lut(multiple_density_lut, lut_sampler, r, mu, mu_s, nu);
-
-        radiance += transmittance_to_sample * source * segment_weight;
-        transmittance_to_sample *= step_t;
-    }
-
-    return radiance;
-}
-
 fn bruneton_sky_spectral_radiance(ray_origin_km_in: vec3<f32>, ray_dir_in: vec3<f32>) -> vec4<f32> {
     let ray_dir = normalize(ray_dir_in);
     var ray_origin_km = move_to_top_atmosphere(ray_origin_km_in, ray_dir);
@@ -136,13 +103,22 @@ fn bruneton_sky_spectral_radiance(ray_origin_km_in: vec3<f32>, ray_dir_in: vec3<
         return vec4<f32>(0.0);
     }
 
+    let r = length(ray_origin_km);
+    let up = ray_origin_km / max(r, 1.0e-6);
+    let mu = dot(up, ray_dir);
+    let mu_s = dot(up, hp.sun_dir);
     let nu = dot(ray_dir, hp.sun_dir);
-    let multiple_scattering = bruneton_runtime_multiple_scattering(
-        ray_origin_km,
-        ray_dir,
-        hp.sun_dir,
-        segment.t_max_km,
+    let accumulated_reduced = bruneton_scattering_from_lut(scattering_lut, lut_sampler, r, mu, mu_s, nu);
+    let single_rayleigh_reduced = bruneton_scattering_from_lut(
+        single_rayleigh_lut,
+        lut_sampler,
+        r,
+        mu,
+        mu_s,
+        nu,
     );
+    let multiple_scattering = max(accumulated_reduced - single_rayleigh_reduced, vec4<f32>(0.0))
+        * molecular_phase_function(nu);
     let single_scattering = bruneton_runtime_single_scattering(
         ray_origin_km,
         ray_dir,

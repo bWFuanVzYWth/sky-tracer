@@ -91,14 +91,6 @@ mod tests {
     }
 
     #[test]
-    fn scattering_density_accumulation_wgsl_composes() -> Result<(), String> {
-        compose_wgsl(
-            include_str!("wgsl/scattering_density_accumulation.comp.wgsl"),
-            "bruneton/scattering_density_accumulation.wgsl",
-        )
-    }
-
-    #[test]
     fn multiple_scattering_wgsl_composes() -> Result<(), String> {
         let source = format!(
             "{}\n\n{}",
