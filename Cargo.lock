@@ -1875,6 +1875,7 @@ dependencies = [
  "sky-core",
  "sky-unreal-atmosphere-3wave",
  "sky-unreal-atmosphere-4wave",
+ "sky-unreal-atmosphere-8wave",
  "wgpu",
  "winit",
 ]
@@ -1891,6 +1892,16 @@ dependencies = [
 
 [[package]]
 name = "sky-unreal-atmosphere-4wave"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "glam",
+ "naga",
+ "wgpu",
+]
+
+[[package]]
+name = "sky-unreal-atmosphere-8wave"
 version = "0.1.0"
 dependencies = [
  "bytemuck",

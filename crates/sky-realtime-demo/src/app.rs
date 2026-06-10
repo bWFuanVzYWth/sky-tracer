@@ -19,6 +19,7 @@ use crate::passes::bruneton_atmosphere_4wave::BrunetonAtmosphere4WaveExperiment;
 use crate::passes::bruneton_atmosphere_8wave::BrunetonAtmosphere8WaveExperiment;
 use crate::passes::unreal_atmosphere_3wave::UnrealAtmosphere3WaveExperiment;
 use crate::passes::unreal_atmosphere_4wave::UnrealAtmosphere4WaveExperiment;
+use crate::passes::unreal_atmosphere_8wave::UnrealAtmosphere8WaveExperiment;
 use crate::view::ViewController;
 
 pub struct RunConfig {
@@ -32,6 +33,8 @@ pub enum ExperimentKind {
     Unreal3Wave,
     #[value(name = "unreal-4wave", alias = "unreal4-wave")]
     Unreal4Wave,
+    #[value(name = "unreal-8wave", alias = "unreal8-wave")]
+    Unreal8Wave,
     #[value(name = "bruneton-4wave", alias = "bruneton4-wave")]
     Bruneton4Wave,
     #[value(name = "bruneton-8wave", alias = "bruneton8-wave")]
@@ -196,6 +199,7 @@ impl ApplicationHandler for DemoApp {
         let required_features = match self.experiment_kind {
             ExperimentKind::Unreal3Wave => sky_unreal_atmosphere_3wave::REQUIRED_FEATURES,
             ExperimentKind::Unreal4Wave => sky_unreal_atmosphere_4wave::REQUIRED_FEATURES,
+            ExperimentKind::Unreal8Wave => sky_unreal_atmosphere_8wave::REQUIRED_FEATURES,
             ExperimentKind::Bruneton4Wave => sky_bruneton_atmosphere_4wave::REQUIRED_FEATURES,
             ExperimentKind::Bruneton8Wave => sky_bruneton_atmosphere_8wave::REQUIRED_FEATURES,
         };
@@ -240,6 +244,14 @@ impl ApplicationHandler for DemoApp {
                 }
             },
             ExperimentKind::Unreal4Wave => match UnrealAtmosphere4WaveExperiment::new(init) {
+                Ok(experiment) => Box::new(experiment),
+                Err(error) => {
+                    self.init_error = Some(error);
+                    event_loop.exit();
+                    return;
+                }
+            },
+            ExperimentKind::Unreal8Wave => match UnrealAtmosphere8WaveExperiment::new(init) {
                 Ok(experiment) => Box::new(experiment),
                 Err(error) => {
                     self.init_error = Some(error);
