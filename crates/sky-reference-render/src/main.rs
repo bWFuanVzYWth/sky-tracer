@@ -1,6 +1,5 @@
 use std::error::Error;
 use std::fs::File;
-use std::io::{Error as IoError, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -11,12 +10,14 @@ use sky_core::asset::{
 use sky_core::atmosphere::SceneData;
 use sky_core::data::load_scene_data;
 use sky_core::spectrum::{
-    CIE_1931_2DEG_CMF_NAME, CIE_1931_2DEG_CMF_SOURCE, LINEAR_SRGB_D65_NAME, SpectralBand,
-    SpectralRgbConverter,
+    CIE_1931_2DEG_CMF_NAME, CIE_1931_2DEG_CMF_SOURCE, LINEAR_SRGB_D65_NAME, SpectralRgbConverter,
 };
-use sky_offline::config::{OutputProjection, RenderConfig};
-use sky_offline::film::Film;
-use sky_offline::integrator::render;
+use sky_spectral_path_tracer::config::{OutputProjection, RenderConfig};
+use sky_spectral_path_tracer::integrator::render;
+
+mod film_output;
+
+use film_output::{read_film_from_band_exrs, write_outputs, write_rgb_outputs};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Offline spectral OPAC atmosphere path tracer")]
@@ -58,18 +59,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     let total_start = Instant::now();
     let cli = Cli::parse();
     let (width, height) = resolve_dimensions(cli.width, cli.height, cli.sky_view_lut);
+    let out_dir = cli.out;
+    let data_dir = cli.data_dir;
+    let png_exposure = cli.png_exposure;
     let config = RenderConfig {
         width,
         height,
         spp: cli.spp,
         seed: cli.seed,
-        out_dir: cli.out,
-        data_dir: cli.data_dir,
         sun_elevation_deg: cli.sun_elevation_deg,
         sun_azimuth_deg: cli.sun_azimuth_deg,
         observer_altitude_km: cli.observer_altitude_km,
         direct_light_samples: cli.direct_light_samples,
-        png_exposure: cli.png_exposure,
         output_projection: if cli.sky_view_lut {
             OutputProjection::SkyViewLut
         } else {
@@ -78,24 +79,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
 
     let load_start = Instant::now();
-    let scene = load_scene_data(
-        &config.data_dir,
-        config.sun_elevation_deg,
-        config.sun_azimuth_deg,
-    )?;
+    let scene = load_scene_data(&data_dir, config.sun_elevation_deg, config.sun_azimuth_deg)?;
     let load_elapsed = load_start.elapsed();
 
     if cli.rebuild_rgb_only {
         let output_start = Instant::now();
-        let film = read_film_from_band_exrs(&config.out_dir, &scene.bands)?;
-        film.write_rgb_outputs(&config.out_dir, &scene.bands, config.png_exposure)?;
-        update_asset_colorimetry(&config.out_dir, &scene)?;
+        let film = read_film_from_band_exrs(&out_dir, &scene.bands)?;
+        write_rgb_outputs(&film, &out_dir, &scene.bands, png_exposure)?;
+        update_asset_colorimetry(&out_dir, &scene)?;
         let output_elapsed = output_start.elapsed();
         let total_elapsed = total_start.elapsed();
         println!(
             "rebuilt rgb outputs from {} band EXRs in {}",
             scene.bands.len(),
-            config.out_dir.display()
+            out_dir.display()
         );
         println!(
             "timing: load={} output={} total={}",
@@ -117,8 +114,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let render_elapsed = render_start.elapsed();
 
     let output_start = Instant::now();
-    film.write_outputs(&config.out_dir, &scene.bands, config.png_exposure)?;
-    write_asset_manifest(&config, &scene)?;
+    write_outputs(&film, &out_dir, &scene.bands, png_exposure)?;
+    write_asset_manifest(&config, &out_dir, &scene)?;
     let output_elapsed = output_start.elapsed();
     let total_elapsed = total_start.elapsed();
 
@@ -128,7 +125,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         film.height(),
         config.output_projection.label(),
         config.spp,
-        config.out_dir.display()
+        out_dir.display()
     );
     println!(
         "timing: load={} render={} output={} total={}",
@@ -156,77 +153,11 @@ fn resolve_dimensions(
     )
 }
 
-fn read_film_from_band_exrs(
+fn write_asset_manifest(
+    config: &RenderConfig,
     out_dir: &Path,
-    bands: &[SpectralBand],
-) -> Result<Film, Box<dyn Error>> {
-    if bands.is_empty() {
-        return Err(IoError::new(ErrorKind::InvalidInput, "no spectral bands to rebuild").into());
-    }
-
-    let mut width = 0;
-    let mut height = 0;
-    let mut values = Vec::new();
-
-    for (band_index, band) in bands.iter().enumerate() {
-        let path = out_dir
-            .join("bands")
-            .join(format!("sky_{:03.0}nm.exr", band.center_nm));
-        let image = read_band_exr(&path)?;
-        if band_index == 0 {
-            width = image.width;
-            height = image.height;
-            values.resize(width * height * bands.len(), 0.0);
-        } else if image.width != width || image.height != height {
-            return Err(IoError::new(
-                ErrorKind::InvalidData,
-                format!(
-                    "band EXR {} has dimensions {}x{}, expected {}x{}",
-                    path.display(),
-                    image.width,
-                    image.height,
-                    width,
-                    height
-                ),
-            )
-            .into());
-        }
-
-        for (pixel, value) in image.pixels.iter().enumerate() {
-            values[pixel * bands.len() + band_index] = *value;
-        }
-    }
-
-    Ok(Film::from_values(width, height, bands.len(), values))
-}
-
-#[derive(Debug)]
-struct BandExrImage {
-    width: usize,
-    height: usize,
-    pixels: Vec<f32>,
-}
-
-fn read_band_exr(path: &Path) -> Result<BandExrImage, Box<dyn Error>> {
-    let image = exr::prelude::read_first_rgba_layer_from_file(
-        path,
-        |resolution, _channels| {
-            let width = resolution.width();
-            let height = resolution.height();
-            BandExrImage {
-                width,
-                height,
-                pixels: vec![0.0; width * height],
-            }
-        },
-        |image, position, (r, _g, _b, _a): (f32, f32, f32, f32)| {
-            image.pixels[position.y() * image.width + position.x()] = r;
-        },
-    )?;
-    Ok(image.layer_data.channel_data.pixels)
-}
-
-fn write_asset_manifest(config: &RenderConfig, scene: &SceneData) -> Result<(), Box<dyn Error>> {
+    scene: &SceneData,
+) -> Result<(), Box<dyn Error>> {
     let band_exrs = scene
         .bands
         .iter()
@@ -262,7 +193,7 @@ fn write_asset_manifest(config: &RenderConfig, scene: &SceneData) -> Result<(), 
         ),
     };
     manifest.colorimetry = Some(colorimetry_from_scene(scene));
-    let path = config.out_dir.join("asset.json");
+    let path = out_dir.join("asset.json");
     let file = File::create(path)?;
     serde_json::to_writer_pretty(file, &manifest)?;
     Ok(())

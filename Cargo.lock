@@ -1810,33 +1810,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
-name = "sky-bake"
-version = "0.1.0"
-dependencies = [
- "clap",
- "exr",
- "serde_json",
- "sky-core",
- "sky-offline",
-]
-
-[[package]]
 name = "sky-core"
 version = "0.1.0"
 dependencies = [
  "serde",
-]
-
-[[package]]
-name = "sky-offline"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "exr",
- "image",
- "pollster",
- "sky-core",
- "wgpu",
 ]
 
 [[package]]
@@ -1857,6 +1834,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "sky-reference-render"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "exr",
+ "image",
+ "serde_json",
+ "sky-core",
+ "sky-spectral-path-tracer",
+]
+
+[[package]]
+name = "sky-spectral-path-tracer"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "pollster",
+ "sky-core",
+ "wgpu",
+]
+
+[[package]]
 name = "sky-unreal-atmosphere-8wave"
 version = "0.1.0"
 dependencies = [
@@ -1864,6 +1863,16 @@ dependencies = [
  "glam",
  "naga",
  "wgpu",
+]
+
+[[package]]
+name = "sky-wavelength-optimizer"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "exr",
+ "serde_json",
+ "sky-core",
 ]
 
 [[package]]

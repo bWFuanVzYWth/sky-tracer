@@ -1,8 +1,9 @@
 [workspace]
 members = [
     "crates/sky-core",
-    "crates/sky-offline",
-    "crates/sky-bake",
+    "crates/sky-spectral-path-tracer",
+    "crates/sky-reference-render",
+    "crates/sky-wavelength-optimizer",
     "crates/sky-unreal-atmosphere-8wave",
     "crates/sky-realtime-demo",
 ]

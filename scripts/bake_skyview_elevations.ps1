@@ -20,7 +20,7 @@ foreach ($elevation in $elevations) {
     }
     $outDir = Join-Path $OutRoot $label
     Write-Host "Baking sky-view LUT elevation=$elevation deg -> $outDir"
-    cargo run -p sky-bake --bin sky-bake --release -- `
+    cargo run -p sky-reference-render --bin sky-reference-render --release -- `
         --sky-view-lut `
         --width $Width `
         --height $Height `
@@ -31,6 +31,6 @@ foreach ($elevation in $elevations) {
         --direct-light-samples $DirectLightSamples `
         --out $outDir
     if ($LASTEXITCODE -ne 0) {
-        throw "sky-bake failed for elevation=$elevation with exit code $LASTEXITCODE"
+        throw "sky-reference-render failed for elevation=$elevation with exit code $LASTEXITCODE"
     }
 }

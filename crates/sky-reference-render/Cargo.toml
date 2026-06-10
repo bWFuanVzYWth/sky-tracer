@@ -1,12 +1,12 @@
 [package]
-name = "sky-offline"
+name = "sky-reference-render"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-bytemuck = { workspace = true }
+clap = { workspace = true }
 exr = { workspace = true }
 image = { workspace = true }
-pollster = { workspace = true }
+serde_json = { workspace = true }
 sky-core = { path = "../sky-core" }
-wgpu = { workspace = true }
+sky-spectral-path-tracer = { path = "../sky-spectral-path-tracer" }
