@@ -1,7 +1,7 @@
 @group(0) @binding(0) var<uniform> hp: HillaireParams;
 @group(0) @binding(1) var transmittance_out: texture_storage_2d<rgba16float, write>;
 
-const TRANSMITTANCE_STEPS: u32 = 40u;
+const TRANSMITTANCE_STEPS: u32 = 64u;
 
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {

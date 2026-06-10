@@ -4,7 +4,7 @@
 @group(0) @binding(3) var multi_scattering_out: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(4) var aerosol_phase_lut: texture_2d_array<f32>;
 
-const MULTI_SCATTERING_RAY_STEPS: u32 = 20u;
+const MULTI_SCATTERING_RAY_STEPS: u32 = 32u;
 const MULTI_SCATTERING_SQRT_DIR_SAMPLES: u32 = 8u;
 const MULTI_SCATTERING_DIR_SAMPLES: u32 = 64u;
 
@@ -34,11 +34,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         clamp(atm_from_sub_uvs_to_unit(uv.y, dims.y), 0.0, 1.0),
     );
 
-    let sun_mu = uv.x * 2.0 - 1.0;
+    let params = multi_scattering_params_from_uv(uv);
+    let sun_mu = params.x;
     let sun_dir = normalize(vec3<f32>(sqrt(max(1.0 - sun_mu * sun_mu, 0.0)), sun_mu, 0.0));
-    let view_height = hp.earth_radius_km
-        + clamp(uv.y + ATM_PLANET_RADIUS_OFFSET_KM / hp.atmosphere_thickness_km, 0.0, 1.0)
-        * (hp.atmosphere_thickness_km - ATM_PLANET_RADIUS_OFFSET_KM);
+    let view_height = hp.earth_radius_km + params.y * hp.atmosphere_thickness_km;
     let origin = vec3<f32>(0.0, view_height, 0.0);
 
     var multi_scat_as1_sum = vec4<f32>(0.0);

@@ -10,6 +10,7 @@ const ATM_SUN_COS_THETA_MAX: f32 = 0.999989;
 const ATM_PLANET_RADIUS_OFFSET_KM: f32 = 0.01;
 const ATM_SKY_VIEW_SKY_FRACTION: f32 = 0.75;
 const ATM_SKY_VIEW_GROUND_FRACTION: f32 = 0.25;
+const ATM_MULTI_SCATTERING_ALTITUDE_SCALE_KM: f32 = 8.0;
 
 struct HillaireSpecies {
     sigma_sca: vec4<f32>,
@@ -224,6 +225,55 @@ fn transmittance_from_lut(
     return textureSampleLevel(lut, samp, transmittance_uv_from_params(cos_theta, normalized_altitude), 0.0);
 }
 
+fn multi_scattering_sun_mu_from_u(u: f32) -> f32 {
+    let x = clamp(u, 0.0, 1.0) * 2.0 - 1.0;
+    return x * abs(x);
+}
+
+fn multi_scattering_u_from_sun_mu(sun_mu: f32) -> f32 {
+    let mu = clamp(sun_mu, -1.0, 1.0);
+    let x = select(-sqrt(abs(mu)), sqrt(abs(mu)), mu >= 0.0);
+    return clamp(x * 0.5 + 0.5, 0.0, 1.0);
+}
+
+fn multi_scattering_altitude_bounds_km() -> vec2<f32> {
+    let min_alt = min(ATM_PLANET_RADIUS_OFFSET_KM, hp.atmosphere_thickness_km * 0.25);
+    let max_alt = max(hp.atmosphere_thickness_km - ATM_PLANET_RADIUS_OFFSET_KM, min_alt + 1.0e-3);
+    return vec2<f32>(min_alt, max_alt);
+}
+
+fn multi_scattering_normalized_altitude_from_v(v: f32) -> f32 {
+    let bounds = multi_scattering_altitude_bounds_km();
+    let range = max(bounds.y - bounds.x, 1.0e-3);
+    let cdf_max = max(1.0 - exp(-range / ATM_MULTI_SCATTERING_ALTITUDE_SCALE_KM), 1.0e-6);
+    let cdf = clamp(v, 0.0, 1.0) * cdf_max;
+    let altitude = bounds.x - ATM_MULTI_SCATTERING_ALTITUDE_SCALE_KM * log(max(1.0 - cdf, 1.0e-6));
+    return clamp(altitude / hp.atmosphere_thickness_km, 0.0, 1.0);
+}
+
+fn multi_scattering_v_from_normalized_altitude(normalized_altitude: f32) -> f32 {
+    let bounds = multi_scattering_altitude_bounds_km();
+    let range = max(bounds.y - bounds.x, 1.0e-3);
+    let altitude = clamp(normalized_altitude, 0.0, 1.0) * hp.atmosphere_thickness_km;
+    let h = clamp(altitude, bounds.x, bounds.y) - bounds.x;
+    let cdf_max = max(1.0 - exp(-range / ATM_MULTI_SCATTERING_ALTITUDE_SCALE_KM), 1.0e-6);
+    return clamp((1.0 - exp(-h / ATM_MULTI_SCATTERING_ALTITUDE_SCALE_KM)) / cdf_max, 0.0, 1.0);
+}
+
+fn multi_scattering_params_from_uv(uv: vec2<f32>) -> vec2<f32> {
+    return vec2<f32>(
+        multi_scattering_sun_mu_from_u(uv.x),
+        multi_scattering_normalized_altitude_from_v(uv.y),
+    );
+}
+
+fn multi_scattering_uv_from_params(sun_mu: f32, normalized_altitude: f32) -> vec2<f32> {
+    return vec2<f32>(
+        multi_scattering_u_from_sun_mu(sun_mu),
+        multi_scattering_v_from_normalized_altitude(normalized_altitude),
+    );
+}
+
 fn multi_scattering_from_lut(
     lut: texture_2d<f32>,
     samp: sampler,
@@ -231,10 +281,7 @@ fn multi_scattering_from_lut(
     normalized_altitude: f32,
 ) -> vec4<f32> {
     let dims = vec2<f32>(textureDimensions(lut));
-    let uv_unit = vec2<f32>(
-        clamp(sun_zenith_cos_angle * 0.5 + 0.5, 0.0, 1.0),
-        clamp(normalized_altitude, 0.0, 1.0),
-    );
+    let uv_unit = multi_scattering_uv_from_params(sun_zenith_cos_angle, normalized_altitude);
     let uv = vec2<f32>(
         atm_from_unit_to_sub_uvs(uv_unit.x, dims.x),
         atm_from_unit_to_sub_uvs(uv_unit.y, dims.y),
