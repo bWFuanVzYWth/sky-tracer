@@ -2,7 +2,7 @@ use std::error::Error as StdError;
 use std::fmt;
 
 use bytemuck::{Pod, Zeroable};
-use glam::UVec2;
+use glam::{UVec2, UVec3};
 
 use crate::atmosphere::HillaireAtmosphere;
 use crate::gpu::{Gpu, RenderTargets, SCENE_RADIANCE_FORMAT, ViewFrame};
@@ -18,6 +18,8 @@ const M_TO_KM: f32 = 1.0e-3;
 const TRANSMITTANCE_SIZE: UVec2 = UVec2::new(256, 64);
 const MULTI_SCATTERING_SIZE: UVec2 = UVec2::new(32, 32);
 const SKY_VIEW_SIZE: UVec2 = UVec2::new(256, 256);
+const AERIAL_PERSPECTIVE_SIZE: UVec3 = UVec3::new(32, 32, 32);
+const AERIAL_PERSPECTIVE_MAX_DISTANCE_KM: f32 = 64.0;
 const LUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 #[derive(Clone, Copy, Debug)]
@@ -61,17 +63,55 @@ impl UnrealFrameParams {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AerialPerspectiveConfig {
+    pub size: UVec3,
+    pub max_distance_km: f32,
+}
+
+impl Default for AerialPerspectiveConfig {
+    fn default() -> Self {
+        Self {
+            size: AERIAL_PERSPECTIVE_SIZE,
+            max_distance_km: AERIAL_PERSPECTIVE_MAX_DISTANCE_KM,
+        }
+    }
+}
+
+impl AerialPerspectiveConfig {
+    #[must_use]
+    pub fn normalized(self) -> Self {
+        Self {
+            size: self.size.max(UVec3::ONE),
+            max_distance_km: self.max_distance_km.max(1.0e-3),
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct AerialPerspectiveGpu {
+    max_distance_km: f32,
+    pad: [f32; 3],
+}
+
 pub struct UnrealAtmosphereContext {
     params_buffers: [wgpu::Buffer; SPECTRAL_GROUP_COUNT],
     view_buffer: wgpu::Buffer,
     sun_buffer: wgpu::Buffer,
+    aerial_perspective_buffer: wgpu::Buffer,
     sampler: wgpu::Sampler,
     resources: [Resources; SPECTRAL_GROUP_COUNT],
+    sky_view_rec2020: Texture2d,
+    aerial_perspective_radiance_rec2020: Texture3d,
+    aerial_perspective_transmittance_rec2020: Texture3d,
+    aerial_perspective_config: AerialPerspectiveConfig,
     layouts: Layouts,
     pipelines: Pipelines,
     render_bind_group: wgpu::BindGroup,
     static_precompute_key: Option<StaticPrecomputeKey>,
     sky_view_key: Option<SkyViewKey>,
+    aerial_perspective_key: Option<AerialPerspectiveKey>,
 }
 
 impl UnrealAtmosphereContext {
@@ -81,6 +121,18 @@ impl UnrealAtmosphereContext {
             Resources::new(device, gpu.queue(), SpectralGroup::Low),
             Resources::new(device, gpu.queue(), SpectralGroup::High),
         ];
+        let sky_view_rec2020 = Texture2d::new(device, SKY_VIEW_SIZE, "unreal.sky_view_rec2020");
+        let aerial_perspective_config = AerialPerspectiveConfig::default();
+        let aerial_perspective_radiance_rec2020 = Texture3d::new(
+            device,
+            aerial_perspective_config.size,
+            "unreal.aerial_perspective.radiance_rec2020",
+        );
+        let aerial_perspective_transmittance_rec2020 = Texture3d::new(
+            device,
+            aerial_perspective_config.size,
+            "unreal.aerial_perspective.transmittance_rec2020",
+        );
         let layouts = Layouts::new(device);
         let pipelines = Pipelines::new(device, &layouts);
         let params_buffers = [
@@ -105,6 +157,14 @@ impl UnrealAtmosphereContext {
             "unreal.sun.uniform",
             SunGpu::from_sun(Sun::default()),
         );
+        let aerial_perspective_buffer = uniform_buffer(
+            device,
+            "unreal.aerial_perspective.uniform",
+            AerialPerspectiveGpu {
+                max_distance_km: aerial_perspective_config.max_distance_km,
+                pad: [0.0; 3],
+            },
+        );
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("unreal.lut.sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -122,21 +182,26 @@ impl UnrealAtmosphereContext {
                 transmittance_low: &resources[SpectralGroup::Low.index()].transmittance.view,
                 transmittance_high: &resources[SpectralGroup::High.index()].transmittance.view,
                 sampler: &sampler,
-                sky_view_low: &resources[SpectralGroup::Low.index()].sky_view.view,
-                sky_view_high: &resources[SpectralGroup::High.index()].sky_view.view,
+                sky_view_rec2020: &sky_view_rec2020.view,
             },
         );
         Ok(Self {
             params_buffers,
             view_buffer,
             sun_buffer,
+            aerial_perspective_buffer,
             sampler,
             resources,
+            sky_view_rec2020,
+            aerial_perspective_radiance_rec2020,
+            aerial_perspective_transmittance_rec2020,
+            aerial_perspective_config,
             layouts,
             pipelines,
             render_bind_group,
             static_precompute_key: None,
             sky_view_key: None,
+            aerial_perspective_key: None,
         })
     }
 
@@ -147,6 +212,95 @@ impl UnrealAtmosphereContext {
         encoder: &mut wgpu::CommandEncoder,
         params: &UnrealFrameParams,
     ) {
+        self.update_sky_view(device, queue, encoder, params);
+    }
+
+    pub fn update_static_luts(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        params: &UnrealFrameParams,
+    ) {
+        self.write_frame_buffers(queue, params);
+        self.update_static_luts_after_write(device, encoder, params);
+    }
+
+    pub fn update_sky_view(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        params: &UnrealFrameParams,
+    ) {
+        let low_params = self.write_frame_buffers(queue, params);
+        self.update_static_luts_after_write(device, encoder, params);
+
+        let sky_view_key = SkyViewKey::from_gpu_params(low_params);
+        if self.sky_view_key != Some(sky_view_key) {
+            self.dispatch_sky_view(device, encoder);
+            self.sky_view_key = Some(sky_view_key);
+        }
+    }
+
+    pub fn update_aerial_perspective(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        params: &UnrealFrameParams,
+        config: AerialPerspectiveConfig,
+    ) {
+        let config = config.normalized();
+        let low_params = self.write_frame_buffers(queue, params);
+        self.update_static_luts_after_write(device, encoder, params);
+        self.ensure_aerial_perspective_resources(device, config);
+        queue.write_buffer(
+            &self.aerial_perspective_buffer,
+            0,
+            bytemuck::bytes_of(&AerialPerspectiveGpu {
+                max_distance_km: config.max_distance_km,
+                pad: [0.0; 3],
+            }),
+        );
+
+        let key = AerialPerspectiveKey::from_params(low_params, params, config);
+        if self.aerial_perspective_key != Some(key) {
+            self.dispatch_aerial_perspective(device, encoder);
+            self.aerial_perspective_key = Some(key);
+        }
+    }
+
+    #[must_use]
+    pub const fn sky_view_rec2020(&self) -> &wgpu::TextureView {
+        &self.sky_view_rec2020.view
+    }
+
+    #[must_use]
+    pub const fn sky_view_size(&self) -> UVec2 {
+        SKY_VIEW_SIZE
+    }
+
+    #[must_use]
+    pub const fn aerial_perspective_radiance_rec2020(&self) -> &wgpu::TextureView {
+        &self.aerial_perspective_radiance_rec2020.view
+    }
+
+    #[must_use]
+    pub const fn aerial_perspective_transmittance_rec2020(&self) -> &wgpu::TextureView {
+        &self.aerial_perspective_transmittance_rec2020.view
+    }
+
+    #[must_use]
+    pub const fn aerial_perspective_config(&self) -> AerialPerspectiveConfig {
+        self.aerial_perspective_config
+    }
+
+    fn write_frame_buffers(
+        &self,
+        queue: &wgpu::Queue,
+        params: &UnrealFrameParams,
+    ) -> HillaireParamsGpu {
         let low_params = unreal_params(params, SpectralGroup::Low);
         for group in SpectralGroup::ALL {
             let gpu_params = if matches!(group, SpectralGroup::Low) {
@@ -170,7 +324,15 @@ impl UnrealAtmosphereContext {
             0,
             bytemuck::bytes_of(&SunGpu::from_sun(params.sun)),
         );
+        low_params
+    }
 
+    fn update_static_luts_after_write(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        params: &UnrealFrameParams,
+    ) {
         let static_key = StaticPrecomputeKey::from_params(params);
         if self.static_precompute_key != Some(static_key) {
             for group in SpectralGroup::ALL {
@@ -178,14 +340,7 @@ impl UnrealAtmosphereContext {
             }
             self.static_precompute_key = Some(static_key);
             self.sky_view_key = None;
-        }
-
-        let sky_view_key = SkyViewKey::from_gpu_params(low_params);
-        if self.sky_view_key != Some(sky_view_key) {
-            for group in SpectralGroup::ALL {
-                self.dispatch_sky_view(device, encoder, group);
-            }
-            self.sky_view_key = Some(sky_view_key);
+            self.aerial_perspective_key = None;
         }
     }
 
@@ -250,14 +405,31 @@ impl UnrealAtmosphereContext {
         );
     }
 
-    fn dispatch_sky_view(
-        &self,
+    fn ensure_aerial_perspective_resources(
+        &mut self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
-        group: SpectralGroup,
+        config: AerialPerspectiveConfig,
     ) {
-        let params_buffer = &self.params_buffers[group.index()];
-        let resources = &self.resources[group.index()];
+        if self.aerial_perspective_config == config {
+            return;
+        }
+        self.aerial_perspective_radiance_rec2020 = Texture3d::new(
+            device,
+            config.size,
+            "unreal.aerial_perspective.radiance_rec2020",
+        );
+        self.aerial_perspective_transmittance_rec2020 = Texture3d::new(
+            device,
+            config.size,
+            "unreal.aerial_perspective.transmittance_rec2020",
+        );
+        self.aerial_perspective_config = config;
+        self.aerial_perspective_key = None;
+    }
+
+    fn dispatch_sky_view(&self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder) {
+        let low = &self.resources[SpectralGroup::Low.index()];
+        let high = &self.resources[SpectralGroup::High.index()];
         dispatch_compute_2d(
             encoder,
             &self.pipelines.sky_view,
@@ -265,16 +437,54 @@ impl UnrealAtmosphereContext {
                 device,
                 &self.layouts.sky_view,
                 SkyViewBindGroupInput {
-                    params: params_buffer,
-                    transmittance: &resources.transmittance.view,
+                    params_low: &self.params_buffers[SpectralGroup::Low.index()],
+                    params_high: &self.params_buffers[SpectralGroup::High.index()],
+                    transmittance_low: &low.transmittance.view,
+                    transmittance_high: &high.transmittance.view,
                     sampler: &self.sampler,
-                    multi_scattering: &resources.multi_scattering.view,
-                    sky_view: &resources.sky_view.view,
-                    phase_lut: &resources.phase_lut.view,
+                    multi_scattering_low: &low.multi_scattering.view,
+                    multi_scattering_high: &high.multi_scattering.view,
+                    sky_view_rec2020: &self.sky_view_rec2020.view,
+                    phase_lut_low: &low.phase_lut.view,
+                    phase_lut_high: &high.phase_lut.view,
                 },
             ),
             SKY_VIEW_SIZE,
             "unreal.sky_view.pass",
+        );
+    }
+
+    fn dispatch_aerial_perspective(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+    ) {
+        let low = &self.resources[SpectralGroup::Low.index()];
+        let high = &self.resources[SpectralGroup::High.index()];
+        dispatch_compute_3d(
+            encoder,
+            &self.pipelines.aerial_perspective,
+            &aerial_perspective_bind_group(
+                device,
+                &self.layouts.aerial_perspective,
+                AerialPerspectiveBindGroupInput {
+                    params_low: &self.params_buffers[SpectralGroup::Low.index()],
+                    params_high: &self.params_buffers[SpectralGroup::High.index()],
+                    view: &self.view_buffer,
+                    aerial_perspective: &self.aerial_perspective_buffer,
+                    transmittance_low: &low.transmittance.view,
+                    transmittance_high: &high.transmittance.view,
+                    sampler: &self.sampler,
+                    multi_scattering_low: &low.multi_scattering.view,
+                    multi_scattering_high: &high.multi_scattering.view,
+                    radiance_rec2020: &self.aerial_perspective_radiance_rec2020.view,
+                    transmittance_rec2020: &self.aerial_perspective_transmittance_rec2020.view,
+                    phase_lut_low: &low.phase_lut.view,
+                    phase_lut_high: &high.phase_lut.view,
+                },
+            ),
+            self.aerial_perspective_config.size,
+            "unreal.aerial_perspective.pass",
         );
     }
 }
@@ -346,10 +556,47 @@ impl SkyViewKey {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AerialPerspectiveKey {
+    sky_view: SkyViewKey,
+    view: [u32; 20],
+    config: [u32; 4],
+}
+
+impl AerialPerspectiveKey {
+    fn from_params(
+        low_params: HillaireParamsGpu,
+        params: &UnrealFrameParams,
+        config: AerialPerspectiveConfig,
+    ) -> Self {
+        let runtime = RuntimeViewGpu::from_view(&params.view);
+        let mut view = [0u32; 20];
+        for (dst, src) in view
+            .iter_mut()
+            .take(16)
+            .zip(runtime.relative_world_from_clip.iter().flatten())
+        {
+            *dst = src.to_bits();
+        }
+        for (dst, src) in view.iter_mut().skip(16).zip(runtime.world_position.iter()) {
+            *dst = src.to_bits();
+        }
+        Self {
+            sky_view: SkyViewKey::from_gpu_params(low_params),
+            view,
+            config: [
+                config.size.x,
+                config.size.y,
+                config.size.z,
+                config.max_distance_km.to_bits(),
+            ],
+        }
+    }
+}
+
 struct Resources {
     transmittance: Texture2d,
     multi_scattering: Texture2d,
-    sky_view: Texture2d,
     phase_lut: TextureArray,
 }
 
@@ -362,7 +609,6 @@ impl Resources {
                 MULTI_SCATTERING_SIZE,
                 "unreal.multi_scattering",
             ),
-            sky_view: Texture2d::new(device, SKY_VIEW_SIZE, "unreal.sky_view"),
             phase_lut: TextureArray::phase_lut(device, queue, group),
         }
     }
@@ -391,6 +637,39 @@ impl Texture2d {
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor {
             label: Some(label),
+            ..Default::default()
+        });
+        Self {
+            _texture: texture,
+            view,
+        }
+    }
+}
+
+struct Texture3d {
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
+}
+
+impl Texture3d {
+    fn new(device: &wgpu::Device, size: UVec3, label: &'static str) -> Self {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: size.x.max(1),
+                height: size.y.max(1),
+                depth_or_array_layers: size.z.max(1),
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: LUT_FORMAT,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some(label),
+            dimension: Some(wgpu::TextureViewDimension::D3),
             ..Default::default()
         });
         Self {
@@ -462,6 +741,7 @@ struct Layouts {
     transmittance: wgpu::BindGroupLayout,
     multi_scattering: wgpu::BindGroupLayout,
     sky_view: wgpu::BindGroupLayout,
+    aerial_perspective: wgpu::BindGroupLayout,
     render: wgpu::BindGroupLayout,
 }
 
@@ -489,11 +769,33 @@ impl Layouts {
                 label: Some("unreal.sky_view.bgl"),
                 entries: &[
                     uniform_entry(0, wgpu::ShaderStages::COMPUTE),
-                    texture_2d_entry(1, wgpu::ShaderStages::COMPUTE),
-                    sampler_entry(2, wgpu::ShaderStages::COMPUTE),
+                    uniform_entry(1, wgpu::ShaderStages::COMPUTE),
+                    texture_2d_entry(2, wgpu::ShaderStages::COMPUTE),
                     texture_2d_entry(3, wgpu::ShaderStages::COMPUTE),
-                    storage_2d_entry(4),
-                    texture_2d_array_entry(5, wgpu::ShaderStages::COMPUTE),
+                    sampler_entry(4, wgpu::ShaderStages::COMPUTE),
+                    texture_2d_entry(5, wgpu::ShaderStages::COMPUTE),
+                    texture_2d_entry(6, wgpu::ShaderStages::COMPUTE),
+                    storage_2d_entry(7),
+                    texture_2d_array_entry(8, wgpu::ShaderStages::COMPUTE),
+                    texture_2d_array_entry(9, wgpu::ShaderStages::COMPUTE),
+                ],
+            }),
+            aerial_perspective: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("unreal.aerial_perspective.bgl"),
+                entries: &[
+                    uniform_entry(0, wgpu::ShaderStages::COMPUTE),
+                    uniform_entry(1, wgpu::ShaderStages::COMPUTE),
+                    uniform_entry(2, wgpu::ShaderStages::COMPUTE),
+                    uniform_entry(3, wgpu::ShaderStages::COMPUTE),
+                    texture_2d_entry(4, wgpu::ShaderStages::COMPUTE),
+                    texture_2d_entry(5, wgpu::ShaderStages::COMPUTE),
+                    sampler_entry(6, wgpu::ShaderStages::COMPUTE),
+                    texture_2d_entry(7, wgpu::ShaderStages::COMPUTE),
+                    texture_2d_entry(8, wgpu::ShaderStages::COMPUTE),
+                    storage_3d_entry(9),
+                    storage_3d_entry(10),
+                    texture_2d_array_entry(11, wgpu::ShaderStages::COMPUTE),
+                    texture_2d_array_entry(12, wgpu::ShaderStages::COMPUTE),
                 ],
             }),
             render: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -506,7 +808,6 @@ impl Layouts {
                     texture_2d_entry(4, wgpu::ShaderStages::FRAGMENT),
                     sampler_entry(5, wgpu::ShaderStages::FRAGMENT),
                     texture_2d_entry(6, wgpu::ShaderStages::FRAGMENT),
-                    texture_2d_entry(7, wgpu::ShaderStages::FRAGMENT),
                 ],
             }),
         }
@@ -517,6 +818,7 @@ struct Pipelines {
     transmittance: wgpu::ComputePipeline,
     multi_scattering: wgpu::ComputePipeline,
     sky_view: wgpu::ComputePipeline,
+    aerial_perspective: wgpu::ComputePipeline,
     render: wgpu::RenderPipeline,
 }
 
@@ -553,6 +855,17 @@ impl Pipelines {
                     crate::COMMON_WGSL,
                     crate::INSCATTER_WGSL,
                     include_str!("wgsl/sky_view.comp.wgsl")
+                ),
+            ),
+            aerial_perspective: compute_pipeline(
+                device,
+                &layouts.aerial_perspective,
+                "unreal.aerial_perspective.pipeline",
+                &format!(
+                    "{}\n\n{}\n\n{}",
+                    crate::COMMON_WGSL,
+                    crate::INSCATTER_WGSL,
+                    include_str!("wgsl/aerial_perspective.comp.wgsl")
                 ),
             ),
             render: render_pipeline(device, &layouts.render),
@@ -701,6 +1014,22 @@ fn dispatch_compute_2d(
     pass.dispatch_workgroups(size.x.div_ceil(8), size.y.div_ceil(8), 1);
 }
 
+fn dispatch_compute_3d(
+    encoder: &mut wgpu::CommandEncoder,
+    pipeline: &wgpu::ComputePipeline,
+    bind_group: &wgpu::BindGroup,
+    size: UVec3,
+    label: &'static str,
+) {
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some(label),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, bind_group, &[]);
+    pass.dispatch_workgroups(size.x.div_ceil(4), size.y.div_ceil(4), size.z.div_ceil(4));
+}
+
 fn uniform_buffer<T: Pod>(device: &wgpu::Device, label: &'static str, value: T) -> wgpu::Buffer {
     device.create_buffer_init(&BufferInitDescriptor {
         label: Some(label),
@@ -776,6 +1105,19 @@ const fn storage_2d_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
+const fn storage_3d_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::StorageTexture {
+            access: wgpu::StorageTextureAccess::WriteOnly,
+            format: LUT_FORMAT,
+            view_dimension: wgpu::TextureViewDimension::D3,
+        },
+        count: None,
+    }
+}
+
 fn buffer_binding(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry {
         binding,
@@ -837,12 +1179,16 @@ fn multi_scattering_bind_group(
 }
 
 struct SkyViewBindGroupInput<'a> {
-    params: &'a wgpu::Buffer,
-    transmittance: &'a wgpu::TextureView,
+    params_low: &'a wgpu::Buffer,
+    params_high: &'a wgpu::Buffer,
+    transmittance_low: &'a wgpu::TextureView,
+    transmittance_high: &'a wgpu::TextureView,
     sampler: &'a wgpu::Sampler,
-    multi_scattering: &'a wgpu::TextureView,
-    sky_view: &'a wgpu::TextureView,
-    phase_lut: &'a wgpu::TextureView,
+    multi_scattering_low: &'a wgpu::TextureView,
+    multi_scattering_high: &'a wgpu::TextureView,
+    sky_view_rec2020: &'a wgpu::TextureView,
+    phase_lut_low: &'a wgpu::TextureView,
+    phase_lut_high: &'a wgpu::TextureView,
 }
 
 fn sky_view_bind_group(
@@ -854,12 +1200,58 @@ fn sky_view_bind_group(
         label: Some("unreal.sky_view.bg"),
         layout,
         entries: &[
-            buffer_binding(0, input.params),
-            texture_binding(1, input.transmittance),
-            sampler_binding(2, input.sampler),
-            texture_binding(3, input.multi_scattering),
-            texture_binding(4, input.sky_view),
-            texture_binding(5, input.phase_lut),
+            buffer_binding(0, input.params_low),
+            buffer_binding(1, input.params_high),
+            texture_binding(2, input.transmittance_low),
+            texture_binding(3, input.transmittance_high),
+            sampler_binding(4, input.sampler),
+            texture_binding(5, input.multi_scattering_low),
+            texture_binding(6, input.multi_scattering_high),
+            texture_binding(7, input.sky_view_rec2020),
+            texture_binding(8, input.phase_lut_low),
+            texture_binding(9, input.phase_lut_high),
+        ],
+    })
+}
+
+struct AerialPerspectiveBindGroupInput<'a> {
+    params_low: &'a wgpu::Buffer,
+    params_high: &'a wgpu::Buffer,
+    view: &'a wgpu::Buffer,
+    aerial_perspective: &'a wgpu::Buffer,
+    transmittance_low: &'a wgpu::TextureView,
+    transmittance_high: &'a wgpu::TextureView,
+    sampler: &'a wgpu::Sampler,
+    multi_scattering_low: &'a wgpu::TextureView,
+    multi_scattering_high: &'a wgpu::TextureView,
+    radiance_rec2020: &'a wgpu::TextureView,
+    transmittance_rec2020: &'a wgpu::TextureView,
+    phase_lut_low: &'a wgpu::TextureView,
+    phase_lut_high: &'a wgpu::TextureView,
+}
+
+fn aerial_perspective_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    input: AerialPerspectiveBindGroupInput<'_>,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("unreal.aerial_perspective.bg"),
+        layout,
+        entries: &[
+            buffer_binding(0, input.params_low),
+            buffer_binding(1, input.params_high),
+            buffer_binding(2, input.view),
+            buffer_binding(3, input.aerial_perspective),
+            texture_binding(4, input.transmittance_low),
+            texture_binding(5, input.transmittance_high),
+            sampler_binding(6, input.sampler),
+            texture_binding(7, input.multi_scattering_low),
+            texture_binding(8, input.multi_scattering_high),
+            texture_binding(9, input.radiance_rec2020),
+            texture_binding(10, input.transmittance_rec2020),
+            texture_binding(11, input.phase_lut_low),
+            texture_binding(12, input.phase_lut_high),
         ],
     })
 }
@@ -871,8 +1263,7 @@ struct RenderBindGroupInput<'a> {
     transmittance_low: &'a wgpu::TextureView,
     transmittance_high: &'a wgpu::TextureView,
     sampler: &'a wgpu::Sampler,
-    sky_view_low: &'a wgpu::TextureView,
-    sky_view_high: &'a wgpu::TextureView,
+    sky_view_rec2020: &'a wgpu::TextureView,
 }
 
 fn render_bind_group(
@@ -890,8 +1281,7 @@ fn render_bind_group(
             texture_binding(3, input.transmittance_low),
             texture_binding(4, input.transmittance_high),
             sampler_binding(5, input.sampler),
-            texture_binding(6, input.sky_view_low),
-            texture_binding(7, input.sky_view_high),
+            texture_binding(6, input.sky_view_rec2020),
         ],
     })
 }
@@ -912,5 +1302,6 @@ impl fmt::Display for UnrealRendererError {
 impl StdError for UnrealRendererError {}
 
 const _: () = assert!(core::mem::size_of::<RuntimeViewGpu>() == 80);
+const _: () = assert!(core::mem::size_of::<AerialPerspectiveGpu>() == 16);
 const _: () = assert!(core::mem::size_of::<HillaireParamsGpu>() == 256);
 const _: () = assert!(AEROSOL_SPECIES == 3);

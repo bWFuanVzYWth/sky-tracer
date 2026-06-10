@@ -88,12 +88,20 @@ struct AtmRaySegment {
     exits_atmosphere: bool,
 }
 
+fn atm_top_radius_km_p(p: HillaireParams) -> f32 {
+    return p.earth_radius_km + p.atmosphere_thickness_km;
+}
+
 fn atm_top_radius_km() -> f32 {
-    return hp.earth_radius_km + hp.atmosphere_thickness_km;
+    return atm_top_radius_km_p(hp);
+}
+
+fn atm_clamp_radius_km_p(p: HillaireParams, radius_km: f32) -> f32 {
+    return clamp(radius_km, p.earth_radius_km + 1.0e-3, atm_top_radius_km_p(p) - 1.0e-3);
 }
 
 fn atm_clamp_radius_km(radius_km: f32) -> f32 {
-    return clamp(radius_km, hp.earth_radius_km + 1.0e-3, atm_top_radius_km() - 1.0e-3);
+    return atm_clamp_radius_km_p(hp, radius_km);
 }
 
 fn atm_point_from_local_pos_km(local_pos_km: vec3<f32>) -> AtmPoint {
@@ -119,17 +127,29 @@ fn atm_ray_segment(ray: AtmRay) -> AtmRaySegment {
     return AtmRaySegment(t_top, t_ground, t_max, hits_ground, !hits_ground && t_top >= 0.0);
 }
 
-fn move_to_top_atmosphere(pos_in: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
+fn atm_ray_segment_p(p: HillaireParams, ray: AtmRay) -> AtmRaySegment {
+    let t_top = ray_sphere_intersection(ray.origin.local_pos_km, ray.dir, atm_top_radius_km_p(p));
+    let t_ground = ray_sphere_intersection(ray.origin.local_pos_km, ray.dir, p.earth_radius_km);
+    let hits_ground = t_ground >= 0.0;
+    let t_max = select(t_top, t_ground, hits_ground);
+    return AtmRaySegment(t_top, t_ground, t_max, hits_ground, !hits_ground && t_top >= 0.0);
+}
+
+fn move_to_top_atmosphere_p(p: HillaireParams, pos_in: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     let view_height = length(pos_in);
-    if (view_height <= atm_top_radius_km()) {
+    if (view_height <= atm_top_radius_km_p(p)) {
         return pos_in;
     }
-    let t_top = ray_sphere_intersection(pos_in, dir, atm_top_radius_km());
+    let t_top = ray_sphere_intersection(pos_in, dir, atm_top_radius_km_p(p));
     if (t_top < 0.0) {
         return pos_in;
     }
     let up = pos_in / max(view_height, 1.0e-6);
     return pos_in + dir * t_top - up * ATM_PLANET_RADIUS_OFFSET_KM;
+}
+
+fn move_to_top_atmosphere(pos_in: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
+    return move_to_top_atmosphere_p(hp, pos_in, dir);
 }
 
 fn molecular_phase_function(cos_theta: f32) -> f32 {
@@ -199,12 +219,16 @@ fn get_atmosphere_collision_coefficients(p: HillaireParams, h_in: f32) -> AtmCoe
     return AtmCoeffs(aerosol_sca, aerosol_abs, mol_sca, mol_abs, aerosol_sca + aerosol_abs + mol_sca + mol_abs);
 }
 
-fn transmittance_uv_from_params(cos_theta: f32, normalized_altitude: f32) -> vec2<f32> {
-    let r_km = hp.earth_radius_km
-        + clamp(normalized_altitude, 0.0, 1.0) * hp.atmosphere_thickness_km;
+fn transmittance_uv_from_params_p(
+    p: HillaireParams,
+    cos_theta: f32,
+    normalized_altitude: f32,
+) -> vec2<f32> {
+    let r_km = p.earth_radius_km
+        + clamp(normalized_altitude, 0.0, 1.0) * p.atmosphere_thickness_km;
     let mu = clamp(cos_theta, -1.0, 1.0);
-    let bottom = hp.earth_radius_km;
-    let top = bottom + hp.atmosphere_thickness_km;
+    let bottom = p.earth_radius_km;
+    let top = bottom + p.atmosphere_thickness_km;
     let h = sqrt(max(top * top - bottom * bottom, 0.0));
     let rho = sqrt(max(r_km * r_km - bottom * bottom, 0.0));
     let discriminant = r_km * r_km * (mu * mu - 1.0) + top * top;
@@ -216,13 +240,27 @@ fn transmittance_uv_from_params(cos_theta: f32, normalized_altitude: f32) -> vec
     return vec2<f32>(x_mu, x_r);
 }
 
+fn transmittance_uv_from_params(cos_theta: f32, normalized_altitude: f32) -> vec2<f32> {
+    return transmittance_uv_from_params_p(hp, cos_theta, normalized_altitude);
+}
+
+fn transmittance_from_lut_p(
+    p: HillaireParams,
+    lut: texture_2d<f32>,
+    samp: sampler,
+    cos_theta: f32,
+    normalized_altitude: f32,
+) -> vec4<f32> {
+    return textureSampleLevel(lut, samp, transmittance_uv_from_params_p(p, cos_theta, normalized_altitude), 0.0);
+}
+
 fn transmittance_from_lut(
     lut: texture_2d<f32>,
     samp: sampler,
     cos_theta: f32,
     normalized_altitude: f32,
 ) -> vec4<f32> {
-    return textureSampleLevel(lut, samp, transmittance_uv_from_params(cos_theta, normalized_altitude), 0.0);
+    return transmittance_from_lut_p(hp, lut, samp, cos_theta, normalized_altitude);
 }
 
 fn multi_scattering_sun_mu_from_u(u: f32) -> f32 {
@@ -236,42 +274,82 @@ fn multi_scattering_u_from_sun_mu(sun_mu: f32) -> f32 {
     return clamp(x * 0.5 + 0.5, 0.0, 1.0);
 }
 
-fn multi_scattering_altitude_bounds_km() -> vec2<f32> {
-    let min_alt = min(ATM_PLANET_RADIUS_OFFSET_KM, hp.atmosphere_thickness_km * 0.25);
-    let max_alt = max(hp.atmosphere_thickness_km - ATM_PLANET_RADIUS_OFFSET_KM, min_alt + 1.0e-3);
+fn multi_scattering_altitude_bounds_km_p(p: HillaireParams) -> vec2<f32> {
+    let min_alt = min(ATM_PLANET_RADIUS_OFFSET_KM, p.atmosphere_thickness_km * 0.25);
+    let max_alt = max(p.atmosphere_thickness_km - ATM_PLANET_RADIUS_OFFSET_KM, min_alt + 1.0e-3);
     return vec2<f32>(min_alt, max_alt);
 }
 
-fn multi_scattering_normalized_altitude_from_v(v: f32) -> f32 {
-    let bounds = multi_scattering_altitude_bounds_km();
+fn multi_scattering_altitude_bounds_km() -> vec2<f32> {
+    return multi_scattering_altitude_bounds_km_p(hp);
+}
+
+fn multi_scattering_normalized_altitude_from_v_p(p: HillaireParams, v: f32) -> f32 {
+    let bounds = multi_scattering_altitude_bounds_km_p(p);
     let range = max(bounds.y - bounds.x, 1.0e-3);
     let cdf_max = max(1.0 - exp(-range / ATM_MULTI_SCATTERING_ALTITUDE_SCALE_KM), 1.0e-6);
     let cdf = clamp(v, 0.0, 1.0) * cdf_max;
     let altitude = bounds.x - ATM_MULTI_SCATTERING_ALTITUDE_SCALE_KM * log(max(1.0 - cdf, 1.0e-6));
-    return clamp(altitude / hp.atmosphere_thickness_km, 0.0, 1.0);
+    return clamp(altitude / p.atmosphere_thickness_km, 0.0, 1.0);
 }
 
-fn multi_scattering_v_from_normalized_altitude(normalized_altitude: f32) -> f32 {
-    let bounds = multi_scattering_altitude_bounds_km();
+fn multi_scattering_normalized_altitude_from_v(v: f32) -> f32 {
+    return multi_scattering_normalized_altitude_from_v_p(hp, v);
+}
+
+fn multi_scattering_v_from_normalized_altitude_p(p: HillaireParams, normalized_altitude: f32) -> f32 {
+    let bounds = multi_scattering_altitude_bounds_km_p(p);
     let range = max(bounds.y - bounds.x, 1.0e-3);
-    let altitude = clamp(normalized_altitude, 0.0, 1.0) * hp.atmosphere_thickness_km;
+    let altitude = clamp(normalized_altitude, 0.0, 1.0) * p.atmosphere_thickness_km;
     let h = clamp(altitude, bounds.x, bounds.y) - bounds.x;
     let cdf_max = max(1.0 - exp(-range / ATM_MULTI_SCATTERING_ALTITUDE_SCALE_KM), 1.0e-6);
     return clamp((1.0 - exp(-h / ATM_MULTI_SCATTERING_ALTITUDE_SCALE_KM)) / cdf_max, 0.0, 1.0);
 }
 
-fn multi_scattering_params_from_uv(uv: vec2<f32>) -> vec2<f32> {
+fn multi_scattering_v_from_normalized_altitude(normalized_altitude: f32) -> f32 {
+    return multi_scattering_v_from_normalized_altitude_p(hp, normalized_altitude);
+}
+
+fn multi_scattering_params_from_uv_p(p: HillaireParams, uv: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(
         multi_scattering_sun_mu_from_u(uv.x),
-        multi_scattering_normalized_altitude_from_v(uv.y),
+        multi_scattering_normalized_altitude_from_v_p(p, uv.y),
+    );
+}
+
+fn multi_scattering_params_from_uv(uv: vec2<f32>) -> vec2<f32> {
+    return multi_scattering_params_from_uv_p(hp, uv);
+}
+
+fn multi_scattering_uv_from_params_p(
+    p: HillaireParams,
+    sun_mu: f32,
+    normalized_altitude: f32,
+) -> vec2<f32> {
+    return vec2<f32>(
+        multi_scattering_u_from_sun_mu(sun_mu),
+        multi_scattering_v_from_normalized_altitude_p(p, normalized_altitude),
     );
 }
 
 fn multi_scattering_uv_from_params(sun_mu: f32, normalized_altitude: f32) -> vec2<f32> {
-    return vec2<f32>(
-        multi_scattering_u_from_sun_mu(sun_mu),
-        multi_scattering_v_from_normalized_altitude(normalized_altitude),
+    return multi_scattering_uv_from_params_p(hp, sun_mu, normalized_altitude);
+}
+
+fn multi_scattering_from_lut_p(
+    p: HillaireParams,
+    lut: texture_2d<f32>,
+    samp: sampler,
+    sun_zenith_cos_angle: f32,
+    normalized_altitude: f32,
+) -> vec4<f32> {
+    let dims = vec2<f32>(textureDimensions(lut));
+    let uv_unit = multi_scattering_uv_from_params_p(p, sun_zenith_cos_angle, normalized_altitude);
+    let uv = vec2<f32>(
+        atm_from_unit_to_sub_uvs(uv_unit.x, dims.x),
+        atm_from_unit_to_sub_uvs(uv_unit.y, dims.y),
     );
+    return textureSampleLevel(lut, samp, uv, 0.0);
 }
 
 fn multi_scattering_from_lut(
@@ -280,13 +358,7 @@ fn multi_scattering_from_lut(
     sun_zenith_cos_angle: f32,
     normalized_altitude: f32,
 ) -> vec4<f32> {
-    let dims = vec2<f32>(textureDimensions(lut));
-    let uv_unit = multi_scattering_uv_from_params(sun_zenith_cos_angle, normalized_altitude);
-    let uv = vec2<f32>(
-        atm_from_unit_to_sub_uvs(uv_unit.x, dims.x),
-        atm_from_unit_to_sub_uvs(uv_unit.y, dims.y),
-    );
-    return textureSampleLevel(lut, samp, uv, 0.0);
+    return multi_scattering_from_lut_p(hp, lut, samp, sun_zenith_cos_angle, normalized_altitude);
 }
 
 fn linear_rec2020_from_spectral(l: vec4<f32>) -> vec3<f32> {
@@ -340,8 +412,29 @@ fn white_balanced_linear_rec2020_from_spectral8(lo: vec4<f32>, hi: vec4<f32>) ->
     return white_balance_rec2020(linear_rec2020_from_spectral8(lo, hi));
 }
 
+fn rec2020_transmittance_from_spectral8(
+    clear_lo: vec4<f32>,
+    clear_hi: vec4<f32>,
+    transmittance_lo: vec4<f32>,
+    transmittance_hi: vec4<f32>,
+) -> vec3<f32> {
+    let clear = max(
+        white_balanced_linear_rec2020_from_spectral8(clear_lo, clear_hi),
+        vec3<f32>(1.0e-6),
+    );
+    let attenuated = max(
+        white_balanced_linear_rec2020_from_spectral8(clear_lo * transmittance_lo, clear_hi * transmittance_hi),
+        vec3<f32>(0.0),
+    );
+    return clamp(attenuated / clear, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+fn sky_view_height_km_p(p: HillaireParams) -> f32 {
+    return atm_clamp_radius_km_p(p, p.sky_view_height_km);
+}
+
 fn sky_view_height_km() -> f32 {
-    return atm_clamp_radius_km(hp.sky_view_height_km);
+    return sky_view_height_km_p(hp);
 }
 
 fn sky_view_horizon_angles(view_height: f32) -> vec2<f32> {
@@ -353,13 +446,14 @@ fn sky_view_horizon_angles(view_height: f32) -> vec2<f32> {
     return vec2<f32>(zenith_horizon_angle, beta);
 }
 
-fn sky_view_params_to_uv(
+fn sky_view_params_to_uv_p(
+    p: HillaireParams,
     view_zenith_cos_angle: f32,
     light_view_cos_angle: f32,
     intersect_ground: bool,
     dims: vec2<f32>,
 ) -> vec2<f32> {
-    let angles = sky_view_horizon_angles(sky_view_height_km());
+    let angles = sky_view_horizon_angles(sky_view_height_km_p(p));
     let zenith_horizon_angle = angles.x;
     let beta = max(angles.y, 1.0e-6);
     let view_angle = acos(clamp(view_zenith_cos_angle, -1.0, 1.0));
@@ -386,12 +480,21 @@ fn sky_view_params_to_uv(
     );
 }
 
-fn sky_view_uv_to_params(uv_in: vec2<f32>, dims: vec2<f32>) -> vec2<f32> {
+fn sky_view_params_to_uv(
+    view_zenith_cos_angle: f32,
+    light_view_cos_angle: f32,
+    intersect_ground: bool,
+    dims: vec2<f32>,
+) -> vec2<f32> {
+    return sky_view_params_to_uv_p(hp, view_zenith_cos_angle, light_view_cos_angle, intersect_ground, dims);
+}
+
+fn sky_view_uv_to_params_p(p: HillaireParams, uv_in: vec2<f32>, dims: vec2<f32>) -> vec2<f32> {
     let uv = vec2<f32>(
         clamp(atm_from_sub_uvs_to_unit(uv_in.x, dims.x), 0.0, 1.0),
         clamp(atm_from_sub_uvs_to_unit(uv_in.y, dims.y), 0.0, 1.0),
     );
-    let angles = sky_view_horizon_angles(sky_view_height_km());
+    let angles = sky_view_horizon_angles(sky_view_height_km_p(p));
     let zenith_horizon_angle = angles.x;
     let beta = angles.y;
 
@@ -414,11 +517,15 @@ fn sky_view_uv_to_params(uv_in: vec2<f32>, dims: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(view_zenith_cos_angle, light_view_cos_angle);
 }
 
-fn sky_view_dir_from_params(params: vec2<f32>) -> vec3<f32> {
+fn sky_view_uv_to_params(uv_in: vec2<f32>, dims: vec2<f32>) -> vec2<f32> {
+    return sky_view_uv_to_params_p(hp, uv_in, dims);
+}
+
+fn sky_view_dir_from_params_p(p: HillaireParams, params: vec2<f32>) -> vec3<f32> {
     let view_zenith_cos_angle = clamp(params.x, -1.0, 1.0);
     let light_view_cos_angle = clamp(params.y, -1.0, 1.0);
     let up = vec3<f32>(0.0, 1.0, 0.0);
-    let sun_h = hp.sun_dir - up * dot(hp.sun_dir, up);
+    let sun_h = p.sun_dir - up * dot(p.sun_dir, up);
     let sun_h_len = length(sun_h);
     let forward = sun_h / max(sun_h_len, 1.0e-5);
     let forward_safe = select(vec3<f32>(1.0, 0.0, 0.0), forward, sun_h_len > 1.0e-5);
@@ -432,13 +539,17 @@ fn sky_view_dir_from_params(params: vec2<f32>) -> vec3<f32> {
     );
 }
 
-fn sky_view_uv_from_dir(dir_in: vec3<f32>, dims: vec2<f32>) -> vec2<f32> {
+fn sky_view_dir_from_params(params: vec2<f32>) -> vec3<f32> {
+    return sky_view_dir_from_params_p(hp, params);
+}
+
+fn sky_view_uv_from_dir_p(p: HillaireParams, dir_in: vec3<f32>, dims: vec2<f32>) -> vec2<f32> {
     let dir = normalize(dir_in);
     let up = vec3<f32>(0.0, 1.0, 0.0);
     let view_zenith_cos_angle = dot(dir, up);
 
     let view_h = dir - up * view_zenith_cos_angle;
-    let sun_h = hp.sun_dir - up * dot(hp.sun_dir, up);
+    let sun_h = p.sun_dir - up * dot(p.sun_dir, up);
     let view_h_len = length(view_h);
     let sun_h_len = length(sun_h);
     let view_h_dir = view_h / max(view_h_len, 1.0e-5);
@@ -449,7 +560,11 @@ fn sky_view_uv_from_dir(dir_in: vec3<f32>, dims: vec2<f32>) -> vec2<f32> {
         view_h_len > 1.0e-5 && sun_h_len > 1.0e-5,
     );
 
-    let origin = atm_point_from_radius_km(sky_view_height_km());
-    let intersect_ground = atm_ray_segment(atm_ray_from_point(origin, dir)).hits_ground;
-    return sky_view_params_to_uv(view_zenith_cos_angle, light_view_cos_angle, intersect_ground, dims);
+    let origin = atm_point_from_local_pos_km(vec3<f32>(0.0, sky_view_height_km_p(p), 0.0));
+    let intersect_ground = atm_ray_segment_p(p, atm_ray_from_point(origin, dir)).hits_ground;
+    return sky_view_params_to_uv_p(p, view_zenith_cos_angle, light_view_cos_angle, intersect_ground, dims);
+}
+
+fn sky_view_uv_from_dir(dir_in: vec3<f32>, dims: vec2<f32>) -> vec2<f32> {
+    return sky_view_uv_from_dir_p(hp, dir_in, dims);
 }

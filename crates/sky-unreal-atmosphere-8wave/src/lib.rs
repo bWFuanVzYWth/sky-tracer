@@ -15,7 +15,9 @@ mod sun;
 pub use atmosphere::HillaireAtmosphere;
 pub use gpu::{Gpu, NonZeroRenderSize, RenderTargets, ViewFrame};
 pub use params::{AerosolPreset, HillairePhaseMode, HillaireSettings};
-pub use renderer::{UnrealAtmosphereContext, UnrealFrameParams, UnrealRendererError};
+pub use renderer::{
+    AerialPerspectiveConfig, UnrealAtmosphereContext, UnrealFrameParams, UnrealRendererError,
+};
 pub use sun::{SUN_IRRADIANCE_REC2020_W_PER_M2, SUN_WGSL, Sun, SunGpu};
 
 pub const REQUIRED_FEATURES: wgpu::Features = wgpu::Features::FLOAT32_FILTERABLE;
@@ -71,14 +73,14 @@ mod tests {
     }
 
     #[test]
-    fn ground_irradiance_wgsl_composes() -> Result<(), String> {
+    fn aerial_perspective_wgsl_composes() -> Result<(), String> {
         let source = format!(
             "{}\n\n{}\n\n{}",
             crate::COMMON_WGSL,
             crate::INSCATTER_WGSL,
-            include_str!("wgsl/ground_irradiance.comp.wgsl")
+            include_str!("wgsl/aerial_perspective.comp.wgsl")
         );
-        compose_wgsl(&source, "unreal/ground_irradiance_combined.wgsl")
+        compose_wgsl(&source, "unreal/aerial_perspective_combined.wgsl")
     }
 
     #[test]

@@ -1,12 +1,12 @@
 [package]
 name = "sky-unreal-atmosphere-8wave"
-version.workspace = true
-edition.workspace = true
+version = "0.1.0"
+edition = "2024"
 
 [dependencies]
-bytemuck = { workspace = true }
-glam = { workspace = true }
-wgpu = { workspace = true }
+bytemuck = { version = "1.25", features = ["derive"] }
+glam = "0.33"
+wgpu = "29.0.3"
 
 [dev-dependencies]
 naga = { version = "29.0.3", features = ["wgsl-in"] }
