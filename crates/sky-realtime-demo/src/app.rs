@@ -15,6 +15,7 @@ use crate::experiment::{
     CompareMode, ExperimentInit, FrameContext, RealtimeExperiment, UpdateContext,
 };
 use crate::gpu::{GpuContext, SurfaceFrameStatus};
+use crate::passes::bruneton_atmosphere_4wave::BrunetonAtmosphere4WaveExperiment;
 use crate::passes::unreal_atmosphere_3wave::UnrealAtmosphere3WaveExperiment;
 use crate::passes::unreal_atmosphere_4wave::UnrealAtmosphere4WaveExperiment;
 use crate::view::ViewController;
@@ -30,6 +31,8 @@ pub enum ExperimentKind {
     Unreal3Wave,
     #[value(name = "unreal-4wave", alias = "unreal4-wave")]
     Unreal4Wave,
+    #[value(name = "bruneton-4wave", alias = "bruneton4-wave")]
+    Bruneton4Wave,
 }
 
 pub fn run(config: RunConfig) -> Result<(), Box<dyn Error>> {
@@ -190,15 +193,21 @@ impl ApplicationHandler for DemoApp {
         let required_features = match self.experiment_kind {
             ExperimentKind::Unreal3Wave => sky_unreal_atmosphere_3wave::REQUIRED_FEATURES,
             ExperimentKind::Unreal4Wave => sky_unreal_atmosphere_4wave::REQUIRED_FEATURES,
+            ExperimentKind::Bruneton4Wave => sky_bruneton_atmosphere_4wave::REQUIRED_FEATURES,
         };
-        let gpu = match pollster::block_on(GpuContext::new(window, required_features)) {
-            Ok(gpu) => gpu,
-            Err(error) => {
-                self.init_error = Some(error);
-                event_loop.exit();
-                return;
-            }
-        };
+        let mut required_limits = wgpu::Limits::default();
+        if matches!(self.experiment_kind, ExperimentKind::Bruneton4Wave) {
+            required_limits.max_texture_dimension_3d = 8192;
+        }
+        let gpu =
+            match pollster::block_on(GpuContext::new(window, required_features, required_limits)) {
+                Ok(gpu) => gpu,
+                Err(error) => {
+                    self.init_error = Some(error);
+                    event_loop.exit();
+                    return;
+                }
+            };
         let display = DisplayTransform::default();
         println!("display transform: {}", display.output_space.label());
         println!("view controls: left drag = yaw/pitch, mouse wheel = fov, R = reset");
@@ -224,6 +233,14 @@ impl ApplicationHandler for DemoApp {
                 }
             },
             ExperimentKind::Unreal4Wave => match UnrealAtmosphere4WaveExperiment::new(init) {
+                Ok(experiment) => Box::new(experiment),
+                Err(error) => {
+                    self.init_error = Some(error);
+                    event_loop.exit();
+                    return;
+                }
+            },
+            ExperimentKind::Bruneton4Wave => match BrunetonAtmosphere4WaveExperiment::new(init) {
                 Ok(experiment) => Box::new(experiment),
                 Err(error) => {
                     self.init_error = Some(error);

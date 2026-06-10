@@ -16,6 +16,7 @@ impl GpuContext {
     pub async fn new(
         window: Arc<Window>,
         required_features: wgpu::Features,
+        required_limits: wgpu::Limits,
     ) -> Result<Self, String> {
         let size = window.inner_size();
         let instance = wgpu::Instance::default();
@@ -35,11 +36,18 @@ impl GpuContext {
                 "adapter does not support required realtime atmosphere features: {required_features:?}"
             ));
         }
+        let adapter_limits = adapter.limits();
+        if adapter_limits.max_texture_dimension_3d < required_limits.max_texture_dimension_3d {
+            return Err(format!(
+                "adapter max_texture_dimension_3d is {}, but this experiment requires {}",
+                adapter_limits.max_texture_dimension_3d, required_limits.max_texture_dimension_3d
+            ));
+        }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("sky_realtime_demo_device"),
                 required_features,
-                required_limits: wgpu::Limits::default(),
+                required_limits,
                 memory_hints: wgpu::MemoryHints::Performance,
                 ..Default::default()
             })
