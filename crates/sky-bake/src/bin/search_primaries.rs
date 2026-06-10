@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::Write;
@@ -27,15 +28,18 @@ struct Cli {
     top: usize,
     #[arg(long, default_value_t = 0)]
     threads: usize,
+    #[arg(long, default_value_t = 4096)]
+    beam_width: usize,
     #[arg(long, value_enum, default_value_t = WeightStrategy::Voronoi)]
     weight_strategy: WeightStrategy,
     #[arg(long, default_value = "target/primary_search")]
     out_dir: PathBuf,
 }
 
-const MAX_PRIMARY_COUNT: usize = 4;
+const MAX_PRIMARY_COUNT: usize = 8;
 const MAX_WEIGHT_ROWS: usize = 9;
 const KKT_DIM: usize = MAX_PRIMARY_COUNT + 1;
+const EXHAUSTIVE_COMBO_LIMIT: usize = 5_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
 enum WeightStrategy {
@@ -85,7 +89,7 @@ struct Oklab {
     b: f64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 struct Combo {
     indices: [usize; MAX_PRIMARY_COUNT],
     count: usize,
@@ -142,14 +146,14 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let dataset = Dataset::load(&cli.asset_dirs)?;
     let sample_indices = screening_indices(dataset.sample_count(), cli.screen_samples);
-    let combos = all_combos(dataset.wavelengths_nm.len(), cli.primary_count);
+    let combo_count = combo_count(dataset.wavelengths_nm.len(), cli.primary_count);
     let threads = resolve_thread_count(cli.threads);
     println!(
         "loaded {} assets, {} samples, {} bands, {} {}-wavelength combos",
         dataset.asset_summaries.len(),
         dataset.sample_count(),
         dataset.wavelengths_nm.len(),
-        combos.len(),
+        combo_count,
         cli.primary_count
     );
     println!(
@@ -160,15 +164,33 @@ fn main() -> Result<(), Box<dyn Error>> {
         cli.weight_strategy.label()
     );
 
-    let mut screened = evaluate_combos(
-        &dataset,
-        &combos,
-        Some(&sample_indices),
-        false,
-        threads,
-        cli.weight_strategy,
-    );
-    screened.sort_by(|a, b| a.score.total_cmp(&b.score));
+    let screened = if combo_count <= EXHAUSTIVE_COMBO_LIMIT {
+        let combos = all_combos(dataset.wavelengths_nm.len(), cli.primary_count);
+        let mut screened = evaluate_combos(
+            &dataset,
+            &combos,
+            Some(&sample_indices),
+            false,
+            threads,
+            cli.weight_strategy,
+        );
+        screened.sort_by(|a, b| a.score.total_cmp(&b.score));
+        screened
+    } else {
+        println!(
+            "combo count exceeds exhaustive in-memory limit {}; using deterministic beam_width={}",
+            EXHAUSTIVE_COMBO_LIMIT, cli.beam_width
+        );
+        beam_search_combos(
+            &dataset,
+            cli.primary_count,
+            &sample_indices,
+            threads,
+            cli.weight_strategy,
+            cli.beam_width,
+            cli.refine_top,
+        )
+    };
 
     let refine_count = cli.refine_top.min(screened.len());
     let refine_combos = screened
@@ -522,6 +544,218 @@ fn all_combos(len: usize, count: usize) -> Vec<Combo> {
     let mut current = [0; MAX_PRIMARY_COUNT];
     collect_combos(len, count, 0, 0, &mut current, &mut combos);
     combos
+}
+
+fn combo_count(len: usize, count: usize) -> usize {
+    if count > len {
+        return 0;
+    }
+    let count = count.min(len - count);
+    let mut result = 1usize;
+    for i in 0..count {
+        result = result * (len - i) / (i + 1);
+    }
+    result
+}
+
+fn beam_search_combos(
+    dataset: &Dataset,
+    primary_count: usize,
+    sample_indices: &[usize],
+    threads: usize,
+    weight_strategy: WeightStrategy,
+    beam_width: usize,
+    keep_count: usize,
+) -> Vec<ComboResult> {
+    let beam_width = beam_width.max(1);
+    let keep_count = keep_count.max(beam_width);
+    let mut beam = (0..dataset.wavelengths_nm.len())
+        .map(|index| combo_from_sorted_indices(&[index]))
+        .collect::<Vec<_>>();
+
+    for depth in 2..=primary_count {
+        let mut seen = HashSet::new();
+        let mut candidates = Vec::with_capacity(beam.len() * dataset.wavelengths_nm.len());
+        for combo in &beam {
+            for index in 0..dataset.wavelengths_nm.len() {
+                if combo_contains(*combo, index) {
+                    continue;
+                }
+                let expanded = combo_with_index(*combo, index);
+                if seen.insert(expanded) {
+                    candidates.push(expanded);
+                }
+            }
+        }
+
+        let mut results = evaluate_combos(
+            dataset,
+            &candidates,
+            Some(sample_indices),
+            false,
+            threads,
+            weight_strategy,
+        );
+        results.sort_by(|a, b| a.score.total_cmp(&b.score));
+        let next_count = beam_width.min(results.len());
+        println!(
+            "beam depth {depth}: evaluated {}, keeping {}",
+            results.len(),
+            next_count
+        );
+        beam = results
+            .into_iter()
+            .take(next_count)
+            .map(|result| result.combo)
+            .collect();
+    }
+
+    let mut seen = HashSet::new();
+    let mut improved = Vec::with_capacity(beam.len());
+    for local in local_search_combos(dataset, &beam, sample_indices, threads, weight_strategy) {
+        if seen.insert(local) {
+            improved.push(local);
+        }
+    }
+
+    let mut results = evaluate_combos(
+        dataset,
+        &improved,
+        Some(sample_indices),
+        false,
+        threads,
+        weight_strategy,
+    );
+    results.sort_by(|a, b| a.score.total_cmp(&b.score));
+    results.truncate(keep_count.min(results.len()));
+    results
+}
+
+fn local_search_combos(
+    dataset: &Dataset,
+    combos: &[Combo],
+    sample_indices: &[usize],
+    threads: usize,
+    weight_strategy: WeightStrategy,
+) -> Vec<Combo> {
+    let thread_count = threads.max(1).min(combos.len().max(1));
+    if thread_count == 1 || combos.len() <= 1 {
+        return combos
+            .iter()
+            .copied()
+            .map(|combo| local_search_combo(dataset, combo, sample_indices, weight_strategy))
+            .collect();
+    }
+
+    let chunk_size = combos.len().div_ceil(thread_count);
+    thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for chunk in combos.chunks(chunk_size) {
+            handles.push(scope.spawn(move || {
+                chunk
+                    .iter()
+                    .copied()
+                    .map(|combo| {
+                        local_search_combo(dataset, combo, sample_indices, weight_strategy)
+                    })
+                    .collect::<Vec<_>>()
+            }));
+        }
+
+        let mut results = Vec::with_capacity(combos.len());
+        for handle in handles {
+            results.extend(handle.join().expect("local search worker panicked"));
+        }
+        results
+    })
+}
+
+fn local_search_combo(
+    dataset: &Dataset,
+    start: Combo,
+    sample_indices: &[usize],
+    weight_strategy: WeightStrategy,
+) -> Combo {
+    let mut current = start;
+    let mut current_score = evaluate_combo(
+        dataset,
+        current,
+        Some(sample_indices),
+        false,
+        weight_strategy,
+    )
+    .score;
+
+    loop {
+        let mut best_combo = current;
+        let mut best_score = current_score;
+        for slot in 0..current.count {
+            for index in 0..dataset.wavelengths_nm.len() {
+                if combo_contains_except(current, index, slot) {
+                    continue;
+                }
+                let candidate = combo_replacing_index(current, slot, index);
+                if candidate == current {
+                    continue;
+                }
+                let score = evaluate_combo(
+                    dataset,
+                    candidate,
+                    Some(sample_indices),
+                    false,
+                    weight_strategy,
+                )
+                .score;
+                if score < best_score {
+                    best_score = score;
+                    best_combo = candidate;
+                }
+            }
+        }
+
+        if best_score >= current_score {
+            return current;
+        }
+        current = best_combo;
+        current_score = best_score;
+    }
+}
+
+fn combo_from_sorted_indices(indices: &[usize]) -> Combo {
+    let mut combo = Combo {
+        indices: [0; MAX_PRIMARY_COUNT],
+        count: indices.len(),
+    };
+    combo.indices[..indices.len()].copy_from_slice(indices);
+    combo
+}
+
+fn combo_contains(combo: Combo, index: usize) -> bool {
+    combo.indices[..combo.count].contains(&index)
+}
+
+fn combo_contains_except(combo: Combo, index: usize, except_slot: usize) -> bool {
+    combo
+        .indices
+        .iter()
+        .take(combo.count)
+        .enumerate()
+        .any(|(slot, value)| slot != except_slot && *value == index)
+}
+
+fn combo_with_index(combo: Combo, index: usize) -> Combo {
+    let mut indices = Vec::with_capacity(combo.count + 1);
+    indices.extend_from_slice(&combo.indices[..combo.count]);
+    indices.push(index);
+    indices.sort_unstable();
+    combo_from_sorted_indices(&indices)
+}
+
+fn combo_replacing_index(combo: Combo, slot: usize, index: usize) -> Combo {
+    let mut indices = combo.indices[..combo.count].to_vec();
+    indices[slot] = index;
+    indices.sort_unstable();
+    combo_from_sorted_indices(&indices)
 }
 
 fn collect_combos(
@@ -1193,10 +1427,7 @@ mod tests {
     #[test]
     fn voronoi_weights_preserve_existing_four_wave_baseline() {
         let (wavelengths_nm, band_widths_nm) = visible_grid();
-        let combo = Combo {
-            indices: [4, 10, 19, 29],
-            count: 4,
-        };
+        let combo = combo_from_sorted_indices(&[4, 10, 19, 29]);
 
         let weights = quadrature_weights(
             &wavelengths_nm,
@@ -1205,16 +1436,13 @@ mod tests {
             WeightStrategy::Voronoi,
         );
 
-        assert_eq!(weights, [75.0, 75.0, 95.0, 165.0]);
+        assert_eq!(&weights[..combo.count], &[75.0, 75.0, 95.0, 165.0]);
     }
 
     #[test]
     fn cmf_fit_weights_preserve_nonnegative_fixed_sum() {
         let (wavelengths_nm, band_widths_nm) = visible_grid();
-        let combo = Combo {
-            indices: [3, 10, 18, 25],
-            count: 4,
-        };
+        let combo = combo_from_sorted_indices(&[3, 10, 18, 25]);
         let total_width = spectral_total_width(&wavelengths_nm, &band_widths_nm);
 
         for strategy in [WeightStrategy::CmfMass, WeightStrategy::CmfMoments] {
@@ -1237,10 +1465,7 @@ mod tests {
     #[test]
     fn cmf_fit_weights_leave_unused_primary_slots_zero() {
         let (wavelengths_nm, band_widths_nm) = visible_grid();
-        let combo = Combo {
-            indices: [4, 12, 29, 0],
-            count: 3,
-        };
+        let combo = combo_from_sorted_indices(&[4, 12, 29]);
 
         let weights = quadrature_weights(
             &wavelengths_nm,
