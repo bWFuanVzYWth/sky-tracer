@@ -37,7 +37,7 @@ fn sky_view_radiance(dir: vec3<f32>) -> vec3<f32> {
 }
 
 fn sky_ray_above_ground(dir: vec3<f32>) -> bool {
-    let origin = vec3<f32>(0.0, sky_view_height_km(), 0.0);
+    let origin = vec3<f32>(0.0, hp.eye_distance_to_earth_center_km, 0.0);
     return ray_sphere_intersection(origin, normalize(dir), hp.earth_radius_km) < 0.0;
 }
 
@@ -61,10 +61,10 @@ fn spectral_sun_transmittance_to_rec2020(transmittance_low: vec4<f32>, transmitt
 
 fn sun_transmittance_at_view(direction: vec3<f32>) -> vec3<f32> {
     let dir = normalize(direction);
-    let sun_mu = clamp(dir.y, -1.0, 1.0);
-    if (sun_mu <= 0.0) {
+    if (!sky_ray_above_ground(dir)) {
         return vec3<f32>(0.0);
     }
+    let sun_mu = clamp(dir.y, -1.0, 1.0);
     let normalized_altitude = clamp(hp.eye_altitude_km / hp.atmosphere_thickness_km, 0.0, 1.0);
     let spectral_t_low = transmittance_from_lut(
         transmittance_lut_low,

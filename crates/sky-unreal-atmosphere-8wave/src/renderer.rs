@@ -71,7 +71,8 @@ pub struct UnrealAtmosphereContext {
     layouts: Layouts,
     pipelines: Pipelines,
     render_bind_group: wgpu::BindGroup,
-    precompute_key: Option<PrecomputeKey>,
+    static_precompute_key: Option<StaticPrecomputeKey>,
+    sky_view_key: Option<SkyViewKey>,
 }
 
 impl UnrealAtmosphereContext {
@@ -135,7 +136,8 @@ impl UnrealAtmosphereContext {
             layouts,
             pipelines,
             render_bind_group,
-            precompute_key: None,
+            static_precompute_key: None,
+            sky_view_key: None,
         })
     }
 
@@ -170,12 +172,21 @@ impl UnrealAtmosphereContext {
             bytemuck::bytes_of(&SunGpu::from_sun(params.sun)),
         );
 
-        let key = PrecomputeKey::from_params(params, low_params);
-        if self.precompute_key != Some(key) {
+        let static_key = StaticPrecomputeKey::from_params(params);
+        if self.static_precompute_key != Some(static_key) {
             for group in SpectralGroup::ALL {
-                self.dispatch_precompute(device, encoder, group);
+                self.dispatch_static_precompute(device, encoder, group);
             }
-            self.precompute_key = Some(key);
+            self.static_precompute_key = Some(static_key);
+            self.sky_view_key = None;
+        }
+
+        let sky_view_key = SkyViewKey::from_gpu_params(low_params);
+        if self.sky_view_key != Some(sky_view_key) {
+            for group in SpectralGroup::ALL {
+                self.dispatch_sky_view(device, encoder, group);
+            }
+            self.sky_view_key = Some(sky_view_key);
         }
     }
 
@@ -201,7 +212,7 @@ impl UnrealAtmosphereContext {
         pass.draw(0..3, 0..1);
     }
 
-    fn dispatch_precompute(
+    fn dispatch_static_precompute(
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
@@ -256,6 +267,16 @@ impl UnrealAtmosphereContext {
             MULTI_SCATTERING_SIZE,
             "unreal.multi_scattering.pass",
         );
+    }
+
+    fn dispatch_sky_view(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        group: SpectralGroup,
+    ) {
+        let params_buffer = &self.params_buffers[group.index()];
+        let resources = &self.resources[group.index()];
         dispatch_compute_2d(
             encoder,
             &self.pipelines.sky_view,
@@ -295,18 +316,15 @@ impl RuntimeViewGpu {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PrecomputeKey {
+struct StaticPrecomputeKey {
     atmosphere: [u32; 4],
     settings: [u32; 6],
-    sun_dir: [u32; 3],
-    sky_view_height: u32,
-    sun_angular_radius: u32,
     phase_mode: HillairePhaseMode,
     aerosol: AerosolPreset,
 }
 
-impl PrecomputeKey {
-    fn from_params(params: &UnrealFrameParams, gpu_params: HillaireParamsGpu) -> Self {
+impl StaticPrecomputeKey {
+    fn from_params(params: &UnrealFrameParams) -> Self {
         let atmosphere = params.atmosphere;
         Self {
             atmosphere: [
@@ -323,15 +341,27 @@ impl PrecomputeKey {
                 params.settings.ground_albedo_spectral[2].to_bits(),
                 params.settings.ground_albedo_spectral[3].to_bits(),
             ],
-            sun_dir: [
-                gpu_params.sun_dir[0].to_bits(),
-                gpu_params.sun_dir[1].to_bits(),
-                gpu_params.sun_dir[2].to_bits(),
-            ],
-            sky_view_height: gpu_params.sky_view_height_km.to_bits(),
-            sun_angular_radius: params.sun.angular_radius_rad.to_bits(),
             phase_mode: params.phase_mode,
             aerosol: params.aerosol,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SkyViewKey {
+    sun_dir: [u32; 3],
+    sky_view_height: u32,
+}
+
+impl SkyViewKey {
+    fn from_gpu_params(params: HillaireParamsGpu) -> Self {
+        Self {
+            sun_dir: [
+                params.sun_dir[0].to_bits(),
+                params.sun_dir[1].to_bits(),
+                params.sun_dir[2].to_bits(),
+            ],
+            sky_view_height: params.sky_view_height_km.to_bits(),
         }
     }
 }
