@@ -6,12 +6,17 @@ edition.workspace = true
 [dependencies]
 bytemuck = { workspace = true }
 clap = { workspace = true }
+egui = "0.35.0"
+egui-wgpu = "0.35.0"
+egui-winit = "0.35.0"
 exr = { workspace = true }
 glam = { workspace = true }
 pollster = { workspace = true }
+rfd = "0.17.2"
 serde_json = { workspace = true }
 sky-core = { path = "../sky-core" }
 sky-unreal-atmosphere-8wave = { path = "../sky-unreal-atmosphere-8wave" }
+walkdir = "2.5"
 wgpu = { workspace = true }
 winit = { workspace = true }
 

@@ -1,10 +1,14 @@
 mod app;
 mod assets;
+mod catalog;
 mod color;
+mod controls;
 mod experiment;
 mod gpu;
 mod passes;
+mod ui_renderer;
 mod view;
+mod workbench;
 
 use std::{error::Error, path::PathBuf};
 

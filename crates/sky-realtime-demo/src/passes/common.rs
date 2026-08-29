@@ -1,5 +1,5 @@
 use crate::assets::RealtimeAsset;
-use crate::experiment::CompareMode;
+use crate::experiment::{CompareMode, SurfaceViewport};
 use crate::view::ViewState;
 
 const PRESENT_SHADER: &str = include_str!("../shaders/present_texture.wgsl");
@@ -9,7 +9,6 @@ pub(crate) struct TexturePresentPass {
     layout: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
     uniform_buffer: wgpu::Buffer,
-    exposure: f32,
     reference_projection_sun_observer: [f32; 4],
 }
 
@@ -26,16 +25,16 @@ impl TexturePresentPass {
             source: wgpu::ShaderSource::Wgsl(PRESENT_SHADER.into()),
         });
         let reference_projection_sun_observer = reference.projection_sun_observer();
-        let uniform = PresentUniform {
-            exposure_mode_ref_diff: [exposure.max(0.0), 0.0, reference.has_reference(), 4.0],
-            view_yaw_pitch_fov_aspect: [
-                ViewState::default().yaw_deg,
-                ViewState::default().pitch_deg,
-                ViewState::default().fov_y_deg,
-                1.0,
-            ],
+        let uniform = present_uniform(
+            CompareMode::Realtime,
+            ViewState::default(),
+            1,
+            1,
+            reference.is_available(),
+            exposure,
+            4.0,
             reference_projection_sun_observer,
-        };
+        );
         let uniform_buffer = wgpu::util::DeviceExt::create_buffer_init(
             device,
             &wgpu::util::BufferInitDescriptor {
@@ -112,7 +111,6 @@ impl TexturePresentPass {
             layout,
             bind_group,
             uniform_buffer,
-            exposure,
             reference_projection_sun_observer,
         }
     }
@@ -140,22 +138,28 @@ impl TexturePresentPass {
         width: u32,
         height: u32,
         has_reference: bool,
+        exposure: f32,
+        difference_scale: f32,
     ) {
-        let aspect = width.max(1) as f32 / height.max(1) as f32;
-        let uniform = PresentUniform {
-            exposure_mode_ref_diff: [
-                self.exposure,
-                compare_mode.shader_id(),
-                if has_reference { 1.0 } else { 0.0 },
-                4.0,
-            ],
-            view_yaw_pitch_fov_aspect: [view.yaw_deg, view.pitch_deg, view.fov_y_deg, aspect],
-            reference_projection_sun_observer: self.reference_projection_sun_observer,
-        };
+        let uniform = present_uniform(
+            compare_mode,
+            view,
+            width,
+            height,
+            has_reference,
+            exposure,
+            difference_scale,
+            self.reference_projection_sun_observer,
+        );
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
     }
 
-    pub(crate) fn render(&self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView) {
+    pub(crate) fn render(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        viewport: SurfaceViewport,
+    ) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("realtime_present_pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -172,6 +176,15 @@ impl TexturePresentPass {
             timestamp_writes: None,
             multiview_mask: None,
         });
+        pass.set_viewport(
+            viewport.x as f32,
+            viewport.y as f32,
+            viewport.width as f32,
+            viewport.height as f32,
+            0.0,
+            1.0,
+        );
+        pass.set_scissor_rect(viewport.x, viewport.y, viewport.width, viewport.height);
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.draw(0..3, 0..1);
@@ -218,6 +231,29 @@ struct PresentUniform {
 }
 
 const _: () = assert!(core::mem::size_of::<PresentUniform>() == 48);
+
+fn present_uniform(
+    compare_mode: CompareMode,
+    view: ViewState,
+    width: u32,
+    height: u32,
+    has_reference: bool,
+    exposure: f32,
+    difference_scale: f32,
+    reference_projection_sun_observer: [f32; 4],
+) -> PresentUniform {
+    let aspect = width.max(1) as f32 / height.max(1) as f32;
+    PresentUniform {
+        exposure_mode_ref_diff: [
+            exposure.max(0.0),
+            compare_mode.shader_id(),
+            if has_reference { 1.0 } else { 0.0 },
+            difference_scale.clamp(0.25, 32.0),
+        ],
+        view_yaw_pitch_fov_aspect: [view.yaw_deg, view.pitch_deg, view.fov_y_deg, aspect],
+        reference_projection_sun_observer,
+    }
+}
 
 pub(crate) struct ReferenceTexture {
     _texture: wgpu::Texture,
@@ -345,10 +381,6 @@ impl ReferenceTexture {
         self.available
     }
 
-    fn has_reference(&self) -> f32 {
-        if self.available { 1.0 } else { 0.0 }
-    }
-
     const fn projection_sun_observer(&self) -> [f32; 4] {
         self.projection_sun_observer
     }
@@ -401,6 +433,9 @@ const fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
 
 #[cfg(test)]
 mod tests {
+    use crate::experiment::CompareMode;
+    use crate::view::ViewState;
+
     #[test]
     fn present_shader_is_valid_wgsl() {
         let module =
@@ -410,5 +445,21 @@ mod tests {
             naga::valid::Capabilities::empty(),
         );
         validator.validate(&module).expect("validate present wgsl");
+    }
+
+    #[test]
+    fn present_uniform_uses_viewport_aspect_and_clamps_difference_scale() {
+        let uniform = super::present_uniform(
+            CompareMode::AbsoluteDifference,
+            ViewState::default(),
+            900,
+            600,
+            true,
+            0.2,
+            64.0,
+            [0.0; 4],
+        );
+        assert_eq!(uniform.exposure_mode_ref_diff, [0.2, 2.0, 1.0, 32.0]);
+        assert_eq!(uniform.view_yaw_pitch_fov_aspect[3], 1.5);
     }
 }

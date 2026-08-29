@@ -1,7 +1,3 @@
-use winit::dpi::PhysicalPosition;
-use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta};
-use winit::keyboard::{KeyCode, PhysicalKey};
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ViewState {
     pub yaw_deg: f32,
@@ -20,82 +16,31 @@ impl Default for ViewState {
 }
 
 impl ViewState {
-    const MIN_PITCH_DEG: f32 = -89.0;
-    const MAX_PITCH_DEG: f32 = 89.0;
-    const MIN_FOV_Y_DEG: f32 = 20.0;
-    const MAX_FOV_Y_DEG: f32 = 120.0;
+    pub const MIN_PITCH_DEG: f32 = -89.0;
+    pub const MAX_PITCH_DEG: f32 = 89.0;
+    pub const MIN_FOV_Y_DEG: f32 = 20.0;
+    pub const MAX_FOV_Y_DEG: f32 = 120.0;
 
-    fn orbit_pixels(&mut self, dx: f64, dy: f64) {
+    pub fn orbit_pixels(&mut self, dx: f64, dy: f64) {
         const DEG_PER_PIXEL: f32 = 0.18;
         self.yaw_deg = wrap_degrees(self.yaw_deg + dx as f32 * DEG_PER_PIXEL);
         self.pitch_deg = (self.pitch_deg - dy as f32 * DEG_PER_PIXEL)
             .clamp(Self::MIN_PITCH_DEG, Self::MAX_PITCH_DEG);
     }
 
-    fn zoom_steps(&mut self, steps: f32) {
+    pub fn zoom_steps(&mut self, steps: f32) {
         self.fov_y_deg =
             (self.fov_y_deg - steps * 3.0).clamp(Self::MIN_FOV_Y_DEG, Self::MAX_FOV_Y_DEG);
     }
-}
 
-#[derive(Debug)]
-pub struct ViewController {
-    state: ViewState,
-    orbiting: bool,
-    last_cursor: Option<PhysicalPosition<f64>>,
-}
-
-impl Default for ViewController {
-    fn default() -> Self {
-        Self {
-            state: ViewState::default(),
-            orbiting: false,
-            last_cursor: None,
-        }
-    }
-}
-
-impl ViewController {
-    pub fn state(&self) -> ViewState {
-        self.state
-    }
-
-    pub fn cursor_moved(&mut self, position: PhysicalPosition<f64>) {
-        if self.orbiting {
-            if let Some(last_cursor) = self.last_cursor {
-                self.state
-                    .orbit_pixels(position.x - last_cursor.x, position.y - last_cursor.y);
-            }
-        }
-        self.last_cursor = Some(position);
-    }
-
-    pub fn mouse_input(&mut self, button: MouseButton, state: ElementState) {
-        if button != MouseButton::Left {
-            return;
-        }
-        self.orbiting = state == ElementState::Pressed;
-        if !self.orbiting {
-            self.last_cursor = None;
-        }
-    }
-
-    pub fn mouse_wheel(&mut self, delta: MouseScrollDelta) {
-        let steps = match delta {
-            MouseScrollDelta::LineDelta(_, y) => y,
-            MouseScrollDelta::PixelDelta(position) => position.y as f32 / 48.0,
-        };
-        self.state.zoom_steps(steps);
-    }
-
-    pub fn keyboard_input(&mut self, event: &KeyEvent) {
-        if event.state != ElementState::Pressed || event.repeat {
-            return;
-        }
-        if event.physical_key == PhysicalKey::Code(KeyCode::KeyR) {
-            self.state = ViewState::default();
-            self.last_cursor = None;
-        }
+    pub fn normalize(&mut self) {
+        self.yaw_deg = wrap_degrees(self.yaw_deg);
+        self.pitch_deg = self
+            .pitch_deg
+            .clamp(Self::MIN_PITCH_DEG, Self::MAX_PITCH_DEG);
+        self.fov_y_deg = self
+            .fov_y_deg
+            .clamp(Self::MIN_FOV_Y_DEG, Self::MAX_FOV_Y_DEG);
     }
 }
 

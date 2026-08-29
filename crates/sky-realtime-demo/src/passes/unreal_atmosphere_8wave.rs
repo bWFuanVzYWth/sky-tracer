@@ -7,6 +7,7 @@ use sky_unreal_atmosphere_8wave::{
 use winit::dpi::PhysicalSize;
 
 use crate::color::DisplayTransform;
+use crate::controls::RealtimeControls;
 use crate::experiment::{
     CompareMode, ExperimentInit, FrameContext, RealtimeExperiment, UpdateContext,
 };
@@ -26,6 +27,8 @@ pub struct UnrealAtmosphere8WaveExperiment {
     settings: HillaireSettings,
     aerosol: AerosolPreset,
     phase_mode: HillairePhaseMode,
+    exposure_multiplier: f32,
+    difference_scale: f32,
     _display: DisplayTransform,
 }
 
@@ -44,6 +47,7 @@ impl UnrealAtmosphere8WaveExperiment {
             context.display.exposure,
         );
 
+        let controls = RealtimeControls::from_asset(context.asset);
         Ok(Self {
             atmosphere,
             targets,
@@ -52,11 +56,13 @@ impl UnrealAtmosphere8WaveExperiment {
             size,
             view: ViewState::default(),
             compare_mode: CompareMode::default(),
-            sun: sun_from_asset(context.asset, context.asset.manifest().sun_elevation_deg),
-            atmosphere_profile: atmosphere_from_asset(context.asset),
-            settings: HillaireSettings::default(),
-            aerosol: AerosolPreset::default(),
-            phase_mode: HillairePhaseMode::default(),
+            sun: sun_from_controls(&controls),
+            atmosphere_profile: controls.atmosphere(),
+            settings: controls.settings(),
+            aerosol: controls.aerosol,
+            phase_mode: controls.phase_mode,
+            exposure_multiplier: controls.exposure_multiplier(),
+            difference_scale: controls.difference_scale,
             _display: context.display,
         })
     }
@@ -82,14 +88,24 @@ impl RealtimeExperiment for UnrealAtmosphere8WaveExperiment {
     }
 
     fn update(&mut self, context: UpdateContext<'_>) {
-        self.view = context.view;
-        self.compare_mode = context.compare_mode;
-        self.sun = sun_from_asset(context.asset, context.sun_elevation_deg);
-        self.atmosphere_profile = atmosphere_from_asset(context.asset);
+        let controls = context.controls;
+        self.view = controls.view;
+        self.compare_mode = controls.compare_mode;
+        self.sun = sun_from_controls(controls);
+        self.atmosphere_profile = controls.atmosphere();
+        self.settings = controls.settings();
+        self.aerosol = controls.aerosol;
+        self.phase_mode = controls.phase_mode;
+        self.exposure_multiplier = controls.exposure_multiplier();
+        self.difference_scale = controls.difference_scale;
+    }
+
+    fn reference_available(&self) -> bool {
+        self.reference.is_available()
     }
 
     fn render(&mut self, context: FrameContext<'_>) {
-        self.ensure_size(context.device, context.surface_size);
+        self.ensure_size(context.device, context.viewport.size());
         let frame_params = UnrealFrameParams {
             view: view_frame_from_state(self.view, self.size, self.sun),
             atmosphere: self.atmosphere_profile,
@@ -112,21 +128,17 @@ impl RealtimeExperiment for UnrealAtmosphere8WaveExperiment {
             self.size.width(),
             self.size.height(),
             self.reference.is_available(),
+            self.exposure_multiplier,
+            self.difference_scale,
         );
-        self.present.render(context.encoder, context.target);
+        self.present
+            .render(context.encoder, context.target, context.viewport);
     }
 }
 
-fn atmosphere_from_asset(asset: &crate::assets::RealtimeAsset) -> HillaireAtmosphere {
-    let mut atmosphere = HillaireAtmosphere::default();
-    atmosphere.world_y0_radius_m =
-        atmosphere.bottom_radius_m + asset.manifest().observer_altitude_km.max(0.0) * 1000.0;
-    atmosphere
-}
-
-fn sun_from_asset(asset: &crate::assets::RealtimeAsset, elevation_deg: f32) -> Sun {
-    let manifest = asset.manifest();
-    let to_sun = direction_from_azimuth_elevation(manifest.sun_azimuth_deg, elevation_deg);
+fn sun_from_controls(controls: &RealtimeControls) -> Sun {
+    let to_sun =
+        direction_from_azimuth_elevation(controls.sun_azimuth_deg, controls.sun_elevation_deg);
     Sun {
         sun_to_scene: -to_sun,
         irradiance_rec2020_w_m2: Vec3::from_array(SUN_IRRADIANCE_REC2020_W_PER_M2),

@@ -46,7 +46,7 @@ fn vertex(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let dims = textureDimensions(source_texture);
     let pixel = clamp(
-        vec2<i32>(in.position.xy),
+        vec2<i32>(in.uv * vec2<f32>(dims)),
         vec2<i32>(0, 0),
         vec2<i32>(dims) - vec2<i32>(1, 1),
     );
@@ -59,8 +59,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         return vec4<f32>(realtime, 1.0);
     }
 
-    let framebuffer_uv = (vec2<f32>(pixel) + vec2<f32>(0.5)) / vec2<f32>(dims);
-    let view_uv = vec2<f32>(framebuffer_uv.x, 1.0 - framebuffer_uv.y);
+    let view_uv = vec2<f32>(in.uv.x, 1.0 - in.uv.y);
     let ray = view_ray_from_uv(view_uv);
     let reference_scene_srgb = max(
         textureSampleLevel(reference_texture, reference_sampler, reference_uv(ray), 0.0).rgb,
