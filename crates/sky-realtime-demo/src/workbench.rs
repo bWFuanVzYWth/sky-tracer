@@ -7,8 +7,11 @@ use sky_unreal_atmosphere_8wave::{AerosolPreset, HillairePhaseMode, HillaireSett
 use crate::assets::RealtimeAsset;
 use crate::catalog::{AssetEntry, CatalogScan};
 use crate::controls::{
-    MAX_ATMOSPHERE_THICKNESS_KM, MAX_EXPOSURE_EV, MAX_PLANET_RADIUS_KM,
-    MIN_ATMOSPHERE_THICKNESS_KM, MIN_EXPOSURE_EV, MIN_PLANET_RADIUS_KM, RealtimeControls,
+    DEFAULT_HDR_PAPER_WHITE_NITS, DEFAULT_HDR_PEAK_NITS, DEFAULT_REINHARD_OVEREXPOSURE,
+    MAX_ATMOSPHERE_THICKNESS_KM, MAX_EXPOSURE_EV, MAX_HDR_PAPER_WHITE_NITS, MAX_HDR_PEAK_NITS,
+    MAX_PLANET_RADIUS_KM, MAX_REINHARD_OVEREXPOSURE, MIN_ATMOSPHERE_THICKNESS_KM, MIN_EXPOSURE_EV,
+    MIN_HDR_PAPER_WHITE_NITS, MIN_HDR_PEAK_NITS, MIN_PLANET_RADIUS_KM, MIN_REINHARD_OVEREXPOSURE,
+    RealtimeControls,
 };
 use crate::experiment::CompareMode;
 use crate::view::ViewState;
@@ -175,11 +178,19 @@ impl WorkbenchState {
         root: &mut egui::Ui,
         asset: &RealtimeAsset,
         reference_available: bool,
+        hdr_supported: bool,
+        hdr_active: bool,
     ) -> WorkbenchFrame {
         let mut actions = Vec::new();
 
-        self.top_toolbar(root, asset, reference_available, &mut actions);
-        self.status_bar(root, asset, reference_available);
+        self.top_toolbar(
+            root,
+            asset,
+            reference_available,
+            hdr_supported,
+            &mut actions,
+        );
+        self.status_bar(root, asset, reference_available, hdr_supported, hdr_active);
         if self.assets_open {
             self.assets_panel(root, &mut actions);
         }
@@ -214,7 +225,7 @@ impl WorkbenchState {
             );
             let inspector =
                 egui::Rect::from_min_max(egui::pos2(divider_x, remaining.min.y), remaining.max);
-            self.inspector_at(root, inspector, asset);
+            self.inspector_at(root, inspector, asset, hdr_supported);
             self.viewport_at(root, viewport, reference_available)
         } else {
             self.viewport_at(root, remaining, reference_available)
@@ -232,6 +243,7 @@ impl WorkbenchState {
         root: &mut egui::Ui,
         asset: &RealtimeAsset,
         reference_available: bool,
+        hdr_supported: bool,
         actions: &mut Vec<WorkbenchAction>,
     ) {
         egui::Panel::top("workbench-toolbar")
@@ -301,6 +313,21 @@ impl WorkbenchState {
                         self.ground_albedo_linked = true;
                     }
 
+                    let hdr = ui.add_enabled(
+                        hdr_supported,
+                        egui::Button::new("HDR").selected(self.controls.hdr_enabled),
+                    );
+                    let hdr = if hdr_supported {
+                        hdr.on_hover_text("Toggle 16-bit floating-point scRGB output (F6)")
+                    } else {
+                        hdr.on_disabled_hover_text(
+                            "The active adapter/surface does not expose scRGB Rgba16Float",
+                        )
+                    };
+                    if hdr.clicked() {
+                        self.controls.hdr_enabled = !self.controls.hdr_enabled;
+                    }
+
                     ui.separator();
                     if ui.selectable_label(self.assets_open, "Assets").clicked() {
                         self.assets_open = !self.assets_open;
@@ -315,7 +342,14 @@ impl WorkbenchState {
             });
     }
 
-    fn status_bar(&self, root: &mut egui::Ui, asset: &RealtimeAsset, reference_available: bool) {
+    fn status_bar(
+        &self,
+        root: &mut egui::Ui,
+        asset: &RealtimeAsset,
+        reference_available: bool,
+        hdr_supported: bool,
+        hdr_active: bool,
+    ) {
         egui::Panel::bottom("workbench-status")
             .exact_size(28.0)
             .frame(
@@ -336,6 +370,17 @@ impl WorkbenchState {
                             manifest.spp
                         ))
                         .color(MUTED),
+                    );
+                    ui.separator();
+                    ui.label(
+                        RichText::new(if hdr_active {
+                            "HDR scRGB active"
+                        } else if hdr_supported {
+                            "SDR output"
+                        } else {
+                            "SDR output · HDR unavailable"
+                        })
+                        .color(if hdr_active { ACCENT } else { MUTED }),
                     );
                     ui.separator();
                     ui.label(
@@ -465,7 +510,13 @@ impl WorkbenchState {
             });
     }
 
-    fn inspector_at(&mut self, root: &mut egui::Ui, rect: egui::Rect, asset: &RealtimeAsset) {
+    fn inspector_at(
+        &mut self,
+        root: &mut egui::Ui,
+        rect: egui::Rect,
+        asset: &RealtimeAsset,
+        hdr_supported: bool,
+    ) {
         root.painter().rect_filled(rect, 0.0, PANEL_FILL);
         root.painter().line_segment(
             [rect.left_top(), rect.left_bottom()],
@@ -564,8 +615,63 @@ impl WorkbenchState {
                             4.0,
                             "Magnification applied in absolute and signed difference modes.",
                         );
+                        ui.checkbox(&mut self.controls.tone_mapping_enabled, "Tone mapping")
+                            .on_hover_text(
+                                "Apply the drt-bench Enhanced Reinhard curve and Oklab gamut mapping.",
+                            );
+                        let hdr = ui.add_enabled(
+                            hdr_supported,
+                            egui::Checkbox::new(&mut self.controls.hdr_enabled, "HDR scRGB output"),
+                        );
+                        if hdr_supported {
+                            hdr.on_hover_text(
+                                "Use a 16-bit floating-point scRGB surface. Enable HDR in Windows for physical HDR output.",
+                            );
+                        } else {
+                            hdr.on_disabled_hover_text(
+                                "The active adapter/surface does not expose scRGB Rgba16Float",
+                            );
+                        }
+                        ui.add_enabled_ui(self.controls.tone_mapping_enabled, |ui| {
+                            resettable_slider(
+                                ui,
+                                &mut self.controls.reinhard_overexposure,
+                                MIN_REINHARD_OVEREXPOSURE..=MAX_REINHARD_OVEREXPOSURE,
+                                "Reinhard asymptote",
+                                DEFAULT_REINHARD_OVEREXPOSURE,
+                                "Enhanced Reinhard overexposure asymptote. Middle gray remains fixed at 18%.",
+                            );
+                        });
+                        ui.add_enabled_ui(self.controls.hdr_enabled && hdr_supported, |ui| {
+                            resettable_slider(
+                                ui,
+                                &mut self.controls.hdr_paper_white_nits,
+                                MIN_HDR_PAPER_WHITE_NITS..=MAX_HDR_PAPER_WHITE_NITS,
+                                "HDR paper white (nits)",
+                                DEFAULT_HDR_PAPER_WHITE_NITS,
+                                "Luminance assigned to mapped display white in the scRGB surface.",
+                            );
+                            resettable_slider(
+                                ui,
+                                &mut self.controls.hdr_peak_nits,
+                                MIN_HDR_PEAK_NITS..=MAX_HDR_PEAK_NITS,
+                                "HDR peak clamp (nits)",
+                                DEFAULT_HDR_PEAK_NITS,
+                                "Safety clamp for untone-mapped HDR highlights.",
+                            );
+                        });
                         ui.label(
-                            RichText::new("Output: sRGB / compact OpenDRT")
+                            RichText::new(if !self.controls.tone_mapping_enabled {
+                                if self.controls.hdr_enabled {
+                                    "Output: raw exposed linear scRGB"
+                                } else {
+                                    "Output: raw exposed linear sRGB (clipped)"
+                                }
+                            } else if self.controls.hdr_enabled {
+                                "Output: linear scRGB / Enhanced Reinhard gamut"
+                            } else {
+                                "Output: sRGB / Enhanced Reinhard gamut"
+                            })
                                 .small()
                                 .color(MUTED),
                         );

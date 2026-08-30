@@ -7,28 +7,28 @@ pub struct DisplayTransform {
 impl Default for DisplayTransform {
     fn default() -> Self {
         Self {
-            output_space: OutputColorSpace::SrgbOpenDrtDebug,
-            exposure: 0.08,
+            output_space: OutputColorSpace::SrgbReinhardGamut,
+            exposure: 0.10,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutputColorSpace {
-    SrgbOpenDrtDebug,
+    SrgbReinhardGamut,
 }
 
 impl OutputColorSpace {
     #[allow(dead_code)]
     pub const fn shader_id(self) -> f32 {
         match self {
-            Self::SrgbOpenDrtDebug => 0.0,
+            Self::SrgbReinhardGamut => 0.0,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::SrgbOpenDrtDebug => "srgb-opendrt-debug",
+            Self::SrgbReinhardGamut => "srgb-reinhard-gamut",
         }
     }
 }

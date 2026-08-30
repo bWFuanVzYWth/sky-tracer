@@ -9,6 +9,15 @@ use crate::view::ViewState;
 
 pub const MIN_EXPOSURE_EV: f32 = -20.0;
 pub const MAX_EXPOSURE_EV: f32 = 20.0;
+pub const MIN_REINHARD_OVEREXPOSURE: f32 = 0.5;
+pub const MAX_REINHARD_OVEREXPOSURE: f32 = 2.0;
+pub const MIN_HDR_PAPER_WHITE_NITS: f32 = 80.0;
+pub const MAX_HDR_PAPER_WHITE_NITS: f32 = 400.0;
+pub const MIN_HDR_PEAK_NITS: f32 = 400.0;
+pub const MAX_HDR_PEAK_NITS: f32 = 4_000.0;
+pub const DEFAULT_REINHARD_OVEREXPOSURE: f32 = 1.1;
+pub const DEFAULT_HDR_PAPER_WHITE_NITS: f32 = 203.0;
+pub const DEFAULT_HDR_PEAK_NITS: f32 = 1_000.0;
 pub const MIN_PLANET_RADIUS_KM: f32 = 1_000.0;
 pub const MAX_PLANET_RADIUS_KM: f32 = 10_000.0;
 pub const MIN_ATMOSPHERE_THICKNESS_KM: f32 = 1.0;
@@ -23,6 +32,11 @@ pub struct RealtimeControls {
     pub observer_altitude_km: f32,
     pub exposure_ev: f32,
     pub difference_scale: f32,
+    pub tone_mapping_enabled: bool,
+    pub hdr_enabled: bool,
+    pub reinhard_overexposure: f32,
+    pub hdr_paper_white_nits: f32,
+    pub hdr_peak_nits: f32,
     pub planet_radius_km: f32,
     pub atmosphere_thickness_km: f32,
     pub month: u32,
@@ -45,6 +59,11 @@ impl RealtimeControls {
             observer_altitude_km: manifest.observer_altitude_km,
             exposure_ev: 0.0,
             difference_scale: 4.0,
+            tone_mapping_enabled: true,
+            hdr_enabled: false,
+            reinhard_overexposure: DEFAULT_REINHARD_OVEREXPOSURE,
+            hdr_paper_white_nits: DEFAULT_HDR_PAPER_WHITE_NITS,
+            hdr_peak_nits: DEFAULT_HDR_PEAK_NITS,
             planet_radius_km: atmosphere.bottom_radius_m * 0.001,
             atmosphere_thickness_km: (atmosphere.top_radius_m - atmosphere.bottom_radius_m) * 0.001,
             month: settings.month,
@@ -62,6 +81,16 @@ impl RealtimeControls {
         self.sun_elevation_deg = self.sun_elevation_deg.clamp(-90.0, 90.0);
         self.exposure_ev = self.exposure_ev.clamp(MIN_EXPOSURE_EV, MAX_EXPOSURE_EV);
         self.difference_scale = self.difference_scale.clamp(0.25, 32.0);
+        self.reinhard_overexposure = self
+            .reinhard_overexposure
+            .clamp(MIN_REINHARD_OVEREXPOSURE, MAX_REINHARD_OVEREXPOSURE);
+        self.hdr_paper_white_nits = self
+            .hdr_paper_white_nits
+            .clamp(MIN_HDR_PAPER_WHITE_NITS, MAX_HDR_PAPER_WHITE_NITS);
+        self.hdr_peak_nits = self
+            .hdr_peak_nits
+            .clamp(MIN_HDR_PEAK_NITS, MAX_HDR_PEAK_NITS)
+            .max(self.hdr_paper_white_nits);
         self.planet_radius_km = self
             .planet_radius_km
             .clamp(MIN_PLANET_RADIUS_KM, MAX_PLANET_RADIUS_KM);
@@ -104,6 +133,11 @@ impl RealtimeControls {
         self.compare_mode = CompareMode::default();
         self.exposure_ev = 0.0;
         self.difference_scale = 4.0;
+        self.tone_mapping_enabled = true;
+        self.hdr_enabled = false;
+        self.reinhard_overexposure = DEFAULT_REINHARD_OVEREXPOSURE;
+        self.hdr_paper_white_nits = DEFAULT_HDR_PAPER_WHITE_NITS;
+        self.hdr_peak_nits = DEFAULT_HDR_PEAK_NITS;
     }
 
     pub fn reset_atmosphere(&mut self) {
@@ -133,6 +167,14 @@ impl RealtimeControls {
 
     pub fn exposure_multiplier(&self) -> f32 {
         DisplayTransform::default().exposure * self.exposure_ev.exp2()
+    }
+
+    pub fn hdr_paper_white_scale(&self) -> f32 {
+        self.hdr_paper_white_nits / 80.0
+    }
+
+    pub fn hdr_peak_scale(&self) -> f32 {
+        self.hdr_peak_nits / 80.0
     }
 
     pub fn atmosphere(&self) -> HillaireAtmosphere {
@@ -212,10 +254,16 @@ mod tests {
         controls.sun_elevation_deg = -120.0;
         controls.atmosphere_thickness_km = 5.0;
         controls.observer_altitude_km = 20.0;
+        controls.reinhard_overexposure = 10.0;
+        controls.hdr_paper_white_nits = 1_000.0;
+        controls.hdr_peak_nits = 100.0;
         controls = controls.normalized();
         assert_eq!(controls.exposure_ev, MAX_EXPOSURE_EV);
         assert_eq!(controls.sun_elevation_deg, -90.0);
         assert!(controls.observer_altitude_km < controls.atmosphere_thickness_km);
+        assert_eq!(controls.reinhard_overexposure, 2.0);
+        assert_eq!(controls.hdr_paper_white_nits, 400.0);
+        assert_eq!(controls.hdr_peak_nits, 400.0);
     }
 
     #[test]
@@ -241,15 +289,34 @@ mod tests {
         controls.view.yaw_deg = 90.0;
         controls.exposure_ev = 3.0;
         controls.difference_scale = 16.0;
+        controls.tone_mapping_enabled = false;
+        controls.hdr_enabled = true;
+        controls.reinhard_overexposure = 1.8;
+        controls.hdr_paper_white_nits = 300.0;
         controls.aerosol_turbidity = 8.0;
 
         controls.reset_display();
         assert_eq!(controls.view.yaw_deg, 90.0);
         assert_eq!(controls.exposure_ev, defaults.exposure_ev);
         assert_eq!(controls.difference_scale, defaults.difference_scale);
+        assert!(controls.tone_mapping_enabled);
+        assert!(!controls.hdr_enabled);
+        assert_eq!(
+            controls.reinhard_overexposure,
+            defaults.reinhard_overexposure
+        );
+        assert_eq!(controls.hdr_paper_white_nits, defaults.hdr_paper_white_nits);
         assert_eq!(controls.aerosol_turbidity, 8.0);
 
         controls.reset_all(&asset);
         assert_eq!(controls, defaults);
+    }
+
+    #[test]
+    fn hdr_scales_use_the_scrgb_eighty_nit_reference() {
+        let asset = test_asset();
+        let controls = RealtimeControls::from_asset(&asset);
+        assert_eq!(controls.hdr_paper_white_scale(), 203.0 / 80.0);
+        assert_eq!(controls.hdr_peak_scale(), 1000.0 / 80.0);
     }
 }

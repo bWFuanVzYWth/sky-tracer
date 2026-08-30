@@ -1,8 +1,16 @@
 use crate::assets::RealtimeAsset;
+use crate::controls::{
+    DEFAULT_HDR_PAPER_WHITE_NITS, DEFAULT_HDR_PEAK_NITS, DEFAULT_REINHARD_OVEREXPOSURE,
+};
 use crate::experiment::{CompareMode, SurfaceViewport};
 use crate::view::ViewState;
 
+const REINHARD_GAMUT_SHADER: &str = include_str!("../shaders/reinhard_gamut.wgsl");
 const PRESENT_SHADER: &str = include_str!("../shaders/present_texture.wgsl");
+
+fn present_shader_source() -> String {
+    format!("{REINHARD_GAMUT_SHADER}\n{PRESENT_SHADER}")
+}
 
 pub(crate) struct TexturePresentPass {
     pipeline: wgpu::RenderPipeline,
@@ -20,9 +28,10 @@ impl TexturePresentPass {
         reference: &ReferenceTexture,
         exposure: f32,
     ) -> Self {
+        let shader_source = present_shader_source();
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("realtime_present_shader"),
-            source: wgpu::ShaderSource::Wgsl(PRESENT_SHADER.into()),
+            source: wgpu::ShaderSource::Wgsl(shader_source.into()),
         });
         let reference_projection_sun_observer = reference.projection_sun_observer();
         let uniform = present_uniform(
@@ -33,6 +42,11 @@ impl TexturePresentPass {
             reference.is_available(),
             exposure,
             4.0,
+            true,
+            false,
+            DEFAULT_REINHARD_OVEREXPOSURE,
+            DEFAULT_HDR_PAPER_WHITE_NITS / 80.0,
+            DEFAULT_HDR_PEAK_NITS / 80.0,
             reference_projection_sun_observer,
         );
         let uniform_buffer = wgpu::util::DeviceExt::create_buffer_init(
@@ -140,6 +154,11 @@ impl TexturePresentPass {
         has_reference: bool,
         exposure: f32,
         difference_scale: f32,
+        tone_mapping_enabled: bool,
+        hdr_enabled: bool,
+        reinhard_overexposure: f32,
+        hdr_paper_white_scale: f32,
+        hdr_peak_scale: f32,
     ) {
         let uniform = present_uniform(
             compare_mode,
@@ -149,6 +168,11 @@ impl TexturePresentPass {
             has_reference,
             exposure,
             difference_scale,
+            tone_mapping_enabled,
+            hdr_enabled,
+            reinhard_overexposure,
+            hdr_paper_white_scale,
+            hdr_peak_scale,
             self.reference_projection_sun_observer,
         );
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
@@ -228,9 +252,11 @@ struct PresentUniform {
     exposure_mode_ref_diff: [f32; 4],
     view_yaw_pitch_fov_aspect: [f32; 4],
     reference_projection_sun_observer: [f32; 4],
+    tonemap_hdr_reinhard_white: [f32; 4],
+    hdr_peak_reserved: [f32; 4],
 }
 
-const _: () = assert!(core::mem::size_of::<PresentUniform>() == 48);
+const _: () = assert!(core::mem::size_of::<PresentUniform>() == 80);
 
 fn present_uniform(
     compare_mode: CompareMode,
@@ -240,6 +266,11 @@ fn present_uniform(
     has_reference: bool,
     exposure: f32,
     difference_scale: f32,
+    tone_mapping_enabled: bool,
+    hdr_enabled: bool,
+    reinhard_overexposure: f32,
+    hdr_paper_white_scale: f32,
+    hdr_peak_scale: f32,
     reference_projection_sun_observer: [f32; 4],
 ) -> PresentUniform {
     let aspect = width.max(1) as f32 / height.max(1) as f32;
@@ -252,6 +283,13 @@ fn present_uniform(
         ],
         view_yaw_pitch_fov_aspect: [view.yaw_deg, view.pitch_deg, view.fov_y_deg, aspect],
         reference_projection_sun_observer,
+        tonemap_hdr_reinhard_white: [
+            if tone_mapping_enabled { 1.0 } else { 0.0 },
+            if hdr_enabled { 1.0 } else { 0.0 },
+            reinhard_overexposure.clamp(0.5, 2.0),
+            hdr_paper_white_scale.clamp(1.0, 5.0),
+        ],
+        hdr_peak_reserved: [hdr_peak_scale.clamp(5.0, 50.0), 0.0, 0.0, 0.0],
     }
 }
 
@@ -438,8 +476,8 @@ mod tests {
 
     #[test]
     fn present_shader_is_valid_wgsl() {
-        let module =
-            naga::front::wgsl::parse_str(super::PRESENT_SHADER).expect("parse present wgsl");
+        let source = super::present_shader_source();
+        let module = naga::front::wgsl::parse_str(&source).expect("parse present wgsl");
         let mut validator = naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::empty(),
@@ -457,9 +495,19 @@ mod tests {
             true,
             0.2,
             64.0,
+            true,
+            true,
+            1.1,
+            203.0 / 80.0,
+            1000.0 / 80.0,
             [0.0; 4],
         );
         assert_eq!(uniform.exposure_mode_ref_diff, [0.2, 2.0, 1.0, 32.0]);
         assert_eq!(uniform.view_yaw_pitch_fov_aspect[3], 1.5);
+        assert_eq!(
+            uniform.tonemap_hdr_reinhard_white,
+            [1.0, 1.0, 1.1, 203.0 / 80.0]
+        );
+        assert_eq!(uniform.hdr_peak_reserved[0], 1000.0 / 80.0);
     }
 }

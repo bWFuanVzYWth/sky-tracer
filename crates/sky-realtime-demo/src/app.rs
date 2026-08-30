@@ -122,6 +122,84 @@ impl DemoApp {
         }
     }
 
+    fn create_ui_renderer(&self, gpu: &GpuContext) -> UiRenderer {
+        let proxy = self.proxy.clone();
+        UiRenderer::new(
+            gpu.window(),
+            gpu.device(),
+            gpu.surface_format(),
+            move |delay| {
+                let _ = proxy.send_event(UserEvent::RepaintAfter(delay));
+            },
+        )
+    }
+
+    fn synchronize_display_mode(&mut self) -> bool {
+        let desired_hdr = self.workbench.controls.hdr_enabled;
+        let Some(gpu) = &self.gpu else {
+            return false;
+        };
+        if desired_hdr == gpu.hdr_enabled() {
+            return false;
+        }
+        if desired_hdr && !gpu.hdr_supported() {
+            self.workbench.controls.hdr_enabled = false;
+            self.workbench
+                .set_error("HDR unavailable: this surface has no scRGB Rgba16Float format.");
+            self.request_redraw();
+            return false;
+        }
+
+        let previous_hdr = gpu.hdr_enabled();
+        if let Err(error) = self
+            .gpu
+            .as_mut()
+            .expect("GPU checked above")
+            .set_hdr_enabled(desired_hdr)
+        {
+            self.workbench.controls.hdr_enabled = previous_hdr;
+            self.workbench
+                .set_error(format!("HDR switch failed: {error}"));
+            self.request_redraw();
+            return false;
+        }
+
+        let next_experiment = {
+            let gpu = self.gpu.as_ref().expect("GPU checked above");
+            Self::create_experiment(self.experiment_kind, gpu, &self.asset)
+        };
+        let next_experiment = match next_experiment {
+            Ok(experiment) => experiment,
+            Err(error) => {
+                let _ = self
+                    .gpu
+                    .as_mut()
+                    .expect("GPU checked above")
+                    .set_hdr_enabled(previous_hdr);
+                self.workbench.controls.hdr_enabled = previous_hdr;
+                self.workbench
+                    .set_error(format!("HDR pipeline rebuild failed: {error}"));
+                self.request_redraw();
+                return false;
+            }
+        };
+
+        let next_ui = {
+            let gpu = self.gpu.as_ref().expect("GPU checked above");
+            self.create_ui_renderer(gpu)
+        };
+        self.experiment = Some(next_experiment);
+        self.ui = Some(next_ui);
+        if let Some(gpu) = &self.gpu {
+            gpu.window().set_title(&format!(
+                "{}{}",
+                self.asset.title(),
+                if desired_hdr { " [HDR scRGB]" } else { "" }
+            ));
+        }
+        true
+    }
+
     fn start_catalog_scan(&mut self) {
         let (generation, root) = self.workbench.begin_scan();
         let proxy = self.proxy.clone();
@@ -157,7 +235,15 @@ impl DemoApp {
             self.workbench.controls.compare_mode = CompareMode::Realtime;
         }
         if let Some(gpu) = &self.gpu {
-            gpu.window().set_title(&self.asset.title());
+            gpu.window().set_title(&format!(
+                "{}{}",
+                self.asset.title(),
+                if gpu.hdr_enabled() {
+                    " [HDR scRGB]"
+                } else {
+                    ""
+                }
+            ));
         }
         println!("loaded asset: {}", self.asset.summary_line());
     }
@@ -200,6 +286,9 @@ impl DemoApp {
 
     fn render_frame(&mut self, event_loop: &ActiveEventLoop) {
         let reference_available = self.reference_available();
+        let (hdr_supported, hdr_active) = self.gpu.as_ref().map_or((false, false), |gpu| {
+            (gpu.hdr_supported(), gpu.hdr_enabled())
+        });
         let (workbench_frame, prepared_ui) = {
             let Some(gpu) = &self.gpu else {
                 return;
@@ -208,13 +297,23 @@ impl DemoApp {
                 return;
             };
             ui.run(gpu.window(), |root| {
-                self.workbench.show(root, &self.asset, reference_available)
+                self.workbench.show(
+                    root,
+                    &self.asset,
+                    reference_available,
+                    hdr_supported,
+                    hdr_active,
+                )
             })
         };
 
         let mut actions = std::mem::take(&mut self.pending_actions);
         actions.extend(workbench_frame.actions);
         self.process_actions(actions);
+        if self.synchronize_display_mode() {
+            self.request_redraw();
+            return;
+        }
 
         let Some(gpu) = &self.gpu else {
             return;
@@ -274,7 +373,7 @@ impl DemoApp {
             target: &target,
             viewport,
         });
-        self.ui.as_ref().expect("UI initialized with GPU").render(
+        self.ui.as_mut().expect("UI initialized with GPU").render(
             &mut encoder,
             &target,
             &prepared_ui,
@@ -327,6 +426,10 @@ impl DemoApp {
                 if let Some(path) = self.workbench.step_asset(1) {
                     self.pending_actions.push(WorkbenchAction::LoadAsset(path));
                 }
+                return true;
+            }
+            KeyCode::F6 if self.gpu.as_ref().is_some_and(GpuContext::hdr_supported) => {
+                self.workbench.controls.hdr_enabled = !self.workbench.controls.hdr_enabled;
                 return true;
             }
             _ => {}
@@ -437,18 +540,11 @@ impl ApplicationHandler<UserEvent> for DemoApp {
             }
         };
 
-        let proxy = self.proxy.clone();
-        let ui = UiRenderer::new(
-            gpu.window(),
-            gpu.device(),
-            gpu.surface_format(),
-            move |delay| {
-                let _ = proxy.send_event(UserEvent::RepaintAfter(delay));
-            },
-        );
+        let ui = self.create_ui_renderer(&gpu);
         println!("selected realtime experiment: {}", experiment.name());
         println!("view controls: viewport drag = yaw/pitch, viewport wheel = fov, R = reset");
         println!("asset controls: Ctrl+O open, F5 rescan, Page Up/Down navigate");
+        println!("display controls: F6 toggles HDR scRGB when supported");
 
         self.experiment = Some(experiment);
         self.ui = Some(ui);

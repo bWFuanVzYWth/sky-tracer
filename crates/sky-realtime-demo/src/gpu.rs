@@ -9,6 +9,8 @@ pub struct GpuContext {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    sdr_format: wgpu::TextureFormat,
+    hdr_format: Option<wgpu::TextureFormat>,
     size: PhysicalSize<u32>,
 }
 
@@ -55,12 +57,9 @@ impl GpuContext {
             .map_err(|error| error.to_string())?;
 
         let caps = surface.get_capabilities(&adapter);
-        let format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(|format| format.is_srgb())
-            .unwrap_or(caps.formats[0]);
+        let sdr_format = preferred_sdr_format(&caps.formats)
+            .ok_or_else(|| "surface reports no compatible formats".to_owned())?;
+        let hdr_format = preferred_hdr_format(&caps.formats);
         let present_mode = caps
             .present_modes
             .iter()
@@ -72,7 +71,7 @@ impl GpuContext {
         let height = size.height.max(1);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
+            format: sdr_format,
             width,
             height,
             present_mode,
@@ -88,6 +87,8 @@ impl GpuContext {
             device,
             queue,
             config,
+            sdr_format,
+            hdr_format,
             size: PhysicalSize::new(width, height),
         })
     }
@@ -110,6 +111,30 @@ impl GpuContext {
 
     pub fn surface_format(&self) -> wgpu::TextureFormat {
         self.config.format
+    }
+
+    pub fn hdr_supported(&self) -> bool {
+        self.hdr_format.is_some()
+    }
+
+    pub fn hdr_enabled(&self) -> bool {
+        self.hdr_format == Some(self.config.format)
+    }
+
+    pub fn set_hdr_enabled(&mut self, enabled: bool) -> Result<bool, String> {
+        let format = if enabled {
+            self.hdr_format.ok_or_else(|| {
+                "the active adapter/surface does not expose an scRGB Rgba16Float format".to_owned()
+            })?
+        } else {
+            self.sdr_format
+        };
+        if format == self.config.format {
+            return Ok(false);
+        }
+        self.config.format = format;
+        self.surface.configure(&self.device, &self.config);
+        Ok(true)
     }
 
     pub fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -141,6 +166,21 @@ impl GpuContext {
     }
 }
 
+fn preferred_sdr_format(formats: &[wgpu::TextureFormat]) -> Option<wgpu::TextureFormat> {
+    formats
+        .iter()
+        .copied()
+        .find(wgpu::TextureFormat::is_srgb)
+        .or_else(|| formats.first().copied())
+}
+
+fn preferred_hdr_format(formats: &[wgpu::TextureFormat]) -> Option<wgpu::TextureFormat> {
+    formats
+        .iter()
+        .copied()
+        .find(|format| *format == wgpu::TextureFormat::Rgba16Float)
+}
+
 pub struct SurfaceFrame {
     pub texture: wgpu::SurfaceTexture,
     pub reconfigure_after_present: bool,
@@ -151,4 +191,32 @@ pub enum SurfaceFrameStatus {
     Reconfigure,
     Skip,
     Exit,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{preferred_hdr_format, preferred_sdr_format};
+
+    #[test]
+    fn surface_format_selection_prefers_srgb_sdr_and_float_scrgb_hdr() {
+        let formats = [
+            wgpu::TextureFormat::Rgba16Float,
+            wgpu::TextureFormat::Bgra8Unorm,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+        ];
+        assert_eq!(
+            preferred_sdr_format(&formats),
+            Some(wgpu::TextureFormat::Bgra8UnormSrgb)
+        );
+        assert_eq!(
+            preferred_hdr_format(&formats),
+            Some(wgpu::TextureFormat::Rgba16Float)
+        );
+    }
+
+    #[test]
+    fn hdr_is_unavailable_without_float_surface_format() {
+        let formats = [wgpu::TextureFormat::Bgra8UnormSrgb];
+        assert_eq!(preferred_hdr_format(&formats), None);
+    }
 }

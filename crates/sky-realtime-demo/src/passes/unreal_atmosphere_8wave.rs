@@ -29,6 +29,11 @@ pub struct UnrealAtmosphere8WaveExperiment {
     phase_mode: HillairePhaseMode,
     exposure_multiplier: f32,
     difference_scale: f32,
+    tone_mapping_enabled: bool,
+    hdr_enabled: bool,
+    reinhard_overexposure: f32,
+    hdr_paper_white_scale: f32,
+    hdr_peak_scale: f32,
     _display: DisplayTransform,
 }
 
@@ -63,6 +68,11 @@ impl UnrealAtmosphere8WaveExperiment {
             phase_mode: controls.phase_mode,
             exposure_multiplier: controls.exposure_multiplier(),
             difference_scale: controls.difference_scale,
+            tone_mapping_enabled: controls.tone_mapping_enabled,
+            hdr_enabled: controls.hdr_enabled,
+            reinhard_overexposure: controls.reinhard_overexposure,
+            hdr_paper_white_scale: controls.hdr_paper_white_scale(),
+            hdr_peak_scale: controls.hdr_peak_scale(),
             _display: context.display,
         })
     }
@@ -98,6 +108,11 @@ impl RealtimeExperiment for UnrealAtmosphere8WaveExperiment {
         self.phase_mode = controls.phase_mode;
         self.exposure_multiplier = controls.exposure_multiplier();
         self.difference_scale = controls.difference_scale;
+        self.tone_mapping_enabled = controls.tone_mapping_enabled;
+        self.hdr_enabled = controls.hdr_enabled;
+        self.reinhard_overexposure = controls.reinhard_overexposure;
+        self.hdr_paper_white_scale = controls.hdr_paper_white_scale();
+        self.hdr_peak_scale = controls.hdr_peak_scale();
     }
 
     fn reference_available(&self) -> bool {
@@ -130,6 +145,11 @@ impl RealtimeExperiment for UnrealAtmosphere8WaveExperiment {
             self.reference.is_available(),
             self.exposure_multiplier,
             self.difference_scale,
+            self.tone_mapping_enabled,
+            self.hdr_enabled,
+            self.reinhard_overexposure,
+            self.hdr_paper_white_scale,
+            self.hdr_peak_scale,
         );
         self.present
             .render(context.encoder, context.target, context.viewport);
