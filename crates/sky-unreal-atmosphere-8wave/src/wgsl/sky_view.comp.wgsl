@@ -9,7 +9,7 @@
 @group(0) @binding(8) var aerosol_phase_lut: texture_2d_array<f32>;
 @group(0) @binding(9) var aerosol_phase_lut_high: texture_2d_array<f32>;
 
-const SKY_VIEW_STEPS: u32 = 32u;
+const SKY_VIEW_STEPS: u32 = 128u;
 
 struct ScatterPair {
     radiance_low: vec4<f32>,

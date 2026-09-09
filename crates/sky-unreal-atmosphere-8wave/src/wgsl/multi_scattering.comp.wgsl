@@ -4,9 +4,9 @@
 @group(0) @binding(3) var multi_scattering_out: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(4) var aerosol_phase_lut: texture_2d_array<f32>;
 
-const MULTI_SCATTERING_RAY_STEPS: u32 = 32u;
-const MULTI_SCATTERING_SQRT_DIR_SAMPLES: u32 = 8u;
-const MULTI_SCATTERING_DIR_SAMPLES: u32 = 64u;
+const MULTI_SCATTERING_RAY_STEPS: u32 = 128u;
+const MULTI_SCATTERING_SQRT_DIR_SAMPLES: u32 = 16u;
+const MULTI_SCATTERING_DIR_SAMPLES: u32 = 256u;
 
 fn uniform_sphere_dir_y_up(sample_index: u32) -> vec3<f32> {
     let sqrt_n = f32(MULTI_SCATTERING_SQRT_DIR_SAMPLES);

@@ -16,7 +16,7 @@ use wgpu::util::{BufferInitDescriptor, DeviceExt};
 
 const M_TO_KM: f32 = 1.0e-3;
 const TRANSMITTANCE_SIZE: UVec2 = UVec2::new(256, 64);
-const MULTI_SCATTERING_SIZE: UVec2 = UVec2::new(32, 32);
+const MULTI_SCATTERING_SIZE: UVec2 = UVec2::new(64, 64);
 const SKY_VIEW_SIZE: UVec2 = UVec2::new(256, 256);
 const AERIAL_PERSPECTIVE_SIZE: UVec3 = UVec3::new(32, 32, 32);
 const AERIAL_PERSPECTIVE_MAX_DISTANCE_KM: f32 = 64.0;

@@ -2,6 +2,7 @@
 name = "sky-unreal-atmosphere-8wave"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 
 [dependencies]
 bytemuck = { version = "1.25", features = ["derive"] }
