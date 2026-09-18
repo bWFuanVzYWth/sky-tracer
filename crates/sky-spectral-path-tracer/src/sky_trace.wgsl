@@ -217,20 +217,28 @@ fn intersect_sphere(ray: Ray, radius: f32) -> SphereHit {
         return SphereHit(false, 0.0, 0.0);
     }
     let s = sqrt(discriminant);
-    return SphereHit(true, -b - s, -b + s);
+    let q = -b - select(-s, s, b >= 0.0);
+    if q == 0.0 { return SphereHit(true, 0.0, 0.0); }
+    let other = c / q;
+    return SphereHit(true, min(q, other), max(q, other));
 }
 
 fn positive_root(t0: f32, t1: f32) -> f32 {
-    if t0 > RAY_EPSILON_KM {
+    if t0 > 0.0 {
         return t0;
     }
-    if t1 > RAY_EPSILON_KM {
+    if t1 > 0.0 {
         return t1;
     }
     return -1.0;
 }
 
 fn next_boundary(ray: Ray) -> BoundaryHit {
+    // A volume vertex can round onto the surface. Never discard an inward
+    // ground hit or trace through the planet because it is within an epsilon.
+    if length(ray.origin) <= constants.ground_radius_km && dot(ray.origin, ray.dir) < 0.0 {
+        return BoundaryHit(true, 0.0, 0u);
+    }
     let atmosphere_hit = intersect_sphere(ray, constants.atmosphere_radius_km);
     if !atmosphere_hit.hit {
         return BoundaryHit(false, 0.0, 0u);
@@ -243,7 +251,7 @@ fn next_boundary(ray: Ray) -> BoundaryHit {
     }
 
     let t_exit = max(atmosphere_hit.t1, RAY_EPSILON_KM);
-    if t_ground > RAY_EPSILON_KM && t_ground < t_exit {
+    if t_ground > 0.0 && t_ground < t_exit {
         return BoundaryHit(true, t_ground, 0u);
     }
     return BoundaryHit(true, t_exit, 1u);
@@ -282,14 +290,19 @@ fn boundary_candidate(ray: Ray, t: f32, current_next: f32, altitude_boundary: f3
 }
 
 fn next_majorant_segment_end(ray: Ray, t: f32, t_max: f32) -> f32 {
-    let probe_t = min(t + RAY_EPSILON_KM, t_max);
-    let layer = layer_for_altitude(altitude_km(ray_at(ray, probe_t)));
+    // At a grazing crossing, an epsilon step may not change the rounded
+    // radius. The approximate layer can then be either side of the boundary.
+    // Search its neighbors too, and classify the resulting segment at its
+    // midpoint below. Never let a rounded boundary select a majorant for an
+    // entire inbound/outbound chord through denser layers.
+    let layer = layer_for_altitude(altitude_km(ray_at(ray, t)));
     let dz = constants.top_altitude_km / f32(constants.majorant_layers);
-    let lo = f32(layer) * dz;
-    let hi = f32(layer + 1u) * dz;
     var next_t = t_max;
-    next_t = boundary_candidate(ray, t, next_t, lo);
-    next_t = boundary_candidate(ray, t, next_t, hi);
+    let first=select(0u,layer-1u,layer>0u);
+    let last=min(layer+2u,constants.majorant_layers);
+    for(var edge=first;edge<=last;edge++) {
+        next_t=boundary_candidate(ray,t,next_t,f32(edge)*dz);
+    }
     return next_t;
 }
 
@@ -298,12 +311,10 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 }
 
 fn interpolate_atmosphere(altitude: f32) -> AtmosphereSample {
-    var hi = 0u;
-    loop {
-        if hi >= constants.atmosphere_len || atmosphere_profile[hi].altitude_km >= altitude {
-            break;
-        }
-        hi = hi + 1u;
+    var first=0u;var hi=constants.atmosphere_len;
+    while first<hi {
+        let mid=(first+hi)/2u;
+        if atmosphere_profile[mid].altitude_km<altitude {first=mid+1u;} else {hi=mid;}
     }
 
     if hi == 0u {
@@ -331,12 +342,10 @@ fn aerosol_mass(point: AerosolPoint) -> vec4f {
 }
 
 fn interpolate_aerosol(altitude: f32) -> AerosolSample {
-    var hi = 0u;
-    loop {
-        if hi >= constants.aerosol_len || aerosol_profile[hi].altitude_km >= altitude {
-            break;
-        }
-        hi = hi + 1u;
+    var first=0u;var hi=constants.aerosol_len;
+    while first<hi {
+        let mid=(first+hi)/2u;
+        if aerosol_profile[mid].altitude_km<altitude {first=mid+1u;} else {hi=mid;}
     }
 
     if hi == 0u {
@@ -416,7 +425,7 @@ fn sample_real_collision(ray: Ray, t_max: f32, band: u32, rng: ptr<function, Rng
         guard = guard + 1u;
 
         let segment_end = next_majorant_segment_end(ray, t, t_max);
-        let layer = layer_for_altitude(altitude_km(ray_at(ray, min(t + RAY_EPSILON_KM, segment_end))));
+        let layer = layer_for_altitude(altitude_km(ray_at(ray,0.5*(t+segment_end))));
         let majorant = majorant_for_layer(band, layer);
         loop {
             if t >= segment_end {
@@ -452,7 +461,7 @@ fn delta_transmittance(ray: Ray, t_max: f32, band: u32, rng: ptr<function, Rng>)
         guard = guard + 1u;
 
         let segment_end = next_majorant_segment_end(ray, t, t_max);
-        let layer = layer_for_altitude(altitude_km(ray_at(ray, min(t + RAY_EPSILON_KM, segment_end))));
+        let layer = layer_for_altitude(altitude_km(ray_at(ray,0.5*(t+segment_end))));
         let majorant = majorant_for_layer(band, layer);
         loop {
             if t >= segment_end {
@@ -571,7 +580,9 @@ fn direct_sun_at_scatter(pos: vec3f, view_dir: vec3f, band: u32, coeffs: MediumC
             break;
         }
         let light = sample_uniform_cone(sun_dir(), constants.sun_angular_radius_rad, rng);
-        let shadow_ray = Ray(pos + light.dir * RAY_EPSILON_KM, light.dir);
+        // Volume vertices need no surface offset. A directional offset can
+        // cross the ground and leak daylight through the planet at twilight.
+        let shadow_ray = Ray(pos, light.dir);
         let boundary = next_boundary(shadow_ray);
         if boundary.hit && boundary.kind == 1u {
             let trans = delta_transmittance(shadow_ray, boundary.t_km, band, rng);
@@ -595,7 +606,7 @@ fn ground_radiance(pos: vec3f, band: u32, rng: ptr<function, Rng>) -> f32 {
         let light = sample_uniform_cone(sun_dir(), constants.sun_angular_radius_rad, rng);
         let cos_sun = max(dot(normal, light.dir), 0.0);
         if cos_sun > 0.0 {
-            let shadow_ray = Ray(pos + light.dir * RAY_EPSILON_KM, light.dir);
+            let shadow_ray = Ray(normal * (constants.ground_radius_km + RAY_EPSILON_KM), light.dir);
             let boundary = next_boundary(shadow_ray);
             if boundary.hit && boundary.kind == 1u {
                 let trans = delta_transmittance(shadow_ray, boundary.t_km, band, rng);
@@ -702,11 +713,25 @@ fn russian_roulette(throughput: ptr<function, f32>, depth: u32, rng: ptr<functio
 
 fn trace_path(initial_ray: Ray, band: u32, rng: ptr<function, Rng>) -> TraceResult {
     var ray = initial_ray;
+    // Vacuum outside the atmosphere carries radiance unchanged. Start delta
+    // tracking at the near atmospheric intersection, not on the vacuum chord.
+    if length(ray.origin)>constants.atmosphere_radius_km {
+        let shell=intersect_sphere(ray,constants.atmosphere_radius_km);
+        if !shell.hit || shell.t1<=0.0 {
+            return TraceResult(select(0.0,bands[band].solar_radiance_w_m2_sr,
+                direction_in_cone(ray.dir,sun_dir(),constants.sun_angular_radius_rad)),false);
+        }
+        ray=Ray(ray_at(ray,max(shell.t0,0.0)),ray.dir);
+    }
     var throughput = 1.0;
     var radiance = 0.0;
     var depth = 0u;
 
     loop {
+        // Optional diagnostic truncation; zero preserves the normal estimator.
+        if constants._pad_tile0 > 0u && depth >= constants._pad_tile0 {
+            break;
+        }
         if depth >= constants.watchdog_limit {
             return TraceResult(radiance, true);
         }
@@ -741,7 +766,7 @@ fn trace_path(initial_ray: Ray, band: u32, rng: ptr<function, Rng>) -> TraceResu
                 break;
             }
 
-            ray = Ray(pos + phase_sample.dir * RAY_EPSILON_KM, phase_sample.dir);
+            ray = Ray(pos, phase_sample.dir);
         } else if boundary.kind == 1u {
             if depth == 0u && direction_in_cone(ray.dir, sun_dir(), constants.sun_angular_radius_rad) {
                 radiance = radiance + throughput * bands[band].solar_radiance_w_m2_sr;
@@ -763,7 +788,7 @@ fn trace_path(initial_ray: Ray, band: u32, rng: ptr<function, Rng>) -> TraceResu
                 break;
             }
 
-            ray = Ray(pos + bounce.dir * RAY_EPSILON_KM, bounce.dir);
+            ray = Ray(normal * (constants.ground_radius_km + RAY_EPSILON_KM), bounce.dir);
         }
 
         if radiance < 0.0 || radiance != radiance || throughput < 0.0 || throughput != throughput {
@@ -779,7 +804,7 @@ fn trace_path(initial_ray: Ray, band: u32, rng: ptr<function, Rng>) -> TraceResu
 fn main(@builtin(global_invocation_id) id: vec3u) {
     let x = id.x;
     let y = id.y;
-    let band = id.z;
+    let band = id.z+constants._pad_tile1;
     if x >= constants.width || y >= constants.height || band >= BAND_COUNT {
         return;
     }

@@ -1,0 +1,8 @@
+[
+  {"Name":"noon_horizon_85","Asset":"out/pt_noon_085/asset.json","Yaw":0,"Pitch":1,"Fov":30,"Exposure":0},
+  {"Name":"noon_wide_85","Asset":"out/pt_noon_085/asset.json","Yaw":0,"Pitch":30,"Fov":120,"Exposure":0},
+  {"Name":"near_sun_20","Asset":"out_skyview_search/elev_020/asset.json","Yaw":0,"Pitch":20,"Fov":30,"Exposure":0},
+  {"Name":"ring_45","Asset":"out_skyview_search/elev_045/asset.json","Yaw":0,"Pitch":30,"Fov":120,"Exposure":0},
+  {"Name":"blue_sun_m06","Asset":"out/lut_pt_v1/elev_m06/asset.json","Yaw":0,"Pitch":3,"Fov":60,"Exposure":12},
+  {"Name":"earth_shadow_m06","Asset":"out/lut_pt_v1/elev_m06/asset.json","Yaw":180,"Pitch":5,"Fov":60,"Exposure":12}
+]

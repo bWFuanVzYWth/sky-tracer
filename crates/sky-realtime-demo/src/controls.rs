@@ -162,7 +162,7 @@ impl RealtimeControls {
     }
 
     pub fn maximum_observer_altitude_km(&self) -> f32 {
-        (self.atmosphere_thickness_km - 0.001).max(0.0)
+        100_000.0
     }
 
     pub fn exposure_multiplier(&self) -> f32 {
@@ -260,7 +260,7 @@ mod tests {
         controls = controls.normalized();
         assert_eq!(controls.exposure_ev, MAX_EXPOSURE_EV);
         assert_eq!(controls.sun_elevation_deg, -90.0);
-        assert!(controls.observer_altitude_km < controls.atmosphere_thickness_km);
+        assert_eq!(controls.observer_altitude_km, 20.0);
         assert_eq!(controls.reinhard_overexposure, 2.0);
         assert_eq!(controls.hdr_paper_white_nits, 400.0);
         assert_eq!(controls.hdr_peak_nits, 400.0);

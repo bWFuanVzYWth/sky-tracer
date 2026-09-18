@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub const SPECTRAL_PANORAMA_KIND: &str = "spectral_panorama_v0";
 pub const SPECTRAL_SKY_VIEW_LUT_KIND: &str = "spectral_sky_view_lut_v0";
+pub const LAYERED_TRANSPORT_VERSION: &str = "wgpu-layered-surface-v2";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SpectralAssetManifest {
@@ -15,6 +16,9 @@ pub struct SpectralAssetManifest {
     pub observer_altitude_km: f32,
     pub band_centers_nm: Vec<f32>,
     pub data_hash: Option<String>,
+    /// Identifies the transport implementation used to render these pixels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub colorimetry: Option<SpectralAssetColorimetry>,
     pub files: SpectralAssetFiles,
@@ -65,6 +69,7 @@ impl SpectralAssetManifest {
             observer_altitude_km,
             band_centers_nm,
             data_hash: None,
+            transport_version: None,
             colorimetry: None,
             files,
         }
@@ -91,6 +96,7 @@ impl SpectralAssetManifest {
             observer_altitude_km,
             band_centers_nm,
             data_hash: None,
+            transport_version: None,
             colorimetry: None,
             files,
         }

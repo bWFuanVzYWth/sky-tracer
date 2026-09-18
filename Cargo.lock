@@ -196,6 +196,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
+name = "bcdec_rs"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f09c37bc0e9f0924b7dae9988265ef3c76c88538f41a3b06caf4bed07cee5226"
+
+[[package]]
 name = "bit-set"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1195,10 +1201,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "intel_tex_2"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7980d359170e7da4bc2421aa74c49d338a3153313e006d732a3430f1af375a60"
+dependencies = [
+ "ispc_rt",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
+
+[[package]]
+name = "ispc_rt"
+version = "2.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a396f76fd253fab9945bb4c6080f515d0c4036bc30219462d199b58886fd37b4"
+dependencies = [
+ "libc",
+ "num_cpus",
+]
 
 [[package]]
 name = "itertools"
@@ -1514,6 +1539,16 @@ checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
  "libm",
+]
+
+[[package]]
+name = "num_cpus"
+version = "1.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b"
+dependencies = [
+ "hermit-abi",
+ "libc",
 ]
 
 [[package]]
@@ -2123,6 +2158,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rayon"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
+dependencies = [
+ "either",
+ "rayon-core",
+]
+
+[[package]]
 name = "rayon-core"
 version = "1.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2383,10 +2428,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "sky-atmosphere-lut"
+version = "0.1.0"
+dependencies = [
+ "bcdec_rs",
+ "bytemuck",
+ "clap",
+ "glam",
+ "half",
+ "intel_tex_2",
+ "pollster",
+ "rayon",
+ "serde",
+ "serde_json",
+ "sky-core",
+ "sky-spectral-path-tracer",
+ "sky-unreal-atmosphere-8wave",
+ "wgpu",
+]
+
+[[package]]
 name = "sky-core"
 version = "0.1.0"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "sky-hybrid-atmosphere"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "clap",
+ "glam",
+ "naga",
+ "pollster",
+ "serde",
+ "serde_json",
+ "sky-atmosphere-lut",
+ "sky-core",
+ "wgpu",
 ]
 
 [[package]]
@@ -2400,11 +2481,14 @@ dependencies = [
  "egui-winit",
  "exr",
  "glam",
+ "image",
  "naga",
  "pollster",
  "rfd",
  "serde_json",
+ "sky-atmosphere-lut",
  "sky-core",
+ "sky-hybrid-atmosphere",
  "sky-unreal-atmosphere-8wave",
  "walkdir",
  "wgpu",

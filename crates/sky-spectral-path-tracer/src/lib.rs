@@ -4,4 +4,4 @@ pub mod integrator;
 
 pub use config::RenderConfig;
 pub use film::Film;
-pub use integrator::{RenderError, render};
+pub use integrator::{RenderError, render, render_band, render_orders};

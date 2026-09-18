@@ -18,6 +18,7 @@ pub(crate) struct TexturePresentPass {
     bind_group: wgpu::BindGroup,
     uniform_buffer: wgpu::Buffer,
     reference_projection_sun_observer: [f32; 4],
+    linear_output: bool,
 }
 
 impl TexturePresentPass {
@@ -112,7 +113,7 @@ impl TexturePresentPass {
                 entry_point: Some("fragment"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_format,
-                    blend: Some(wgpu::BlendState::REPLACE),
+                    blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -126,7 +127,12 @@ impl TexturePresentPass {
             bind_group,
             uniform_buffer,
             reference_projection_sun_observer,
+            linear_output: false,
         }
+    }
+
+    pub(crate) fn set_linear_output(&mut self, enabled: bool) {
+        self.linear_output = enabled;
     }
 
     pub(crate) fn set_source(
@@ -160,7 +166,7 @@ impl TexturePresentPass {
         hdr_paper_white_scale: f32,
         hdr_peak_scale: f32,
     ) {
-        let uniform = present_uniform(
+        let mut uniform = present_uniform(
             compare_mode,
             view,
             width,
@@ -175,6 +181,7 @@ impl TexturePresentPass {
             hdr_peak_scale,
             self.reference_projection_sun_observer,
         );
+        uniform.hdr_peak_reserved[1] = if self.linear_output { 1.0 } else { 0.0 };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
     }
 

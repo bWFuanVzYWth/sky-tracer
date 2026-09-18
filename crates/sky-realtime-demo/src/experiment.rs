@@ -70,6 +70,9 @@ pub struct FrameContext<'a> {
 pub trait RealtimeExperiment {
     fn name(&self) -> &'static str;
 
+    /// Headless photometric validation bypasses exposure and display mapping.
+    fn set_linear_output(&mut self, _enabled: bool) {}
+
     fn update(&mut self, _context: UpdateContext<'_>) {}
 
     fn reference_available(&self) -> bool {

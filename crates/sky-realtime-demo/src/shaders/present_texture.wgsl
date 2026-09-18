@@ -57,6 +57,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let has_reference = present.exposure_mode_ref_diff.z > 0.5;
     let diff_scale = present.exposure_mode_ref_diff.w;
     if (!has_reference || mode < 0.5) {
+        if present.hdr_peak_reserved.y>0.5 {return vec4f(realtime_scene_rec2020,1.0);}
         return vec4<f32>(realtime, 1.0);
     }
 
@@ -67,6 +68,14 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         vec3<f32>(0.0),
     );
     let reference = display_linear_srgb_from_scene_rec2020(srgb_to_rec2020(reference_scene_srgb));
+
+    if present.hdr_peak_reserved.y>0.5 {
+        let reference_linear=srgb_to_rec2020(reference_scene_srgb);
+        if mode<1.5 {return vec4f(reference_linear,1.0);}
+        let delta=realtime_scene_rec2020-reference_linear;
+        if mode<2.5 {return vec4f(abs(delta),1.0);}
+        return vec4f(delta,1.0);
+    }
 
     if (mode < 1.5) {
         return vec4<f32>(reference, 1.0);
@@ -178,7 +187,8 @@ fn sky_view_horizon_angles(view_height: f32) -> vec2<f32> {
 }
 
 fn from_unit_to_sub_uvs(u: f32, resolution: f32) -> f32 {
-    return (u + 0.5 / resolution) * (resolution / (resolution + 1.0));
+    // Exact inverse of the PT baker's (uv - 0.5/res) * res/(res-1).
+    return (u * (resolution - 1.0) + 0.5) / resolution;
 }
 
 fn sky_view_uv_from_dir(ray: vec3<f32>) -> vec2<f32> {

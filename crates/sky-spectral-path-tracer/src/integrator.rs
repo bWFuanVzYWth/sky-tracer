@@ -124,7 +124,58 @@ struct PackedScene {
 
 pub fn render(scene: &SceneData, config: &RenderConfig) -> Result<Film, RenderError> {
     validate_config(scene, config)?;
-    pollster::block_on(render_async(scene, config))
+    pollster::block_on(render_async(
+        scene,
+        config,
+        0,
+        None,
+        include_str!("sky_trace.wgsl"),
+    ))
+}
+
+/// Diagnostic prefix of the path expansion, counting volume scattering and
+/// ground reflection as interactions. Normal `render` remains untruncated.
+pub fn render_orders(
+    scene: &SceneData,
+    config: &RenderConfig,
+    max_interactions: u32,
+) -> Result<Film, RenderError> {
+    validate_config(scene, config)?;
+    if max_interactions == 0 || max_interactions >= WATCHDOG_LIMIT {
+        return Err(RenderError::InvalidConfig(
+            "diagnostic interaction count must be in 1..1024".into(),
+        ));
+    }
+    pollster::block_on(render_async(
+        scene,
+        config,
+        max_interactions,
+        None,
+        include_str!("sky_trace.wgsl"),
+    ))
+}
+
+/// Diagnostic rendering of one spectral band. Other film channels are zero.
+/// Uses the same per-pixel/sample/band RNG as full spectral rendering.
+pub fn render_band(
+    scene: &SceneData,
+    config: &RenderConfig,
+    band: usize,
+    max_interactions: Option<u32>,
+) -> Result<Film, RenderError> {
+    validate_config(scene, config)?;
+    if band >= BAND_COUNT || max_interactions.is_some_and(|n| n == 0 || n >= WATCHDOG_LIMIT) {
+        return Err(RenderError::InvalidConfig(
+            "invalid diagnostic band or interaction count".into(),
+        ));
+    }
+    pollster::block_on(render_async(
+        scene,
+        config,
+        max_interactions.unwrap_or(0),
+        Some(band as u32),
+        include_str!("sky_trace.wgsl"),
+    ))
 }
 
 fn validate_config(scene: &SceneData, config: &RenderConfig) -> Result<(), RenderError> {
@@ -162,8 +213,16 @@ fn validate_config(scene: &SceneData, config: &RenderConfig) -> Result<(), Rende
     Ok(())
 }
 
-async fn render_async(scene: &SceneData, config: &RenderConfig) -> Result<Film, RenderError> {
-    let packed = PackedScene::new(scene, config)?;
+async fn render_async(
+    scene: &SceneData,
+    config: &RenderConfig,
+    max_interactions: u32,
+    selected_band: Option<u32>,
+    shader_source: &str,
+) -> Result<Film, RenderError> {
+    let mut packed = PackedScene::new(scene, config)?;
+    packed.constants._pad_tile0 = max_interactions;
+    packed.constants._pad_tile1 = selected_band.unwrap_or(0);
     let output_len = config.width * config.height * BAND_COUNT;
     let output_size = byte_size::<f32>(output_len)?;
     let diagnostic_size = byte_size::<u32>(1)?;
@@ -178,11 +237,30 @@ async fn render_async(scene: &SceneData, config: &RenderConfig) -> Result<Film, 
         .await
         .map_err(|err| RenderError::NoAdapter(err.to_string()))?;
 
+    // A 2048x1024 reference now stores all 41 bands (~344 MB). Request only
+    // the larger buffer limits needed for that film instead of relying on
+    // wgpu's 128 MB default storage-binding limit.
+    let available = adapter.limits();
+    if output_size > available.max_storage_buffer_binding_size
+        || output_size > available.max_buffer_size
+    {
+        return Err(RenderError::InvalidConfig(format!(
+            "spectral film needs {output_size} bytes; adapter storage binding limit is {}",
+            available.max_storage_buffer_binding_size
+        )));
+    }
+    let defaults = wgpu::Limits::default();
+    let required_limits = wgpu::Limits {
+        max_storage_buffer_binding_size: defaults.max_storage_buffer_binding_size.max(output_size),
+        max_buffer_size: defaults.max_buffer_size.max(output_size),
+        ..defaults
+    };
+
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("sky_tracer_device"),
             required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
+            required_limits,
             memory_hints: wgpu::MemoryHints::Performance,
             ..Default::default()
         })
@@ -221,7 +299,7 @@ async fn render_async(scene: &SceneData, config: &RenderConfig) -> Result<Film, 
 
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("sky_tracer_compute_shader"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("sky_trace.wgsl").into()),
+        source: wgpu::ShaderSource::Wgsl(shader_source.into()),
     });
     let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some("sky_tracer_compute_pipeline"),
@@ -253,8 +331,18 @@ async fn render_async(scene: &SceneData, config: &RenderConfig) -> Result<Film, 
     let mut sample_offset = 0_u32;
     let workgroups_x = config.width.div_ceil(8) as u32;
     let workgroups_y = config.height.div_ceil(8) as u32;
+    let band_count = if selected_band.is_some() {
+        1
+    } else {
+        BAND_COUNT as u32
+    };
+    let samples_per_dispatch = if selected_band.is_some() {
+        32
+    } else {
+        SAMPLES_PER_DISPATCH
+    };
     while sample_offset < config.spp as u32 {
-        let samples_this_dispatch = SAMPLES_PER_DISPATCH.min(config.spp as u32 - sample_offset);
+        let samples_this_dispatch = samples_per_dispatch.min(config.spp as u32 - sample_offset);
         let mut constants = packed.constants;
         constants.sample_offset = sample_offset;
         constants.samples_this_dispatch = samples_this_dispatch;
@@ -270,11 +358,11 @@ async fn render_async(scene: &SceneData, config: &RenderConfig) -> Result<Film, 
             });
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(workgroups_x, workgroups_y, BAND_COUNT as u32);
+            pass.dispatch_workgroups(workgroups_x, workgroups_y, band_count);
         }
         queue.submit([encoder.finish()]);
         dispatched += 1;
-        if dispatched % SUBMITS_BEFORE_WAIT == 0 {
+        if dispatched.is_multiple_of(SUBMITS_BEFORE_WAIT) {
             device
                 .poll(wgpu::PollType::wait_indefinitely())
                 .map_err(|err| RenderError::Poll(err.to_string()))?;
@@ -474,6 +562,145 @@ fn byte_size<T>(len: usize) -> Result<u64, RenderError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_ground_bounce_matches_incident_hemisphere() {
+        let scene = sky_core::data::load_scene_data(&repository_data_dir(), -6.0, 0.0).unwrap();
+        let config = RenderConfig {
+            width: 64,
+            height: 2,
+            spp: 32768,
+            sun_elevation_deg: -6.0,
+            ..Default::default()
+        };
+        let mut shader = include_str!("sky_trace.wgsl").replace(
+            "trace_path(camera_ray(u, v), band, &rng)",
+            "ground_probe(y, band, &rng)",
+        );
+        shader.push_str(r#"
+fn ground_probe(row:u32,band:u32,rng:ptr<function,Rng>)->TraceResult {
+    let normal=vec3f(0.0,1.0,0.0);
+    if row==0u {
+        let v=sample_cosine_hemisphere(normal,rng).dir;
+        var offset=normal*RAY_EPSILON_KM;
+        return TraceResult(GROUND_ALBEDO*trace_path(Ray(normal*constants.ground_radius_km+offset,v),band,rng).radiance,false);
+    }
+    var v=vec3f(0.0,-1.0,0.0);
+    return trace_path(Ray(observer_origin(),v),band,rng);
+}
+"#);
+        let mut expected = 0.0;
+        for orders in [1, 2] {
+            let film = pollster::block_on(render_async(&scene, &config, orders, Some(17), &shader))
+                .unwrap();
+            for y in 0..2 {
+                let value = (0..64)
+                    .map(|x| film.pixel_spectrum(y * 64 + x)[17])
+                    .sum::<f32>()
+                    / 64.0;
+                eprintln!("ground probe order {orders} row {y}: {value:e}");
+                if orders == 1 && y == 0 {
+                    expected = value;
+                }
+                if orders == 2 && y == 1 {
+                    // At 200 m the camera segment has little attenuation. The
+                    // twilight nadir must agree with albedo times cosine-sampled
+                    // first-order sky. Directional volume offsets previously
+                    // leaked daylight through the ground, inflating this >6x.
+                    assert!(
+                        expected > 0.0 && (value / expected - 1.0).abs() < 0.3,
+                        "ground radiance {value:e}, hemisphere {expected:e}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selected_band_matches_full_spectral_samples() {
+        let scene = sky_core::data::load_scene_data(&repository_data_dir(), 20.0, 0.0).unwrap();
+        let config = RenderConfig {
+            width: 8,
+            height: 4,
+            spp: 64,
+            sun_elevation_deg: 20.0,
+            ..Default::default()
+        };
+        let full = render(&scene, &config).unwrap();
+        let selected = render_band(&scene, &config, 17, None).unwrap();
+        for pixel in 0..32 {
+            let a = full.pixel_spectrum(pixel)[17];
+            let b = selected.pixel_spectrum(pixel)[17];
+            assert!(
+                (a - b).abs() < 1e-5 * a.abs().max(1e-6),
+                "{pixel}: {a} vs {b}"
+            );
+            assert!(
+                selected
+                    .pixel_spectrum(pixel)
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &v)| i == 17 || v == 0.0)
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_grazing_transmittance_matches_integrated_extinction() {
+        let scene = sky_core::data::load_scene_data(&repository_data_dir(), -6.0, 0.0).unwrap();
+        let config = RenderConfig {
+            width: 64,
+            height: 4,
+            spp: 4096,
+            sun_elevation_deg: -6.0,
+            ..Default::default()
+        };
+        let mut shader = include_str!("sky_trace.wgsl").replace(
+            "trace_path(camera_ray(u, v), band, &rng)",
+            "transmittance_probe(y, band, &rng)",
+        );
+        shader.push_str(
+            r#"
+fn transmittance_probe(row:u32,band:u32,rng:ptr<function,Rng>)->TraceResult {
+    if constants.width==0u { return trace_path(camera_ray(0.0,0.0),band,rng); }
+    let ray=Ray(vec3f(0.0,constants.ground_radius_km+40.0+10.0*f32(row),0.0),sun_dir());
+    return TraceResult(delta_transmittance(ray,next_boundary(ray).t_km,band,rng),false);
+}
+"#,
+        );
+        let film = pollster::block_on(render_async(&scene, &config, 0, None, &shader)).unwrap();
+        let mut errors = Vec::new();
+        for y in 0..4 {
+            let h = 40.0 + 10.0 * y as f32;
+            let origin = sky_core::math::Vec3::new(0.0, scene.planet.ground_radius_km + h, 0.0);
+            let dir = scene.sun.direction;
+            let b = origin.dot(dir);
+            let c = (scene.planet.atmosphere_radius_km - origin.length())
+                * (scene.planet.atmosphere_radius_km + origin.length());
+            let ds = (-b + (b * b + c).sqrt()) / 16384.0;
+            let mut tau = 0.0;
+            for j in 0..16384 {
+                tau += ds
+                    * sky_core::medium::coefficients_at(
+                        &scene,
+                        origin + dir * ((j as f32 + 0.5) * ds),
+                        17,
+                    )
+                    .extinction_total();
+            }
+            let expected = (-tau).exp();
+            let actual = (0..64)
+                .map(|x| film.pixel_spectrum(y * 64 + x)[17])
+                .sum::<f32>()
+                / 64.0;
+            eprintln!("h={h}: delta tracking {actual}, integrated {expected}");
+            errors.push((actual / expected - 1.0).abs());
+        }
+        assert!(
+            errors.iter().all(|e| *e < 0.2),
+            "grazing transmittance errors: {errors:?}"
+        );
+    }
 
     #[test]
     fn packed_scene_matches_cpu_table_shapes() {

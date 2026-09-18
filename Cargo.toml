@@ -3,6 +3,8 @@ members = [
     "crates/sky-core",
     "crates/sky-spectral-path-tracer",
     "crates/sky-reference-render",
+    "crates/sky-atmosphere-lut",
+    "crates/sky-hybrid-atmosphere",
     "crates/sky-wavelength-optimizer",
     "crates/sky-unreal-atmosphere-8wave",
     "crates/sky-realtime-demo",

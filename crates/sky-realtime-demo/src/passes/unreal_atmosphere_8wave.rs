@@ -93,6 +93,9 @@ impl UnrealAtmosphere8WaveExperiment {
 }
 
 impl RealtimeExperiment for UnrealAtmosphere8WaveExperiment {
+    fn set_linear_output(&mut self, enabled: bool) {
+        self.present.set_linear_output(enabled);
+    }
     fn name(&self) -> &'static str {
         "unreal-8wave-sky-atmosphere"
     }

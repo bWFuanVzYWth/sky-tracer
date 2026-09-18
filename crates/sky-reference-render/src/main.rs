@@ -193,6 +193,7 @@ fn write_asset_manifest(
         ),
     };
     manifest.colorimetry = Some(colorimetry_from_scene(scene));
+    manifest.transport_version = Some(sky_core::asset::LAYERED_TRANSPORT_VERSION.into());
     let path = out_dir.join("asset.json");
     let file = File::create(path)?;
     serde_json::to_writer_pretty(file, &manifest)?;

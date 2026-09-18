@@ -18,6 +18,7 @@ use crate::experiment::{
     CompareMode, ExperimentInit, FrameContext, RealtimeExperiment, SurfaceViewport, UpdateContext,
 };
 use crate::gpu::{GpuContext, SurfaceFrameStatus};
+use crate::passes::offline_lut::OfflineLutExperiment;
 use crate::passes::unreal_atmosphere_8wave::UnrealAtmosphere8WaveExperiment;
 use crate::ui_renderer::UiRenderer;
 use crate::workbench::{WorkbenchAction, WorkbenchState};
@@ -25,12 +26,19 @@ use crate::workbench::{WorkbenchAction, WorkbenchState};
 pub struct RunConfig {
     pub asset_path: PathBuf,
     pub experiment: ExperimentKind,
+    pub lut_path: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 pub enum ExperimentKind {
+    #[value(name = "hybrid-4d")]
+    Hybrid4d,
+    #[value(name = "four-wave")]
+    FourWave,
     #[value(name = "unreal-8wave", alias = "unreal8-wave")]
     Unreal8Wave,
+    #[value(name = "offline-lut")]
+    OfflineLut,
 }
 
 #[derive(Debug)]
@@ -49,12 +57,28 @@ pub fn run(config: RunConfig) -> Result<(), Box<dyn Error>> {
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
-    let workbench = WorkbenchState::new(&asset);
+    let mut workbench = WorkbenchState::new(&asset);
+    workbench.hybrid_atmosphere = matches!(config.experiment, ExperimentKind::Hybrid4d);
+    if matches!(config.experiment, ExperimentKind::FourWave) {
+        let r = sky_atmosphere_lut::four_wave::Resource::open(&config.lut_path)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        workbench.baked_atmosphere = Some([r.geometry.bottom, r.geometry.top_height(), r.albedo]);
+    }
+    if matches!(config.experiment, ExperimentKind::OfflineLut) {
+        let lut = sky_atmosphere_lut::asset::Manifest::open(&config.lut_path)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        workbench.baked_atmosphere = Some([
+            lut.geometry.bottom,
+            lut.geometry.top_height(),
+            lut.config.ground_albedo,
+        ]);
+    }
     let mut app = DemoApp {
         asset,
         gpu: None,
         experiment: None,
         experiment_kind: config.experiment,
+        lut_path: config.lut_path,
         ui: None,
         workbench,
         proxy,
@@ -82,6 +106,7 @@ struct DemoApp {
     gpu: Option<GpuContext>,
     experiment: Option<Box<dyn RealtimeExperiment>>,
     experiment_kind: ExperimentKind,
+    lut_path: PathBuf,
     ui: Option<UiRenderer>,
     workbench: WorkbenchState,
     proxy: EventLoopProxy<UserEvent>,
@@ -98,6 +123,7 @@ impl DemoApp {
         kind: ExperimentKind,
         gpu: &GpuContext,
         asset: &RealtimeAsset,
+        lut_path: &std::path::Path,
     ) -> Result<Box<dyn RealtimeExperiment>, String> {
         let init = ExperimentInit {
             device: gpu.device(),
@@ -107,7 +133,15 @@ impl DemoApp {
             display: DisplayTransform::default(),
         };
         match kind {
+            ExperimentKind::Hybrid4d => crate::passes::hybrid::HybridExperiment::new(init)
+                .map(|experiment| Box::new(experiment) as Box<dyn RealtimeExperiment>),
+            ExperimentKind::FourWave => {
+                crate::passes::four_wave::FourWaveExperiment::new(init, lut_path)
+                    .map(|experiment| Box::new(experiment) as Box<dyn RealtimeExperiment>)
+            }
             ExperimentKind::Unreal8Wave => UnrealAtmosphere8WaveExperiment::new(init)
+                .map(|experiment| Box::new(experiment) as Box<dyn RealtimeExperiment>),
+            ExperimentKind::OfflineLut => OfflineLutExperiment::new(init, lut_path)
                 .map(|experiment| Box::new(experiment) as Box<dyn RealtimeExperiment>),
         }
     }
@@ -166,7 +200,7 @@ impl DemoApp {
 
         let next_experiment = {
             let gpu = self.gpu.as_ref().expect("GPU checked above");
-            Self::create_experiment(self.experiment_kind, gpu, &self.asset)
+            Self::create_experiment(self.experiment_kind, gpu, &self.asset, &self.lut_path)
         };
         let next_experiment = match next_experiment {
             Ok(experiment) => experiment,
@@ -215,7 +249,7 @@ impl DemoApp {
             return;
         };
         let candidate = prepare_asset_change(path.clone(), |asset| {
-            Self::create_experiment(self.experiment_kind, gpu, asset)
+            Self::create_experiment(self.experiment_kind, gpu, asset, &self.lut_path)
         });
         let (next_asset, next_experiment) = match candidate {
             Ok(candidate) => candidate,
@@ -514,9 +548,35 @@ impl ApplicationHandler<UserEvent> for DemoApp {
         };
 
         let required_features = match self.experiment_kind {
+            ExperimentKind::Hybrid4d => wgpu::Features::empty(),
+            ExperimentKind::FourWave => wgpu::Features::empty(),
             ExperimentKind::Unreal8Wave => sky_unreal_atmosphere_8wave::REQUIRED_FEATURES,
+            ExperimentKind::OfflineLut => wgpu::Features::empty(),
         };
-        let required_limits = wgpu::Limits::default();
+        let mut required_limits = wgpu::Limits::default();
+        if matches!(self.experiment_kind, ExperimentKind::Hybrid4d) {
+            required_limits.max_storage_buffer_binding_size = 512 * 1024 * 1024;
+            required_limits.max_buffer_size = 512 * 1024 * 1024;
+        }
+        if matches!(self.experiment_kind, ExperimentKind::OfflineLut) {
+            match sky_atmosphere_lut::asset::Manifest::open(&self.lut_path) {
+                Ok(lut) => {
+                    let (bytes, total) = sky_atmosphere_lut::renderer::storage_budget(&lut);
+                    println!(
+                        "offline LUT resident payload: {:.1} MiB",
+                        total as f32 / 1048576.0
+                    );
+                    required_limits.max_storage_buffer_binding_size =
+                        required_limits.max_storage_buffer_binding_size.max(bytes);
+                    required_limits.max_buffer_size = required_limits.max_buffer_size.max(bytes);
+                }
+                Err(error) => {
+                    self.init_error = Some(error.to_string());
+                    event_loop.exit();
+                    return;
+                }
+            }
+        }
         let display = DisplayTransform::default();
         println!("display transform: {}", display.output_space.label());
         let gpu = match pollster::block_on(GpuContext::new(
@@ -531,7 +591,12 @@ impl ApplicationHandler<UserEvent> for DemoApp {
                 return;
             }
         };
-        let experiment = match Self::create_experiment(self.experiment_kind, &gpu, &self.asset) {
+        let experiment = match Self::create_experiment(
+            self.experiment_kind,
+            &gpu,
+            &self.asset,
+            &self.lut_path,
+        ) {
             Ok(experiment) => experiment,
             Err(error) => {
                 self.init_error = Some(error);

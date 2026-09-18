@@ -102,7 +102,11 @@ fn majorant_probe_altitudes(scene: &SceneData, lo: f32, hi: f32) -> Vec<f32> {
 }
 
 pub fn rayleigh_cross_section_m2(wavelength_nm: f32) -> f32 {
-    5.8e-31 * (550.0 / wavelength_nm).powi(4)
+    // Explicit products keep the tabulated model bit-identical between debug
+    // and release builds. powi may choose a different rounding sequence.
+    let ratio = 550.0 / wavelength_nm;
+    let squared = ratio * ratio;
+    5.8e-31 * (squared * squared)
 }
 
 fn interpolate_atmosphere(

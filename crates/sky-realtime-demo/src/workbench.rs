@@ -46,6 +46,9 @@ pub enum StatusKind {
 #[derive(Debug)]
 pub struct WorkbenchState {
     pub controls: RealtimeControls,
+    pub baked_atmosphere: Option<[f32; 3]>,
+    pub hybrid_atmosphere: bool,
+    hybrid_draft: [f32; 2],
     asset_root: PathBuf,
     entries: Vec<AssetEntry>,
     current_path: PathBuf,
@@ -68,6 +71,9 @@ impl WorkbenchState {
             .to_owned();
         Self {
             controls: RealtimeControls::from_asset(asset),
+            baked_atmosphere: None,
+            hybrid_atmosphere: false,
+            hybrid_draft: [1.0, 0.18],
             entries: vec![AssetEntry::from_path(current_path.clone(), &asset_root)],
             current_path,
             asset_root,
@@ -230,6 +236,11 @@ impl WorkbenchState {
         } else {
             self.viewport_at(root, remaining, reference_available)
         };
+        if let Some([radius, thickness, albedo]) = self.baked_atmosphere {
+            self.controls.planet_radius_km = radius;
+            self.controls.atmosphere_thickness_km = thickness;
+            self.controls.ground_albedo_spectral = [albedo; 4];
+        }
         self.controls = self.controls.normalized();
 
         WorkbenchFrame {
@@ -282,7 +293,7 @@ impl WorkbenchState {
 
                     ui.separator();
                     for (mode, label, shortcut) in [
-                        (CompareMode::Realtime, "Realtime", "1"),
+                        (CompareMode::Realtime, if self.baked_atmosphere.is_some() { "Baked LUT" } else { "Realtime" }, "1"),
                         (CompareMode::Reference, "Reference", "2"),
                         (CompareMode::AbsoluteDifference, "Absolute Diff", "3"),
                         (CompareMode::SignedDifference, "Signed Diff", "4"),
@@ -295,7 +306,7 @@ impl WorkbenchState {
                             response.on_hover_text(format!("Comparison mode ({shortcut})"))
                         } else {
                             response.on_disabled_hover_text(
-                                "The current asset has no readable reference EXR",
+                                "Reference EXR/transport version unavailable, or sun/observer differs. Re-render legacy PT assets; reset Sun & Observer to match the pose.",
                             )
                         };
                         if response.clicked() {
@@ -566,6 +577,12 @@ impl WorkbenchState {
                         if section_header(ui, "Sun & Observer") {
                             self.controls.reset_sun_observer(asset);
                         }
+                        if self.baked_atmosphere.is_some() {
+                            ui.label("Baked LUT / wgpu f32. Reset this section to match the selected path-traced reference.");
+                            if asset.manifest().transport_version.as_deref()!=Some(sky_core::asset::LAYERED_TRANSPORT_VERSION) {
+                                ui.colored_label(egui::Color32::YELLOW,"Legacy PT reference: re-render with the corrected grazing-layer transport before comparing.");
+                            }
+                        }
                         resettable_slider(
                             ui,
                             &mut self.controls.sun_azimuth_deg,
@@ -583,7 +600,7 @@ impl WorkbenchState {
                             "Sun height above the horizon. Use [ and ] for one-degree steps.",
                         );
                         let maximum_altitude = self.controls.maximum_observer_altitude_km();
-                        resettable_slider(
+                        resettable_log_slider(
                             ui,
                             &mut self.controls.observer_altitude_km,
                             0.0..=maximum_altitude,
@@ -677,6 +694,21 @@ impl WorkbenchState {
                         );
 
                         ui.add_space(10.0);
+                        if self.hybrid_atmosphere {
+                            ui.label("4D multiple scattering is solved at startup. Sun / altitude updates only rebuild SkyView.");
+                            ui.label("Tabulated Earth profile and measured phases; four wavelengths: 450, 510, 580, 650 nm.");
+                            if section_header(ui, "Medium") { self.hybrid_draft = [1.0, 0.18]; }
+                            ui.add(egui::Slider::new(&mut self.hybrid_draft[0], 0.0..=4.0).text("Aerosol density scale"));
+                            ui.add(egui::Slider::new(&mut self.hybrid_draft[1], 0.0..=1.0).text("Ground albedo"));
+                            if ui.button("Apply medium / rebuild 4D LUT").clicked() {
+                                self.controls.aerosol_turbidity = self.hybrid_draft[0];
+                                self.controls.ground_albedo_spectral = [self.hybrid_draft[1]; 4];
+                            }
+                        } else {
+                        if self.baked_atmosphere.is_some() {
+                            ui.label("Atmosphere, aerosol phases and ground albedo are fixed in the baked resource. Re-bake to change them.");
+                        }
+                        ui.add_enabled_ui(self.baked_atmosphere.is_none(), |ui| {
                         if section_header(ui, "Atmosphere") {
                             self.controls.reset_atmosphere();
                         }
@@ -782,6 +814,8 @@ impl WorkbenchState {
                                 let value = self.controls.ground_albedo_spectral[index];
                                 self.controls.ground_albedo_spectral = [value; 4];
                             }
+                        }
+                        });
                         }
                     });
             },

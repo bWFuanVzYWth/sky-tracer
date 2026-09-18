@@ -1,0 +1,24 @@
+{
+  "heights": 40,
+  "suns": 160,
+  "phases": 20,
+  "cones": 12,
+  "angular_mu": 32,
+  "angular_phi": 16,
+  "ray_steps": 64,
+  "iterations": 8,
+  "optical": [
+    128,
+    512
+  ],
+  "optical_steps": 256,
+  "horizon_power": 3.0,
+  "compact_rayleigh": true,
+  "mapping_flags": 63,
+  "sky_size": 256,
+  "specialize_constants": true,
+  "high_sun_weight": 0.0,
+  "sun_importance_width": 0.01,
+  "path_height_scale": 0.25,
+  "batch_heights": 4
+}
