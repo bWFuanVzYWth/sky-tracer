@@ -1,0 +1,16 @@
+[package]
+name = "sky-baker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+clap.workspace = true
+exr.workspace = true
+image.workspace = true
+serde_json.workspace = true
+glam.workspace = true
+sky-assets = { path = "../../crates/sky-assets" }
+sky-pt = { path = "../../crates/sky-pt" }
+sky-reference = { path = "../../crates/sky-reference" }
+

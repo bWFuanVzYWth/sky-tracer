@@ -1,14 +1,5 @@
 [workspace]
-members = [
-    "crates/sky-core",
-    "crates/sky-spectral-path-tracer",
-    "crates/sky-reference-render",
-    "crates/sky-atmosphere-lut",
-    "crates/sky-hybrid-atmosphere",
-    "crates/sky-wavelength-optimizer",
-    "crates/sky-unreal-atmosphere-8wave",
-    "crates/sky-realtime-demo",
-]
+members = ["crates/sky-assets", "crates/sky-pt", "crates/sky-reference", "crates/sky-realtime", "apps/sky-baker", "apps/sky-demo", "apps/sky-audit"]
 resolver = "3"
 
 [workspace.package]

@@ -1,0 +1,270 @@
+use crate::assets::RealtimeAsset;
+use crate::color::DisplayTransform;
+use crate::experiment::CompareMode;
+use crate::view::ViewState;
+
+pub const MIN_EXPOSURE_EV: f32 = -20.0;
+pub const MAX_EXPOSURE_EV: f32 = 20.0;
+pub const MIN_REINHARD_OVEREXPOSURE: f32 = 0.5;
+pub const MAX_REINHARD_OVEREXPOSURE: f32 = 2.0;
+pub const MIN_HDR_PAPER_WHITE_NITS: f32 = 80.0;
+pub const MAX_HDR_PAPER_WHITE_NITS: f32 = 400.0;
+pub const MIN_HDR_PEAK_NITS: f32 = 400.0;
+pub const MAX_HDR_PEAK_NITS: f32 = 4_000.0;
+pub const DEFAULT_REINHARD_OVEREXPOSURE: f32 = 1.1;
+pub const DEFAULT_HDR_PAPER_WHITE_NITS: f32 = 203.0;
+pub const DEFAULT_HDR_PEAK_NITS: f32 = 1_000.0;
+pub const MIN_PLANET_RADIUS_KM: f32 = 1_000.0;
+pub const MAX_PLANET_RADIUS_KM: f32 = 10_000.0;
+pub const MIN_ATMOSPHERE_THICKNESS_KM: f32 = 1.0;
+pub const MAX_ATMOSPHERE_THICKNESS_KM: f32 = 1_000.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RealtimeControls {
+    pub view: ViewState,
+    pub compare_mode: CompareMode,
+    pub sun_azimuth_deg: f32,
+    pub sun_elevation_deg: f32,
+    pub observer_altitude_km: f32,
+    pub exposure_ev: f32,
+    pub difference_scale: f32,
+    pub tone_mapping_enabled: bool,
+    pub hdr_enabled: bool,
+    pub reinhard_overexposure: f32,
+    pub hdr_paper_white_nits: f32,
+    pub hdr_peak_nits: f32,
+    pub planet_radius_km: f32,
+    pub atmosphere_thickness_km: f32,
+    pub aerosol_turbidity: f32,
+    pub ground_albedo_spectral: [f32; 4],
+}
+
+impl RealtimeControls {
+    pub fn from_asset(asset: &RealtimeAsset) -> Self {
+        let manifest = asset.manifest();
+        Self {
+            view: ViewState::default(),
+            compare_mode: CompareMode::default(),
+            sun_azimuth_deg: manifest.sun_azimuth_deg,
+            sun_elevation_deg: manifest.sun_elevation_deg,
+            observer_altitude_km: manifest.observer_altitude_km,
+            exposure_ev: 0.0,
+            difference_scale: 4.0,
+            tone_mapping_enabled: true,
+            hdr_enabled: false,
+            reinhard_overexposure: DEFAULT_REINHARD_OVEREXPOSURE,
+            hdr_paper_white_nits: DEFAULT_HDR_PAPER_WHITE_NITS,
+            hdr_peak_nits: DEFAULT_HDR_PEAK_NITS,
+            planet_radius_km: 6360.0,
+            atmosphere_thickness_km: 120.0,
+            aerosol_turbidity: 1.0,
+            ground_albedo_spectral: [0.18; 4],
+        }
+        .normalized()
+    }
+
+    pub fn normalized(mut self) -> Self {
+        self.view.normalize();
+        self.sun_azimuth_deg = self.sun_azimuth_deg.rem_euclid(360.0);
+        self.sun_elevation_deg = self.sun_elevation_deg.clamp(-90.0, 90.0);
+        self.exposure_ev = self.exposure_ev.clamp(MIN_EXPOSURE_EV, MAX_EXPOSURE_EV);
+        self.difference_scale = self.difference_scale.clamp(0.25, 32.0);
+        self.reinhard_overexposure = self
+            .reinhard_overexposure
+            .clamp(MIN_REINHARD_OVEREXPOSURE, MAX_REINHARD_OVEREXPOSURE);
+        self.hdr_paper_white_nits = self
+            .hdr_paper_white_nits
+            .clamp(MIN_HDR_PAPER_WHITE_NITS, MAX_HDR_PAPER_WHITE_NITS);
+        self.hdr_peak_nits = self
+            .hdr_peak_nits
+            .clamp(MIN_HDR_PEAK_NITS, MAX_HDR_PEAK_NITS)
+            .max(self.hdr_paper_white_nits);
+        self.planet_radius_km = self
+            .planet_radius_km
+            .clamp(MIN_PLANET_RADIUS_KM, MAX_PLANET_RADIUS_KM);
+        self.atmosphere_thickness_km = self
+            .atmosphere_thickness_km
+            .clamp(MIN_ATMOSPHERE_THICKNESS_KM, MAX_ATMOSPHERE_THICKNESS_KM);
+        self.observer_altitude_km = self
+            .observer_altitude_km
+            .clamp(0.0, self.maximum_observer_altitude_km());
+        self.aerosol_turbidity = self.aerosol_turbidity.clamp(0.0, 10.0);
+        for albedo in &mut self.ground_albedo_spectral {
+            *albedo = albedo.clamp(0.0, 1.0);
+        }
+        self
+    }
+
+    pub fn sync_asset_bound(&mut self, asset: &RealtimeAsset) {
+        let manifest = asset.manifest();
+        self.sun_azimuth_deg = manifest.sun_azimuth_deg.rem_euclid(360.0);
+        self.sun_elevation_deg = manifest.sun_elevation_deg.clamp(-90.0, 90.0);
+        self.observer_altitude_km = manifest
+            .observer_altitude_km
+            .clamp(0.0, self.maximum_observer_altitude_km());
+    }
+
+    pub fn reset_all(&mut self, asset: &RealtimeAsset) {
+        *self = Self::from_asset(asset);
+    }
+
+    pub fn reset_view(&mut self) {
+        self.view = ViewState::default();
+    }
+
+    pub fn reset_sun_observer(&mut self, asset: &RealtimeAsset) {
+        self.sync_asset_bound(asset);
+    }
+
+    pub fn reset_display(&mut self) {
+        self.compare_mode = CompareMode::default();
+        self.exposure_ev = 0.0;
+        self.difference_scale = 4.0;
+        self.tone_mapping_enabled = true;
+        self.hdr_enabled = false;
+        self.reinhard_overexposure = DEFAULT_REINHARD_OVEREXPOSURE;
+        self.hdr_paper_white_nits = DEFAULT_HDR_PAPER_WHITE_NITS;
+        self.hdr_peak_nits = DEFAULT_HDR_PEAK_NITS;
+    }
+
+    pub fn maximum_observer_altitude_km(&self) -> f32 {
+        100_000.0
+    }
+
+    pub fn exposure_multiplier(&self) -> f32 {
+        DisplayTransform::default().exposure * self.exposure_ev.exp2()
+    }
+
+    pub fn hdr_paper_white_scale(&self) -> f32 {
+        self.hdr_paper_white_nits / 80.0
+    }
+
+    pub fn hdr_peak_scale(&self) -> f32 {
+        self.hdr_peak_nits / 80.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use sky_assets::asset::{SpectralAssetFiles, SpectralAssetManifest};
+
+    use super::{MAX_EXPOSURE_EV, RealtimeControls};
+    use crate::assets::RealtimeAsset;
+
+    static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(0);
+
+    fn test_asset() -> RealtimeAsset {
+        let root = std::env::temp_dir().join(format!(
+            "sky-realtime-controls-{}-{}",
+            std::process::id(),
+            NEXT_TEST_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).expect("create test root");
+        let manifest = SpectralAssetManifest::spectral_panorama(
+            [4, 2],
+            8,
+            1,
+            12.0,
+            34.0,
+            0.2,
+            vec![500.0],
+            SpectralAssetFiles {
+                rgb_exr: "sky.exr".to_owned(),
+                rgb_png: "sky.png".to_owned(),
+                band_exrs: vec!["band.exr".to_owned()],
+            },
+        );
+        let path = root.join("asset.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+        RealtimeAsset::load(path).expect("load test asset")
+    }
+
+    #[test]
+    fn exposure_ev_is_relative_to_the_current_display_baseline() {
+        let asset = test_asset();
+        let mut controls = RealtimeControls::from_asset(&asset);
+        let baseline = controls.exposure_multiplier();
+        controls.exposure_ev = 1.0;
+        assert!((controls.exposure_multiplier() - baseline * 2.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn normalization_clamps_unsafe_values() {
+        let asset = test_asset();
+        let mut controls = RealtimeControls::from_asset(&asset);
+        controls.exposure_ev = 100.0;
+        controls.sun_elevation_deg = -120.0;
+        controls.atmosphere_thickness_km = 5.0;
+        controls.observer_altitude_km = 20.0;
+        controls.reinhard_overexposure = 10.0;
+        controls.hdr_paper_white_nits = 1_000.0;
+        controls.hdr_peak_nits = 100.0;
+        controls = controls.normalized();
+        assert_eq!(controls.exposure_ev, MAX_EXPOSURE_EV);
+        assert_eq!(controls.sun_elevation_deg, -90.0);
+        assert_eq!(controls.observer_altitude_km, 20.0);
+        assert_eq!(controls.reinhard_overexposure, 2.0);
+        assert_eq!(controls.hdr_paper_white_nits, 400.0);
+        assert_eq!(controls.hdr_peak_nits, 400.0);
+    }
+
+    #[test]
+    fn asset_switch_only_updates_asset_bound_controls() {
+        let asset = test_asset();
+        let mut controls = RealtimeControls::from_asset(&asset);
+        controls.view.yaw_deg = 90.0;
+        controls.exposure_ev = 2.0;
+        controls.aerosol_turbidity = 4.0;
+        controls.sun_elevation_deg = -10.0;
+        controls.sync_asset_bound(&asset);
+        assert_eq!(controls.view.yaw_deg, 90.0);
+        assert_eq!(controls.exposure_ev, 2.0);
+        assert_eq!(controls.aerosol_turbidity, 4.0);
+        assert_eq!(controls.sun_elevation_deg, 12.0);
+    }
+
+    #[test]
+    fn group_and_global_resets_restore_their_expected_scope() {
+        let asset = test_asset();
+        let defaults = RealtimeControls::from_asset(&asset);
+        let mut controls = defaults;
+        controls.view.yaw_deg = 90.0;
+        controls.exposure_ev = 3.0;
+        controls.difference_scale = 16.0;
+        controls.tone_mapping_enabled = false;
+        controls.hdr_enabled = true;
+        controls.reinhard_overexposure = 1.8;
+        controls.hdr_paper_white_nits = 300.0;
+        controls.aerosol_turbidity = 8.0;
+
+        controls.reset_display();
+        assert_eq!(controls.view.yaw_deg, 90.0);
+        assert_eq!(controls.exposure_ev, defaults.exposure_ev);
+        assert_eq!(controls.difference_scale, defaults.difference_scale);
+        assert!(controls.tone_mapping_enabled);
+        assert!(!controls.hdr_enabled);
+        assert_eq!(
+            controls.reinhard_overexposure,
+            defaults.reinhard_overexposure
+        );
+        assert_eq!(controls.hdr_paper_white_nits, defaults.hdr_paper_white_nits);
+        assert_eq!(controls.aerosol_turbidity, 8.0);
+
+        controls.reset_all(&asset);
+        assert_eq!(controls, defaults);
+    }
+
+    #[test]
+    fn hdr_scales_use_the_scrgb_eighty_nit_reference() {
+        let asset = test_asset();
+        let controls = RealtimeControls::from_asset(&asset);
+        assert_eq!(controls.hdr_paper_white_scale(), 203.0 / 80.0);
+        assert_eq!(controls.hdr_peak_scale(), 1000.0 / 80.0);
+    }
+}

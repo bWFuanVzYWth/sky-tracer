@@ -1,0 +1,452 @@
+{
+  "images": [
+    {
+      "name": "noon_aureole",
+      "start": 14592,
+      "end": 33024,
+      "width": 192,
+      "height": 96,
+      "altitude_km": 0.2,
+      "sun_elevation_deg": 85,
+      "pitch": 85,
+      "yaw": 0,
+      "horizontal_fov": 12
+    },
+    {
+      "name": "noon_horizon",
+      "start": 33024,
+      "end": 51456,
+      "width": 192,
+      "height": 96,
+      "altitude_km": 0.2,
+      "sun_elevation_deg": 85,
+      "pitch": 4,
+      "yaw": 0,
+      "horizontal_fov": 100
+    },
+    {
+      "name": "sunset",
+      "start": 51456,
+      "end": 69888,
+      "width": 192,
+      "height": 96,
+      "altitude_km": 0.2,
+      "sun_elevation_deg": 0,
+      "pitch": 4,
+      "yaw": 0,
+      "horizontal_fov": 100
+    },
+    {
+      "name": "blue_sunward",
+      "start": 69888,
+      "end": 88320,
+      "width": 192,
+      "height": 96,
+      "altitude_km": 0.2,
+      "sun_elevation_deg": -6,
+      "pitch": 5,
+      "yaw": 0,
+      "horizontal_fov": 90
+    },
+    {
+      "name": "blue_antisolar",
+      "start": 88320,
+      "end": 106752,
+      "width": 192,
+      "height": 96,
+      "altitude_km": 0.2,
+      "sun_elevation_deg": -6,
+      "pitch": 5,
+      "yaw": 180,
+      "horizontal_fov": 90
+    },
+    {
+      "name": "aircraft_twilight",
+      "start": 106752,
+      "end": 125184,
+      "width": 192,
+      "height": 96,
+      "altitude_km": 12,
+      "sun_elevation_deg": -7,
+      "pitch": 0.4831118583679199,
+      "yaw": 0,
+      "horizontal_fov": 90
+    },
+    {
+      "name": "moving_shadow",
+      "start": 125184,
+      "end": 143616,
+      "width": 192,
+      "height": 96,
+      "altitude_km": 30,
+      "sun_elevation_deg": -5.854153633117676,
+      "pitch": -2.5541534423828125,
+      "yaw": 0,
+      "horizontal_fov": 30
+    },
+    {
+      "name": "upper_limb",
+      "start": 143616,
+      "end": 162048,
+      "width": 192,
+      "height": 96,
+      "altitude_km": 108,
+      "sun_elevation_deg": 0,
+      "pitch": -0.5,
+      "yaw": 90,
+      "horizontal_fov": 12
+    },
+    {
+      "name": "orbital_twilight",
+      "start": 162048,
+      "end": 180480,
+      "width": 192,
+      "height": 96,
+      "altitude_km": 400,
+      "sun_elevation_deg": -6,
+      "pitch": -16.808853149414062,
+      "yaw": 0,
+      "horizontal_fov": 38
+    },
+    {
+      "name": "sun_close_85",
+      "width": 256,
+      "height": 128,
+      "altitude_km": 0.2,
+      "sun_elevation_deg": 85,
+      "pitch": 85,
+      "yaw": 0,
+      "horizontal_fov": 4
+    },
+    {
+      "name": "sun_close_47",
+      "width": 256,
+      "height": 128,
+      "altitude_km": 0.2,
+      "sun_elevation_deg": 47,
+      "pitch": 47,
+      "yaw": 0,
+      "horizontal_fov": 4
+    },
+    {
+      "name": "sun_close_5",
+      "width": 256,
+      "height": 128,
+      "altitude_km": 0.2,
+      "sun_elevation_deg": 5,
+      "pitch": 5,
+      "yaw": 0,
+      "horizontal_fov": 4
+    },
+    {
+      "name": "sun_close_0",
+      "width": 256,
+      "height": 128,
+      "altitude_km": 0.2,
+      "sun_elevation_deg": 0,
+      "pitch": 0,
+      "yaw": 0,
+      "horizontal_fov": 4
+    },
+    {
+      "name": "sun_close_-0.25",
+      "width": 256,
+      "height": 128,
+      "altitude_km": 0.2,
+      "sun_elevation_deg": -0.25,
+      "pitch": -0.25,
+      "yaw": 0,
+      "horizontal_fov": 4
+    },
+    {
+      "name": "sun_close_-0.45",
+      "width": 256,
+      "height": 128,
+      "altitude_km": 0.2,
+      "sun_elevation_deg": -0.45,
+      "pitch": -0.45,
+      "yaw": 0,
+      "horizontal_fov": 4
+    },
+    {
+      "name": "sun_close_-0.65",
+      "width": 256,
+      "height": 128,
+      "altitude_km": 0.2,
+      "sun_elevation_deg": -0.65,
+      "pitch": -0.65,
+      "yaw": 0,
+      "horizontal_fov": 4
+    },
+    {
+      "name": "sun_close_-0.8",
+      "width": 256,
+      "height": 128,
+      "altitude_km": 0.2,
+      "sun_elevation_deg": -0.8,
+      "pitch": -0.8,
+      "yaw": 0,
+      "horizontal_fov": 4
+    },
+    {
+      "name": "shadow_0.002_-0.3",
+      "width": 192,
+      "height": 96,
+      "altitude_km": 0.002,
+      "sun_elevation_deg": -0.3454385028511644,
+      "pitch": 0.9545614971488355,
+      "yaw": 90,
+      "horizontal_fov": 16
+    },
+    {
+      "name": "shadow_0.002_0",
+      "width": 192,
+      "height": 96,
+      "altitude_km": 0.002,
+      "sun_elevation_deg": -0.04543850285116442,
+      "pitch": 0.9545614971488355,
+      "yaw": 90,
+      "horizontal_fov": 16
+    },
+    {
+      "name": "shadow_0.002_0.3",
+      "width": 192,
+      "height": 96,
+      "altitude_km": 0.002,
+      "sun_elevation_deg": 0.2545614971488356,
+      "pitch": 0.9545614971488355,
+      "yaw": 90,
+      "horizontal_fov": 16
+    },
+    {
+      "name": "shadow_0.2_-0.3",
+      "width": 192,
+      "height": 96,
+      "altitude_km": 0.2,
+      "sun_elevation_deg": -0.7543791344154043,
+      "pitch": 0.5456208655845957,
+      "yaw": 90,
+      "horizontal_fov": 16
+    },
+    {
+      "name": "shadow_0.2_0",
+      "width": 192,
+      "height": 96,
+      "altitude_km": 0.2,
+      "sun_elevation_deg": -0.45437913441540434,
+      "pitch": 0.5456208655845957,
+      "yaw": 90,
+      "horizontal_fov": 16
+    },
+    {
+      "name": "shadow_0.2_0.3",
+      "width": 192,
+      "height": 96,
+      "altitude_km": 0.2,
+      "sun_elevation_deg": -0.15437913441540435,
+      "pitch": 0.5456208655845957,
+      "yaw": 90,
+      "horizontal_fov": 16
+    },
+    {
+      "name": "shadow_12_-0.3",
+      "width": 192,
+      "height": 96,
+      "altitude_km": 12,
+      "sun_elevation_deg": -3.8168880979366486,
+      "pitch": -2.516888097936649,
+      "yaw": 90,
+      "horizontal_fov": 16
+    },
+    {
+      "name": "shadow_12_0",
+      "width": 192,
+      "height": 96,
+      "altitude_km": 12,
+      "sun_elevation_deg": -3.516888097936649,
+      "pitch": -2.516888097936649,
+      "yaw": 90,
+      "horizontal_fov": 16
+    },
+    {
+      "name": "shadow_12_0.3",
+      "width": 192,
+      "height": 96,
+      "altitude_km": 12,
+      "sun_elevation_deg": -3.216888097936649,
+      "pitch": -2.516888097936649,
+      "yaw": 90,
+      "horizontal_fov": 16
+    },
+    {
+      "name": "shadow_30_-0.3",
+      "width": 192,
+      "height": 96,
+      "altitude_km": 30,
+      "sun_elevation_deg": -5.854153609487942,
+      "pitch": -4.554153609487942,
+      "yaw": 90,
+      "horizontal_fov": 16
+    },
+    {
+      "name": "shadow_30_0",
+      "width": 192,
+      "height": 96,
+      "altitude_km": 30,
+      "sun_elevation_deg": -5.554153609487942,
+      "pitch": -4.554153609487942,
+      "yaw": 90,
+      "horizontal_fov": 16
+    },
+    {
+      "name": "shadow_30_0.3",
+      "width": 192,
+      "height": 96,
+      "altitude_km": 30,
+      "sun_elevation_deg": -5.254153609487942,
+      "pitch": -4.554153609487942,
+      "yaw": 90,
+      "horizontal_fov": 16
+    },
+    {
+      "name": "shadow_108_-0.3",
+      "width": 192,
+      "height": 96,
+      "altitude_km": 108,
+      "sun_elevation_deg": -10.78505388420042,
+      "pitch": -9.48505388420042,
+      "yaw": 90,
+      "horizontal_fov": 16
+    },
+    {
+      "name": "shadow_108_0",
+      "width": 192,
+      "height": 96,
+      "altitude_km": 108,
+      "sun_elevation_deg": -10.48505388420042,
+      "pitch": -9.48505388420042,
+      "yaw": 90,
+      "horizontal_fov": 16
+    },
+    {
+      "name": "shadow_108_0.3",
+      "width": 192,
+      "height": 96,
+      "altitude_km": 108,
+      "sun_elevation_deg": -10.18505388420042,
+      "pitch": -9.48505388420042,
+      "yaw": 90,
+      "horizontal_fov": 16
+    },
+    {
+      "name": "shadow_400_-0.3",
+      "width": 192,
+      "height": 96,
+      "altitude_km": 400,
+      "sun_elevation_deg": -20.108855638448183,
+      "pitch": -18.808855638448183,
+      "yaw": 90,
+      "horizontal_fov": 16
+    },
+    {
+      "name": "shadow_400_0",
+      "width": 192,
+      "height": 96,
+      "altitude_km": 400,
+      "sun_elevation_deg": -19.808855638448183,
+      "pitch": -18.808855638448183,
+      "yaw": 90,
+      "horizontal_fov": 16
+    },
+    {
+      "name": "shadow_400_0.3",
+      "width": 192,
+      "height": 96,
+      "altitude_km": 400,
+      "sun_elevation_deg": -19.508855638448182,
+      "pitch": -18.808855638448183,
+      "yaw": 90,
+      "horizontal_fov": 16
+    },
+    {
+      "name": "twilight_-8",
+      "width": 192,
+      "height": 96,
+      "altitude_km": 0.2,
+      "sun_elevation_deg": -8,
+      "pitch": 5,
+      "yaw": 0,
+      "horizontal_fov": 120
+    },
+    {
+      "name": "twilight_-6",
+      "width": 192,
+      "height": 96,
+      "altitude_km": 0.2,
+      "sun_elevation_deg": -6,
+      "pitch": 5,
+      "yaw": 0,
+      "horizontal_fov": 120
+    },
+    {
+      "name": "twilight_-4",
+      "width": 192,
+      "height": 96,
+      "altitude_km": 0.2,
+      "sun_elevation_deg": -4,
+      "pitch": 5,
+      "yaw": 0,
+      "horizontal_fov": 120
+    },
+    {
+      "name": "twilight_-2",
+      "width": 192,
+      "height": 96,
+      "altitude_km": 0.2,
+      "sun_elevation_deg": -2,
+      "pitch": 5,
+      "yaw": 0,
+      "horizontal_fov": 120
+    },
+    {
+      "name": "twilight_-1",
+      "width": 192,
+      "height": 96,
+      "altitude_km": 0.2,
+      "sun_elevation_deg": -1,
+      "pitch": 5,
+      "yaw": 0,
+      "horizontal_fov": 120
+    },
+    {
+      "name": "twilight_-0.5",
+      "width": 192,
+      "height": 96,
+      "altitude_km": 0.2,
+      "sun_elevation_deg": -0.5,
+      "pitch": 5,
+      "yaw": 0,
+      "horizontal_fov": 120
+    },
+    {
+      "name": "twilight_0",
+      "width": 192,
+      "height": 96,
+      "altitude_km": 0.2,
+      "sun_elevation_deg": 0,
+      "pitch": 5,
+      "yaw": 0,
+      "horizontal_fov": 120
+    },
+    {
+      "name": "twilight_0.5",
+      "width": 192,
+      "height": 96,
+      "altitude_km": 0.2,
+      "sun_elevation_deg": 0.5,
+      "pitch": 5,
+      "yaw": 0,
+      "horizontal_fov": 120
+    }
+  ]
+}

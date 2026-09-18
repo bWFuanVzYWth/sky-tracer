@@ -1,0 +1,16 @@
+[package]
+name = "sky-audit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+clap.workspace = true
+glam.workspace = true
+serde_json.workspace = true
+wgpu.workspace = true
+pollster.workspace = true
+bytemuck.workspace = true
+sky-realtime = { path = "../../crates/sky-realtime" }
+sky-reference = { path = "../../crates/sky-reference" }
+
