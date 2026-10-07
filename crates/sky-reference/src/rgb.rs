@@ -2,8 +2,10 @@
 use crate::physics::spectrum::{SpectralBand, SpectralRgbConverter};
 use crate::{
     Result,
-    asset::{Hash, Manifest, RGB_KIND},
+    asset::{Hash, LutContainer, Manifest, RGB_KIND},
+    tensor_container,
 };
+use safetensors::tensor::Dtype;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File},
@@ -18,7 +20,7 @@ pub struct RgbStorage {
     pub color_space: String,
     pub weights: Vec<[f32; 3]>,
     pub solar_irradiance: [f32; 3],
-    /// Each channel file: 8-byte magic, attenuated solar irradiance, radiance.
+    /// Each channel container stores attenuated solar irradiance and radiance.
     pub channel_checksums: [String; 3],
     /// Exact original spectral optical depths, retained for future segment work.
     pub optical_depth_checksum: String,
@@ -83,14 +85,13 @@ pub fn rec2020_weights(m: &Manifest) -> Vec<[f32; 3]> {
         .collect()
 }
 
-fn write_values(writer: &mut impl Write, hash: &mut Hash, values: &[f32]) -> Result<()> {
+fn write_values(writer: &mut impl Write, values: &[f32]) -> Result<()> {
     for &value in values {
         if !value.is_finite() {
             return Err("nonfinite RGB export".into());
         }
         let bytes = value.to_le_bytes();
         writer.write_all(&bytes)?;
-        hash.update(&bytes);
     }
     Ok(())
 }
@@ -109,11 +110,18 @@ pub fn export(source: &Path, output: &Path) -> Result<Manifest> {
     let mut solar_table: [Vec<f32>; 3] =
         std::array::from_fn(|_| vec![0.0; m.config.optical_depth_len()]);
     let mut solar = [0.0; 3];
-    let mut tau_file = BufWriter::new(File::create(output.join("spectral_tau.part"))?);
-    let mut tau_hash = Hash::new();
+    let tau_path = output.join("spectral_tau.safetensors");
+    let tau_part = tau_path.with_extension("part");
+    let mut tau_file = BufWriter::new(File::create(&tau_part)?);
+    // Append one band at a time; exporting optical depth never requires a
+    // second, full spectral table in memory.
+    tensor_container::write_header(
+        &mut tau_file,
+        &[("optical_depth", Dtype::F32, tau_shape(&m))],
+    )?;
     for (i, w) in weights.iter().enumerate() {
         let band = m.read_band(source, i)?;
-        write_values(&mut tau_file, &mut tau_hash, &band.optical_depth)?;
+        write_values(&mut tau_file, &band.optical_depth)?;
         for channel in 0..3 {
             let scale = w[channel];
             let solar_scale = scale * band.info.solar_irradiance_w_m2;
@@ -130,26 +138,36 @@ pub fn export(source: &Path, output: &Path) -> Result<Manifest> {
     tau_file.flush()?;
     tau_file.get_ref().sync_all()?;
     drop(tau_file);
-    fs::rename(
-        output.join("spectral_tau.part"),
-        output.join("spectral_tau.bin"),
-    )?;
+    fs::rename(&tau_part, &tau_path)?;
+    let tau_checksum = tensor_container::checksum_file(&tau_path)?;
     let mut checksums = std::array::from_fn(|_| String::new());
     for channel in 0..3 {
-        let path = output.join(format!("channel_{channel}.bin"));
-        let part = path.with_extension("part");
-        let mut writer = BufWriter::new(File::create(&part)?);
-        let mut hash = Hash::new();
-        writer.write_all(MAGIC)?;
-        hash.update(MAGIC);
-        write_values(&mut writer, &mut hash, &solar_table[channel])?;
-        write_values(&mut writer, &mut hash, &radiance[channel])?;
-        writer.flush()?;
-        writer.get_ref().sync_all()?;
-        drop(writer);
-        fs::rename(part, path)?;
-        checksums[channel] = hash.finish();
+        if solar_table[channel]
+            .iter()
+            .chain(&radiance[channel])
+            .any(|value| !value.is_finite())
+        {
+            return Err("nonfinite RGB export".into());
+        }
+        checksums[channel] = tensor_container::write(
+            &output.join(format!("channel_{channel}.safetensors")),
+            &[
+                (
+                    "solar_irradiance",
+                    Dtype::F32,
+                    m.config.optical_depth.to_vec(),
+                    bytemuck::cast_slice(&solar_table[channel]),
+                ),
+                (
+                    "radiance",
+                    Dtype::F32,
+                    m.config.scattering.to_vec(),
+                    bytemuck::cast_slice(&radiance[channel]),
+                ),
+            ],
+        )?;
     }
+    m.container = LutContainer::Safetensors;
     m.kind = RGB_KIND.into();
     m.radiance_units = "linear Rec.2020, solar-D65 transform of band-integrated radiance".into();
     m.records.fill(None);
@@ -158,7 +176,7 @@ pub fn export(source: &Path, output: &Path) -> Result<Manifest> {
         weights,
         solar_irradiance: solar,
         channel_checksums: checksums,
-        optical_depth_checksum: tau_hash.finish(),
+        optical_depth_checksum: tau_checksum,
         packed: None,
     });
     m.save(output)?;
@@ -176,6 +194,30 @@ pub fn read_channel(m: &Manifest, dir: &Path, channel: usize) -> Result<(Vec<f32
         .channel_checksums
         .get(channel)
         .ok_or("RGB channel out of range")?;
+    if m.container == LutContainer::Safetensors {
+        let mut tensors = tensor_container::read(
+            &dir.join(format!("channel_{channel}.safetensors")),
+            &[
+                (
+                    "solar_irradiance",
+                    Dtype::F32,
+                    m.config.optical_depth.to_vec(),
+                ),
+                ("radiance", Dtype::F32, m.config.scattering.to_vec()),
+            ],
+            checksum,
+        )?
+        .into_iter();
+        let solar = tensor_container::f32_values(
+            &tensors.next().ok_or("missing RGB solar tensor")?,
+            false,
+        )?;
+        let radiance = tensor_container::f32_values(
+            &tensors.next().ok_or("missing RGB radiance tensor")?,
+            false,
+        )?;
+        return Ok((solar, radiance));
+    }
     let path = dir.join(format!("channel_{channel}.bin"));
     let len = m.config.optical_depth_len() + m.config.scattering_len();
     if fs::metadata(&path)?.len() != 8 + len as u64 * 4 {
@@ -214,6 +256,29 @@ pub fn verify(m: &Manifest, dir: &Path) -> Result<()> {
     for channel in 0..3 {
         read_channel(m, dir, channel)?;
     }
+    if m.container == LutContainer::Safetensors {
+        let checksum = &m
+            .rgb
+            .as_ref()
+            .ok_or("asset is not RGB")?
+            .optical_depth_checksum;
+        let (mut reader, _, _) = tensor_container::open_validated(
+            &dir.join("spectral_tau.safetensors"),
+            &[("optical_depth", Dtype::F32, tau_shape(m))],
+            checksum,
+        )?;
+        // Optical depth is verified in constant memory, even for full teacher
+        // assets retaining all original wavelength bands.
+        let mut bytes = [0u8; 4];
+        for _ in 0..m.bands.len() * m.config.optical_depth_len() {
+            reader.read_exact(&mut bytes)?;
+            let value = f32::from_le_bytes(bytes);
+            if !value.is_finite() || value < 0.0 {
+                return Err("invalid spectral optical depth".into());
+            }
+        }
+        return Ok(());
+    }
     let path = dir.join("spectral_tau.bin");
     if fs::metadata(&path)?.len() != m.bands.len() as u64 * m.config.optical_depth_len() as u64 * 4
     {
@@ -239,4 +304,12 @@ pub fn verify(m: &Manifest, dir: &Path) -> Result<()> {
         return Err("spectral optical depth checksum mismatch".into());
     }
     Ok(())
+}
+
+fn tau_shape(m: &Manifest) -> Vec<usize> {
+    vec![
+        m.bands.len(),
+        m.config.optical_depth[0],
+        m.config.optical_depth[1],
+    ]
 }

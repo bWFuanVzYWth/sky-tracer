@@ -27,6 +27,37 @@ pub struct Input {
 }
 #[derive(Subcommand)]
 pub enum Command {
+    /// Compare integration sampling counts on one fixed, small fitted teacher grid.
+    /// Dense control is a numerical comparison, not a full-grid accuracy or timing estimate.
+    SamplingStudy {
+        /// New JSON output path; checkpoints are saved after every band/repeat.
+        #[arg(long)]
+        out: PathBuf,
+        /// Four LUT axes: altitude, view cone, solar coordinate, phase.
+        #[arg(long, num_args = 4, default_values = ["8", "12", "25", "33"])]
+        scattering: Vec<usize>,
+        /// Auxiliary optical-depth axes; use 384 4096 for a separate full-size auxiliary-table study.
+        #[arg(long, num_args = 2, default_values = ["64", "512"])]
+        optical_depth: Vec<usize>,
+        /// Requested wavelengths in nm; chooses nearest available band centers.
+        #[arg(long, num_args = 1.., default_values = ["450", "550", "650"])]
+        bands: Vec<f32>,
+        /// Variants to run; dense_control always runs first. Include baseline for wall ratios.
+        /// Names: baseline, ray_128, ray_384, ray_uniform_768,
+        /// ray_logheight_128, ray_logheight_192, ray_logheight_256,
+        /// tau_1024, angular_12x24, angular_20x40,
+        /// balanced_logheight_192 (LogHeight 192 + angular 20x40),
+        /// sun_2x16, sun_4x8, sun_4x32, orders_16.
+        #[arg(long, num_args = 1..)]
+        only: Vec<String>,
+        #[arg(long, default_value_t = 1)]
+        repeats: usize,
+        /// Prime each case with one excluded solve before collecting timings.
+        #[arg(long)]
+        warmup: bool,
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
     /// Validate inputs, print byte/work budgets and the resolved config; no GPU work.
     Plan {
         #[command(flatten)]
@@ -162,6 +193,44 @@ impl Input {
 
 pub fn run(command: Command) -> Result<()> {
     match command {
+        Command::SamplingStudy {
+            out,
+            scattering,
+            optical_depth,
+            bands,
+            only,
+            repeats,
+            warmup,
+            data_dir,
+        } => {
+            let scene = sky_reference::physics::data::load_scene_data(
+                &data_dir.unwrap_or_else(sky_reference::physics::data::default_data_dir),
+                0.0,
+                0.0,
+            )
+            .map_err(|e| e.to_string())?;
+            let model = Model::from_scene(&scene)?;
+            let options = sky_reference::sampling_study::StudyOptions {
+                scattering: scattering
+                    .try_into()
+                    .map_err(|_| "scattering requires four dimensions")?,
+                optical_depth: optical_depth
+                    .try_into()
+                    .map_err(|_| "optical-depth requires two dimensions")?,
+                bands_nm: bands,
+                only,
+                repeats,
+                warmup,
+            };
+            let report = sky_reference::sampling_study::run(&model, options, &out, |message| {
+                eprintln!("{message}")
+            })?;
+            println!(
+                "Completed {} sampling-study cases: {}",
+                report.cases.len(),
+                out.display()
+            );
+        }
         Command::Spectra {
             source,
             queries,
@@ -184,6 +253,7 @@ pub fn run(command: Command) -> Result<()> {
                 serde_json::to_string_pretty(&serde_json::json!({
                     "bands":model.bands.len(),"model_fingerprint_fnv1a64":fingerprint(&model)?,"asset_bytes_including_metadata_reserve":config.asset_bytes(model.bands.len())?,
                     "decimal_gb":config.asset_bytes(model.bands.len())? as f32/1e9,
+                    "container":"safetensors","teacher_hard_limit_bytes":sky_reference::config::MAX_TEACHER_BYTES,
                     "scattering_texels_per_band":n,"angular_lookups_per_later_order_per_band":n as u64*config.angular_mu as u64*config.angular_phi as u64*if config.angular_integration==AngularIntegration::SunAndView {2} else {1},
                     "working_transport_storage_bytes":4*(4*n+config.optical_depth_len()+4*config.ground_sun_samples+n.div_ceil(64)*5+n.div_ceil(64).div_ceil(256)*5),
                     "work_reuse":work,"gpu_timing_measured":false,
@@ -205,6 +275,9 @@ pub fn run(command: Command) -> Result<()> {
                 let m = Manifest::open(&out)?;
                 if m.rgb.is_some() {
                     return Err("cannot resume baking an exported RGB asset".into());
+                }
+                if m.container != sky_reference::asset::LutContainer::Safetensors {
+                    return Err("legacy binary LUTs are read-only; use a new output directory for safetensors baking".into());
                 }
                 if m.solver != sky_reference::asset::SOLVER {
                     return Err("cannot resume a LUT baked with an older solver; use a new output directory".into());

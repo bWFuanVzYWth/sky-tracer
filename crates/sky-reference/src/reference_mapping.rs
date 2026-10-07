@@ -2,10 +2,83 @@
 //! Each region has fixed indices: a cone becoming tangent to the horizon never
 //! crosses an arbitrary phase cell. Radiance (including phase) remains stored.
 use crate::{
-    config::{BakeConfig, SolarInterpolation},
+    config::{BakeConfig, CoordinateAllocation, SolarInterpolation},
     mapping::{Geometry, State, log_mix, unit},
 };
-use std::f32::consts::PI;
+use std::{f32::consts::PI, sync::OnceLock};
+
+#[derive(serde::Deserialize)]
+struct RealtimeFit {
+    source_height: Vec<f32>,
+    solar_weights: [f32; 5],
+    solar_widths: [f32; 3],
+}
+fn realtime_fit() -> &'static RealtimeFit {
+    static FIT: OnceLock<RealtimeFit> = OnceLock::new();
+    FIT.get_or_init(|| {
+        serde_json::from_str(include_str!("../configs/teacher_mapping_fit_v1.json"))
+            .expect("frozen realtime teacher fit")
+    })
+}
+
+/// Resample the realtime source-curvature allocation, retaining material
+/// boundaries and extra near-surface nodes for the teacher's boundary radiance.
+/// The resulting nodes are serialized into the bake config, not regenerated
+/// when an existing asset is opened.
+pub fn realtime_fit_heights(g: Geometry, n: usize) -> Vec<f32> {
+    assert!(n >= 2);
+    let fit = &realtime_fit().source_height;
+    let near_ground = [0.00025, 0.001, 0.004, 0.016, 0.064, 0.25, 0.5, 0.75];
+    let extra = (n / 9).min(near_ground.len());
+    let count = n - extra;
+    let top = g.top_height();
+    let mut nodes: Vec<_> = (0..count)
+        .map(|i| {
+            let x = unit(i, count) * (fit.len() - 1) as f32;
+            let j = (x as usize).min(fit.len() - 2);
+            let t = x - j as f32;
+            let h = fit[j] * (1.0 - t) + fit[j + 1] * t;
+            if top < 35.0 {
+                h * top / 120.0
+            } else if h <= 35.0 {
+                h
+            } else {
+                35.0 + (h - 35.0) * (top - 35.0) / 85.0
+            }
+        })
+        .collect();
+    let anchors: &[f32] = if count >= 32 {
+        &[1.0, 2.0, 11.0, 12.0, 35.0]
+    } else if count > 2 {
+        &[35.0]
+    } else {
+        &[]
+    };
+    let mut used = vec![false; count];
+    used[0] = true;
+    used[count - 1] = true;
+    for &anchor in anchors.iter().rev().filter(|&&h| h < top) {
+        let j = (1..count - 1)
+            .filter(|&j| !used[j])
+            .min_by(|&a, &b| {
+                (nodes[a] - anchor)
+                    .abs()
+                    .total_cmp(&(nodes[b] - anchor).abs())
+            })
+            .expect("interior height anchor");
+        nodes[j] = anchor;
+        used[j] = true;
+    }
+    nodes.extend(
+        near_ground[..extra]
+            .iter()
+            .map(|&h| h * (top / 120.0).min(1.0)),
+    );
+    nodes.sort_by(f32::total_cmp);
+    nodes[0] = 0.0;
+    nodes[n - 1] = top;
+    nodes
+}
 
 /// Harmonic-mean tangents preserve monotonicity and give matching derivatives
 /// at adjacent phase cells. Constant padding handles the two domain endpoints.
@@ -121,6 +194,36 @@ pub fn solar_coord(g: Geometry, h: f32, mu: f32) -> f32 {
 }
 pub fn solar_cosine(g: Geometry, h: f32, u: f32) -> f32 {
     invert(|e| solar_coord(g, h, e.sin()), u, -PI * 0.5, PI * 0.5).sin()
+}
+
+pub fn solar_coord_config(g: Geometry, c: &BakeConfig, h: f32, mu: f32) -> f32 {
+    if c.coordinate_allocation == CoordinateAllocation::Legacy {
+        return solar_coord(g, h, mu);
+    }
+    let fit = realtime_fit();
+    let e = mu.clamp(-1.0, 1.0).asin();
+    let hor = g.horizon(h).asin();
+    let centers = [hor, hor - 6.0_f32.to_radians(), -hor];
+    let soft = |x: f32, width: f32| x / (x.abs() + width);
+    let d = (PI * 0.5 - e).max(0.0);
+    let scale = 5.0_f32.to_radians();
+    let cap = 1.0 - (d / (d + scale)).sqrt() / (PI / (PI + scale)).sqrt();
+    let mut y = fit.solar_weights[0] * (e / PI + 0.5) + fit.solar_weights[4] * cap;
+    for j in 0..3 {
+        let a = soft(-PI * 0.5 - centers[j], fit.solar_widths[j]);
+        let b = soft(PI * 0.5 - centers[j], fit.solar_widths[j]);
+        y += fit.solar_weights[j + 1] * (soft(e - centers[j], fit.solar_widths[j]) - a) / (b - a);
+    }
+    y.clamp(0.0, 1.0)
+}
+pub fn solar_cosine_config(g: Geometry, c: &BakeConfig, h: f32, u: f32) -> f32 {
+    invert(
+        |e| solar_coord_config(g, c, h, e.sin()),
+        u,
+        -PI * 0.5,
+        PI * 0.5,
+    )
+    .sin()
 }
 
 // The two exact phase angles at which a solar cone touches the horizon.
@@ -339,7 +442,7 @@ pub fn append_nodes(g: Geometry, c: &BakeConfig, packed: &mut Vec<f32>) {
     let heights = radius_nodes(g, c);
     let solar: Vec<_> = heights
         .iter()
-        .flat_map(|&h| (0..ns).map(move |i| solar_cosine(g, h, unit(i, ns))))
+        .flat_map(|&h| (0..ns).map(move |i| solar_cosine_config(g, c, h, unit(i, ns))))
         .collect();
     packed.extend_from_slice(&heights);
     packed.extend_from_slice(&solar);
@@ -369,7 +472,8 @@ pub fn append_display_nodes(g: Geometry, c: &BakeConfig, packed: &mut Vec<f32>) 
         if c.mapping == crate::config::CoordinateMapping::RayAlignedReference {
             for h in heights {
                 packed.extend(
-                    (0..c.scattering[2]).map(|si| solar_cosine(g, h, unit(si, c.scattering[2]))),
+                    (0..c.scattering[2])
+                        .map(|si| solar_cosine_config(g, c, h, unit(si, c.scattering[2]))),
                 );
             }
         }

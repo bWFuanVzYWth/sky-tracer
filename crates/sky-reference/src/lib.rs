@@ -8,11 +8,13 @@ pub mod config;
 pub mod mapping;
 pub mod model;
 pub mod packed;
+pub mod path_integration;
 pub mod quadrature;
 pub mod ray_mapping;
 pub mod reference_mapping;
 pub mod renderer;
 pub mod rgb;
+pub mod sampling_study;
 pub mod solver;
 pub mod synthesis;
 
@@ -22,3 +24,4 @@ pub mod physics;
 
 mod direct;
 pub mod spectral_dataset;
+mod tensor_container;

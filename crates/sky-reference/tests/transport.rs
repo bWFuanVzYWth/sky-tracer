@@ -98,10 +98,23 @@ fn gpu_horizon_reference_chart_preserves_thin_transport_and_vacuum() -> sky_refe
 
 #[test]
 fn gpu_ray_reference_direct_first_preserves_thin_transport() -> sky_reference::Result<()> {
+    check_ray_reference_direct_first(sky_reference::config::CoordinateAllocation::Legacy)
+}
+
+#[test]
+fn gpu_realtime_fitted_reference_preserves_thin_transport_and_cpu_render_lookup()
+-> sky_reference::Result<()> {
+    check_ray_reference_direct_first(sky_reference::config::CoordinateAllocation::RealtimeFitV1)
+}
+
+fn check_ray_reference_direct_first(
+    allocation: sky_reference::config::CoordinateAllocation,
+) -> sky_reference::Result<()> {
     let gpu = GpuBaker::new()?;
     let model = homogeneous(1e-8);
     let c = BakeConfig {
         mapping: CoordinateMapping::RayAlignedReference,
+        coordinate_allocation: allocation,
         phase_interpolation: sky_reference::config::PhaseInterpolation::LogRadiance,
         view_interpolation: sky_reference::config::ViewInterpolation::MonotoneCubic,
         iteration_scheme: sky_reference::config::IterationScheme::FixedPoint,
@@ -136,7 +149,11 @@ fn gpu_ray_reference_direct_first_preserves_thin_transport() -> sky_reference::R
             "{above}: {value} vs {expected}"
         );
     }
-    let root = std::env::temp_dir().join(format!("sky-ray-chart-test-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!(
+        "sky-ray-chart-test-{}-{}",
+        std::process::id(),
+        allocation as u32
+    ));
     fs::create_dir_all(&root)?;
     let mut manifest = Manifest::new(&model, c, gpu.adapter_name.clone())?;
     manifest.write_band(&root, 0, band)?;
@@ -177,13 +194,13 @@ fn gpu_ray_reference_direct_first_preserves_thin_transport() -> sky_reference::R
                 )?;
                 assert!(
                     (values[(y * 8 + x) * 4] - cpu).abs() < cpu.abs() * 0.005 + 1e-11,
-                    "ray chart GPU/CPU at h={h}: {} vs {cpu}",
+                    "ray chart GPU/CPU at h={h}, pitch={pitch}, sun={sun}, pixel=({x},{y}), allocation={allocation:?}: {} vs {cpu}",
                     values[(y * 8 + x) * 4]
                 );
             }
         }
     }
-    for file in ["band_000.bin", "asset.json"] {
+    for file in ["band_000.safetensors", "asset.json"] {
         fs::remove_file(root.join(file))?;
     }
     fs::remove_dir(root)?;
@@ -361,7 +378,7 @@ fn cpu_synthesis_streams_spectra_and_matches_band_queries() -> sky_reference::Re
     }
     assert!(sky_reference::packed::compress(&rgb_root, &packed_root, 16).is_err());
     assert!(sky_reference::packed::compress(&packed_root, &root.join("invalid"), 16).is_err());
-    let map_path = packed_root.join("blocks.bin");
+    let map_path = packed_root.join("blocks.safetensors");
     let mut bytes = fs::read(&map_path)?;
     bytes[0] ^= 1;
     fs::write(&map_path, &bytes)?;
@@ -376,8 +393,8 @@ fn budgets_and_invalid_input_are_checked_before_gpu_work() {
     let reference = BakeConfig::reference();
     reference.validate(41).unwrap();
     assert_eq!(reference.mapping, CoordinateMapping::HorizonAligned);
-    assert_eq!(reference.scattering, [80, 32, 193, 257]);
-    assert!(reference.asset_bytes(41).unwrap() < 22_000_000_000);
+    assert_eq!(reference.scattering, [72, 32, 193, 257]);
+    assert!(reference.asset_bytes(41).unwrap() <= sky_reference::config::MAX_TEACHER_BYTES);
     let c = BakeConfig::default();
     c.validate(41).unwrap();
     assert!(c.asset_bytes(41).unwrap() < MAX_ASSET_BYTES);
@@ -863,29 +880,29 @@ fn gpu_transport_analytic_limits_io_and_render_agree()
             );
         }
     }
-    let path = rgb_root.join("channel_0.bin");
+    let path = rgb_root.join("channel_0.safetensors");
     let mut bytes = fs::read(&path)?;
     bytes[10] ^= 1;
     fs::write(&path, bytes)?;
     assert!(sky_reference::rgb::verify(&rgb_manifest, &rgb_root).is_err());
     for file in [
-        "channel_0.bin",
-        "channel_1.bin",
-        "channel_2.bin",
-        "spectral_tau.bin",
+        "channel_0.safetensors",
+        "channel_1.safetensors",
+        "channel_2.safetensors",
+        "spectral_tau.safetensors",
         "asset.json",
     ] {
         fs::remove_file(rgb_root.join(file))?;
     }
     fs::remove_dir(rgb_root)?;
     // Detect a corrupt payload, even if it remains finite and the length matches.
-    let path = root.join("band_000.bin");
+    let path = root.join("band_000.safetensors");
     let mut bytes = fs::read(&path)?;
     bytes[10] ^= 1;
     fs::write(&path, bytes)?;
     assert!(manifest.read_band(&root, 0).is_err());
     fs::remove_file(path)?;
-    fs::remove_file(root.join("band_001.bin"))?;
+    fs::remove_file(root.join("band_001.safetensors"))?;
     fs::remove_file(root.join("asset.json"))?;
     fs::remove_dir(root)?;
     Ok(())

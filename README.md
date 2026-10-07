@@ -53,7 +53,7 @@ cargo run --release -p sky-baker -- pt --width 32 --height 16 --spp 64 --out out
 cargo run --release -p sky-baker -- reference plan
 ```
 
-完整参考约 **21.08 GB**，不是首次运行的前提。实时算法不加载这份资源，常驻计算载荷约 **7.910 MiB**。已有本机资源继续可读；使用参考显示时显式选择：
+完整教师 LUT 使用 safetensors，按含容器头和元数据预留的上界约 **19.001 GB**，新烘焙硬上限为 **20 GB（20,000,000,000 字节）**。它不是首次运行的前提。实时算法不加载这份资源，常驻计算载荷约 **7.910 MiB**。已有二进制资源继续可读；使用参考显示时显式选择：
 
 ```powershell
 cargo run --release -p sky-demo -- --experiment reference --lut out/lut_reference_v6_packed16

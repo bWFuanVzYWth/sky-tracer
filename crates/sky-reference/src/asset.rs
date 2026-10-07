@@ -1,27 +1,31 @@
 use crate::{
     Result,
-    config::{BakeConfig, CoordinateMapping, METADATA_RESERVE},
+    config::{BakeConfig, CoordinateAllocation, CoordinateMapping, METADATA_RESERVE},
     mapping::{Geometry, State, sample, sample_radiance_state, scattering_cosine, sun_coord, unit},
     model::{BandInfo, Model},
     solver::{BakedBand, OrderStats},
 };
 use glam::Vec3;
+use safetensors::tensor::Dtype;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File},
-    io::{BufReader, BufWriter, Read, Write},
+    io::{BufReader, Read, Write},
     path::{Path, PathBuf},
 };
 
 pub const KIND: &str = "spectral_atmosphere_4d_phase_inclusive_v1";
 pub const RGB_KIND: &str = "rec2020_atmosphere_4d_phase_inclusive_v1";
-pub const SOLVER: &str = "spectral-transport-wgpu-f32-v5";
+pub const SOLVER: &str = "spectral-transport-wgpu-f32-v6";
 pub const COORDINATE_MAPPING: &str = "rho-mu-split-cubic-endpoints-mus-asinh20-nu-cubic-v1";
 pub const SUN_ALIGNED_MAPPING: &str = "rho-solar-horizon-square-cone-split75-angle-mixture-v2";
 pub const SUN_ANGULAR_MAPPING: &str =
     "rho-solar-horizon-square-zenith-cap-cone-split75-angle-mixture-v3";
-fn mapping_name(mapping: CoordinateMapping) -> &'static str {
-    match mapping {
+fn mapping_name(config: &BakeConfig) -> &'static str {
+    if config.coordinate_allocation == CoordinateAllocation::RealtimeFitV1 {
+        return "ray-frame-realtime-fitted-height-solar-phase-inclusive-v7";
+    }
+    match config.mapping {
         CoordinateMapping::Legacy => COORDINATE_MAPPING,
         CoordinateMapping::SunAligned => SUN_ALIGNED_MAPPING,
         CoordinateMapping::SunAlignedAngular => SUN_ANGULAR_MAPPING,
@@ -34,6 +38,15 @@ fn mapping_name(mapping: CoordinateMapping) -> &'static str {
     }
 }
 const MAGIC: &[u8; 8] = b"SKYLUT01";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LutContainer {
+    /// Missing in older manifests, whose payloads keep their original format.
+    #[default]
+    LegacyBinary,
+    Safetensors,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BandRecord {
@@ -48,6 +61,8 @@ pub struct Manifest {
     pub solver: String,
     pub coordinate_mapping: String,
     pub scalar_format: String,
+    #[serde(default)]
+    pub container: LutContainer,
     pub radiance_units: String,
     pub includes_ground: bool,
     pub includes_direct_sun_disk: bool,
@@ -69,8 +84,9 @@ impl Manifest {
         Ok(Self {
             kind: KIND.into(),
             solver: SOLVER.into(),
-            coordinate_mapping: mapping_name(config.mapping).into(),
+            coordinate_mapping: mapping_name(&config).into(),
             scalar_format: "little-endian-f32".into(),
+            container: LutContainer::Safetensors,
             radiance_units: "W m^-2 sr^-1 integrated over each input band".into(),
             includes_ground: true,
             includes_direct_sun_disk: false,
@@ -93,7 +109,11 @@ impl Manifest {
             return Err("oversized LUT manifest".into());
         }
         let m: Self = serde_json::from_reader(BufReader::new(File::open(path)?))?;
-        m.config.validate(m.bands.len())?;
+        if m.container == LutContainer::LegacyBinary || m.rgb.is_some() {
+            m.config.validate_existing(m.bands.len())?;
+        } else {
+            m.config.validate(m.bands.len())?;
+        }
         m.config.validate_top_height(m.geometry.top_height())?;
         if ![KIND, RGB_KIND].contains(&m.kind.as_str())
             || (m.kind == RGB_KIND) != m.rgb.is_some()
@@ -102,10 +122,11 @@ impl Manifest {
                 "successive-orders-wgpu-f32-v2",
                 "successive-orders-wgpu-f32-v3",
                 "spectral-transport-wgpu-f32-v4",
+                "spectral-transport-wgpu-f32-v5",
                 SOLVER,
             ]
             .contains(&m.solver.as_str())
-            || m.coordinate_mapping != mapping_name(m.config.mapping)
+            || m.coordinate_mapping != mapping_name(&m.config)
             || m.scalar_format
                 != if m.rgb.as_ref().is_some_and(|r| r.packed.is_some()) {
                     crate::packed::FORMAT
@@ -143,9 +164,15 @@ impl Manifest {
         Ok(m)
     }
     pub fn save(&self, dir: &Path) -> Result<()> {
+        if self.rgb.is_none() {
+            self.config.validate(self.bands.len())?;
+        }
         let bytes = serde_json::to_vec_pretty(self)?;
         if bytes.len() as u64 > METADATA_RESERVE / 2 {
             return Err("manifest exceeds metadata budget".into());
+        }
+        if self.rgb.is_none() {
+            self.check_storage_budget(dir, 0, None)?;
         }
         let part = dir.join("asset.json.part");
         let mut file = File::create(&part)?;
@@ -161,49 +188,97 @@ impl Manifest {
         if index >= self.bands.len() || self.records[index].is_some() {
             return Err("band index invalid or already committed".into());
         }
+        self.config.validate(self.bands.len())?;
+        if self.container != LutContainer::Safetensors {
+            return Err(
+                "legacy binary LUTs are read-only; bake into a new safetensors directory".into(),
+            );
+        }
         if band.radiance.len() != self.config.scattering_len()
             || band.optical_depth.len() != self.config.optical_depth_len()
             || band.ground_irradiance.len() != self.config.ground_sun_samples
         {
             return Err("band dimensions do not match manifest".into());
         }
-        let path = band_path(dir, index);
-        let part = path.with_extension("part");
+        if band
+            .optical_depth
+            .iter()
+            .chain(&band.radiance)
+            .chain(&band.ground_irradiance)
+            .any(|x| !x.is_finite() || *x < 0.0)
+        {
+            return Err("invalid band value".into());
+        }
+        let path = band_path(dir, index, self.container);
+        self.check_storage_budget(dir, self.config.band_bytes()?, Some(&path))?;
         // An uncommitted orphan is from an interrupted bake. Remove it before
         // replacing it so resume never retains two full copies of a band.
         if path.exists() {
             fs::remove_file(&path)?;
         }
-        let mut writer = BufWriter::new(File::create(&part)?);
-        let mut hash = Hash::new();
-        writer.write_all(MAGIC)?;
-        hash.update(MAGIC);
-        for x in band
-            .optical_depth
-            .iter()
-            .chain(&band.radiance)
-            .chain(&band.ground_irradiance)
-        {
-            if !x.is_finite() || *x < 0.0 {
-                return Err("invalid band value".into());
-            }
-            let bytes = x.to_le_bytes();
-            writer.write_all(&bytes)?;
-            hash.update(&bytes);
-        }
-        writer.flush()?;
-        writer.get_ref().sync_all()?;
-        drop(writer);
-        if fs::metadata(&part)?.len() != self.config.band_bytes()? {
+        let checksum = crate::tensor_container::write(
+            &path,
+            &[
+                (
+                    "optical_depth",
+                    Dtype::F32,
+                    self.config.optical_depth.to_vec(),
+                    bytemuck::cast_slice(&band.optical_depth),
+                ),
+                (
+                    "radiance",
+                    Dtype::F32,
+                    self.config.scattering.to_vec(),
+                    bytemuck::cast_slice(&band.radiance),
+                ),
+                (
+                    "ground_irradiance",
+                    Dtype::F32,
+                    vec![self.config.ground_sun_samples],
+                    bytemuck::cast_slice(&band.ground_irradiance),
+                ),
+            ],
+        )?;
+        if fs::metadata(&path)?.len() > self.config.band_bytes()? {
             return Err("band file size mismatch".into());
         }
-        fs::rename(part, path)?;
         self.records[index] = Some(BandRecord {
-            checksum_fnv1a64: hash.finish(),
+            checksum_fnv1a64: checksum,
             orders: band.orders,
             stopped_by_tolerance: band.stopped_by_tolerance,
         });
         self.save(dir)
+    }
+
+    /// Include interrupted-write temporaries and reserve both manifest copies.
+    /// Payloads are direct children of their asset directory.
+    fn check_storage_budget(&self, dir: &Path, extra: u64, replacing: Option<&Path>) -> Result<()> {
+        let mut bytes = METADATA_RESERVE
+            .checked_add(extra)
+            .ok_or("asset size overflow")?;
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if replacing == Some(path.as_path())
+                || ["asset.json", "asset.json.part"]
+                    .contains(&entry.file_name().to_string_lossy().as_ref())
+            {
+                continue;
+            }
+            if entry.file_type()?.is_file() {
+                bytes = bytes
+                    .checked_add(entry.metadata()?.len())
+                    .ok_or("asset size overflow")?;
+            }
+        }
+        let budget = self
+            .config
+            .max_asset_bytes
+            .min(crate::config::MAX_TEACHER_BYTES);
+        if bytes > budget {
+            return Err(format!("LUT directory needs up to {bytes} bytes including temporary files; budget is {budget} bytes").into());
+        }
+        Ok(())
     }
     pub fn read_band(&self, dir: &Path, index: usize) -> Result<BandLut> {
         if self.rgb.is_some() {
@@ -214,40 +289,69 @@ impl Manifest {
             .get(index)
             .and_then(Option::as_ref)
             .ok_or("band has not been baked")?;
-        let path = band_path(dir, index);
-        if fs::metadata(&path)?.len() != self.config.band_bytes()? {
-            return Err("band file length mismatch".into());
-        }
-        let mut file = BufReader::new(File::open(path)?);
-        let mut header = [0u8; 8];
-        file.read_exact(&mut header)?;
-        if &header != MAGIC {
-            return Err("bad LUT magic/version".into());
-        }
-        let mut hash = Hash::new();
-        hash.update(&header);
-        let mut values = vec![0.0; (self.config.band_bytes()? as usize - 8) / 4];
-        for x in &mut values {
-            let mut bytes = [0u8; 4];
-            file.read_exact(&mut bytes)?;
-            hash.update(&bytes);
-            *x = f32::from_le_bytes(bytes);
-            if !x.is_finite() || *x < 0.0 {
-                return Err("invalid stored LUT value".into());
-            }
-        }
-        if hash.finish() != record.checksum_fnv1a64 {
-            return Err("LUT checksum mismatch".into());
-        }
-        let ground_irradiance =
-            values.split_off(self.config.optical_depth_len() + self.config.scattering_len());
-        let radiance = values.split_off(self.config.optical_depth_len());
+        let path = band_path(dir, index, self.container);
+        let (optical_depth, radiance, ground_irradiance) =
+            if self.container == LutContainer::Safetensors {
+                let data = crate::tensor_container::read(
+                    &path,
+                    &[
+                        (
+                            "optical_depth",
+                            Dtype::F32,
+                            self.config.optical_depth.to_vec(),
+                        ),
+                        ("radiance", Dtype::F32, self.config.scattering.to_vec()),
+                        (
+                            "ground_irradiance",
+                            Dtype::F32,
+                            vec![self.config.ground_sun_samples],
+                        ),
+                    ],
+                    &record.checksum_fnv1a64,
+                )?;
+                (
+                    crate::tensor_container::f32_values(&data[0], true)?,
+                    crate::tensor_container::f32_values(&data[1], true)?,
+                    crate::tensor_container::f32_values(&data[2], true)?,
+                )
+            } else {
+                let legacy_bytes =
+                    self.config.band_bytes()? - crate::tensor_container::HEADER_RESERVE + 8;
+                if fs::metadata(&path)?.len() != legacy_bytes {
+                    return Err("band file length mismatch".into());
+                }
+                let mut file = BufReader::new(File::open(path)?);
+                let mut header = [0u8; 8];
+                file.read_exact(&mut header)?;
+                if &header != MAGIC {
+                    return Err("bad LUT magic/version".into());
+                }
+                let mut hash = Hash::new();
+                hash.update(&header);
+                let mut values = vec![0.0; (legacy_bytes as usize - 8) / 4];
+                for x in &mut values {
+                    let mut bytes = [0u8; 4];
+                    file.read_exact(&mut bytes)?;
+                    hash.update(&bytes);
+                    *x = f32::from_le_bytes(bytes);
+                    if !x.is_finite() || *x < 0.0 {
+                        return Err("invalid stored LUT value".into());
+                    }
+                }
+                if hash.finish() != record.checksum_fnv1a64 {
+                    return Err("LUT checksum mismatch".into());
+                }
+                let ground_irradiance = values
+                    .split_off(self.config.optical_depth_len() + self.config.scattering_len());
+                let radiance = values.split_off(self.config.optical_depth_len());
+                (values, radiance, ground_irradiance)
+            };
         Ok(BandLut {
             geometry: self.geometry,
             config: self.config.clone(),
             info: self.bands[index].clone(),
             sun_radius: self.sun_radius_rad,
-            optical_depth: values,
+            optical_depth,
             radiance,
             ground_irradiance,
             scattering_cosines: (0..self.config.scattering[3])
@@ -293,7 +397,7 @@ impl BandLut {
             altitude_km,
             mu: view.z,
             mu_s: sun.z,
-            nu: view.dot(sun).clamp(-1.0, 1.0),
+            nu: crate::mapping::unit_direction_cosine(view, sun),
             ground: self.geometry.hits_ground(altitude_km, view.z),
         };
         let entry = self.geometry.atmosphere_entry(s);
@@ -333,12 +437,16 @@ impl BandLut {
             [self.config.ground_sun_samples],
             [match self.config.mapping {
                 CoordinateMapping::Legacy => sun_coord(mu_s),
-                CoordinateMapping::SunAligned
-                | CoordinateMapping::SunAlignedAngular
-                | CoordinateMapping::HorizonAligned
-                | CoordinateMapping::RayAlignedReference => {
-                    self.geometry
-                        .solar_coord_mapped(0.0, mu_s, self.config.mapping)
+                CoordinateMapping::SunAligned | CoordinateMapping::SunAlignedAngular => self
+                    .geometry
+                    .solar_coord_mapped(0.0, mu_s, self.config.mapping),
+                CoordinateMapping::HorizonAligned | CoordinateMapping::RayAlignedReference => {
+                    crate::reference_mapping::solar_coord_config(
+                        self.geometry,
+                        &self.config,
+                        0.0,
+                        mu_s,
+                    )
                 }
             } * (self.config.ground_sun_samples - 1) as f32],
         )
@@ -350,8 +458,12 @@ pub fn fingerprint(model: &Model) -> Result<String> {
     hash.update(&serde_json::to_vec(model)?);
     Ok(hash.finish())
 }
-fn band_path(dir: &Path, index: usize) -> PathBuf {
-    dir.join(format!("band_{index:03}.bin"))
+fn band_path(dir: &Path, index: usize, container: LutContainer) -> PathBuf {
+    let extension = match container {
+        LutContainer::LegacyBinary => "bin",
+        LutContainer::Safetensors => "safetensors",
+    };
+    dir.join(format!("band_{index:03}.{extension}"))
 }
 pub(crate) struct Hash(u64);
 impl Hash {

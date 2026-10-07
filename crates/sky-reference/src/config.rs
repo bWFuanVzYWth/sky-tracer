@@ -2,8 +2,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::Result;
 
-/// Reference budget after mapping and quadrature convergence studies.
+/// Default development budget; the full teacher has a separate hard ceiling.
 pub const MAX_ASSET_BYTES: u64 = 6_000_000_000;
+/// Decimal 20 GB, including tensor headers and the manifest reserve.
+pub const MAX_TEACHER_BYTES: u64 = 20_000_000_000;
 pub const METADATA_RESERVE: u64 = 1_048_576;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -24,6 +26,16 @@ impl CoordinateMapping {
     pub fn is_reference(self) -> bool {
         matches!(self, Self::HorizonAligned | Self::RayAlignedReference)
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordinateAllocation {
+    /// Assets without an allocation field retain their original coordinates.
+    #[default]
+    Legacy,
+    /// Frozen height/solar fit transferred from the realtime solver.
+    RealtimeFitV1,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -68,6 +80,16 @@ pub enum HeightInterpolation {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum RayStepMapping {
+    /// Preserve the original midpoint rule for assets without this field.
+    #[default]
+    UniformDistance,
+    /// Frozen 0.25 km height scale, concentrated around a ray's lowest point.
+    LogHeightV1,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum IterationScheme {
     #[default]
     Orders,
@@ -97,6 +119,8 @@ pub struct BakeConfig {
     #[serde(default)]
     pub mapping: CoordinateMapping,
     #[serde(default)]
+    pub coordinate_allocation: CoordinateAllocation,
+    #[serde(default)]
     pub solar_interpolation: SolarInterpolation,
     #[serde(default)]
     pub phase_interpolation: PhaseInterpolation,
@@ -110,7 +134,7 @@ pub struct BakeConfig {
     pub angular_integration: AngularIntegration,
     #[serde(default)]
     pub cone_mapping: ConeMapping,
-    /// Per-asset byte budget. Raise deliberately after measuring mapping/integration bias.
+    /// Per-asset byte budget, bounded by MAX_TEACHER_BYTES for new bakes.
     #[serde(default = "default_asset_budget")]
     pub max_asset_bytes: u64,
     /// [radius, view zenith, solar zenith, view/sun cosine]. Nu varies fastest.
@@ -123,6 +147,8 @@ pub struct BakeConfig {
     /// [radius, view zenith], with separate ground and space halves.
     pub optical_depth: [usize; 2],
     pub ground_sun_samples: usize,
+    #[serde(default)]
+    pub ray_step_mapping: RayStepMapping,
     pub ray_steps: usize,
     pub optical_depth_steps: usize,
     pub angular_mu: usize,
@@ -143,6 +169,7 @@ impl Default for BakeConfig {
     fn default() -> Self {
         Self {
             mapping: CoordinateMapping::SunAligned,
+            coordinate_allocation: CoordinateAllocation::Legacy,
             solar_interpolation: SolarInterpolation::LogRadiance,
             phase_interpolation: PhaseInterpolation::LinearRadiance,
             view_interpolation: ViewInterpolation::Linear,
@@ -156,6 +183,7 @@ impl Default for BakeConfig {
             height_interpolation: HeightInterpolation::LinearHeight,
             optical_depth: [128, 1024],
             ground_sun_samples: 512,
+            ray_step_mapping: RayStepMapping::UniformDistance,
             ray_steps: 256,
             optical_depth_steps: 2048,
             angular_mu: 16,
@@ -187,13 +215,15 @@ impl BakeConfig {
         }
         Ok(())
     }
+    /// Historical horizon-chart diagnostic preset. The current full teacher
+    /// uses current_reference(), including its measured integration allocation.
     pub fn reference() -> Self {
         Self {
             mapping: CoordinateMapping::HorizonAligned,
-            scattering: [80, 32, 193, 257],
+            scattering: [72, 32, 193, 257],
             optical_depth: [384, 4096],
             ground_sun_samples: 1024,
-            max_asset_bytes: 22_000_000_000,
+            max_asset_bytes: 20_000_000_000,
             ..Self::default()
         }
     }
@@ -260,7 +290,7 @@ impl BakeConfig {
             .checked_add(product(&self.optical_depth)?)
             .and_then(|n| n.checked_add(self.ground_sun_samples as u64))
             .and_then(|n| n.checked_mul(4))
-            .and_then(|n| n.checked_add(8))
+            .and_then(|n| n.checked_add(crate::tensor_container::HEADER_RESERVE))
             .ok_or_else(|| "LUT byte size overflow".into())
     }
 
@@ -272,6 +302,22 @@ impl BakeConfig {
     }
 
     pub fn validate(&self, band_count: usize) -> Result<()> {
+        self.validate_impl(band_count, true)
+    }
+
+    /// Old assets remain readable at their original budget; new bakes cannot
+    /// use this path, including resume of a pre-limit teacher.
+    pub(crate) fn validate_existing(&self, band_count: usize) -> Result<()> {
+        self.validate_impl(band_count, false)
+    }
+
+    fn validate_impl(&self, band_count: usize, enforce_teacher_cap: bool) -> Result<()> {
+        if self.coordinate_allocation != CoordinateAllocation::Legacy
+            && (self.mapping != CoordinateMapping::RayAlignedReference
+                || self.scattering_altitudes_km.is_empty())
+        {
+            return Err("realtime-fitted allocation requires ray-aligned reference mapping and explicit scattering heights".into());
+        }
         if self.source_mapping != SourceMapping::Radiance
             && self.mapping != CoordinateMapping::RayAlignedReference
         {
@@ -389,8 +435,14 @@ impl BakeConfig {
         {
             return Err("LUT dimensions exceed WGSL u32 indexing".into());
         }
-        if size > self.max_asset_bytes {
-            return Err(format!("asset needs {size} bytes; configured budget is {} bytes; refine the mapping or adjust dimensions/budget",self.max_asset_bytes).into());
+        if enforce_teacher_cap && self.max_asset_bytes > MAX_TEACHER_BYTES {
+            return Err(format!(
+                "teacher LUT budget cannot exceed {MAX_TEACHER_BYTES} bytes (20 GB)"
+            )
+            .into());
+        }
+        if enforce_teacher_cap && (size > self.max_asset_bytes || size > MAX_TEACHER_BYTES) {
+            return Err(format!("asset needs up to {size} bytes including tensor headers and metadata; configured budget is {} bytes; refine the mapping or reduce dimensions",self.max_asset_bytes).into());
         }
         Ok(())
     }

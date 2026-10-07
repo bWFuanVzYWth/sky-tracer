@@ -8,7 +8,7 @@ use crate::{
 
 /// The ground boundary uses *total* irradiance. The remainder therefore holds
 /// indirect atmospheric scattering, including scattering of ground-reflected light.
-/// Uniform 256 steps and the finite solar disk match the frozen v6 integrator.
+/// Ray allocation and the finite solar disk follow the asset's bake config.
 pub fn direct(lut: &BandLut, band: &BandModel, s: State, steps: usize) -> [f32; 2] {
     let g = lut.geometry;
     let (ray, sun) = s.directions();
@@ -24,9 +24,7 @@ pub fn direct(lut: &BandLut, band: &BandModel, s: State, steps: usize) -> [f32; 
     let length = g.distance(s.altitude_km, s.mu, s.ground);
     let mut single = 0.0_f32;
     let mut trans = 1.0_f32;
-    for j in 0..steps {
-        let dx = length / steps as f32;
-        let d = (j as f32 + 0.5) * dx;
+    for (d, dx) in crate::path_integration::path_cells(g, s, steps, lut.config.ray_step_mapping) {
         let point = g.advanced(s, d);
         let c = band.coefficients(point.altitude_km);
         let mut source = 0.0;

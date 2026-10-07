@@ -91,7 +91,26 @@ fn reference_atan_cdf(e:f32,center:f32,scale:f32)->f32 {
  let a=atan((-PI*0.5-center)/scale);
  return (atan((e-center)/scale)-a)/(atan((PI*0.5-center)/scale)-a);
 }
+// Frozen v1 fit from sky-realtime/configs/mapping_fit.json. Keep these values
+// synchronized with teacher_mapping_fit_v1.json, not with future realtime fits.
+const REALTIME_SOLAR_WEIGHTS=array<f32,5>(0.0958385095000267,0.4414754807949066,0.3132699131965637,0.11675123125314713,0.03266480192542076);
+const REALTIME_SOLAR_WIDTHS=array<f32,3>(0.11138743162155151,0.07567445933818817,0.167180135846138);
+fn reference_softsign(x:f32,width:f32)->f32 {return x/(abs(x)+width);}
+fn fitted_reference_solar_coord(h:f32,mu:f32)->f32 {
+ let e=asin(clamp(mu,-1.0,1.0));let hor=asin(horizon(h));
+ let centers=array<f32,3>(hor,hor-PI/30.0,-hor);
+ let d=max(PI*0.5-e,0.0);let scale=PI/36.0;
+ let cap=1.0-sqrt(d/(d+scale))/sqrt(PI/(PI+scale));
+ var y=REALTIME_SOLAR_WEIGHTS[0]*(e/PI+0.5)+REALTIME_SOLAR_WEIGHTS[4]*cap;
+ for(var j=0u;j<3u;j++) {
+  let a=reference_softsign(-PI*0.5-centers[j],REALTIME_SOLAR_WIDTHS[j]);
+  let b=reference_softsign(PI*0.5-centers[j],REALTIME_SOLAR_WIDTHS[j]);
+  y+=REALTIME_SOLAR_WEIGHTS[j+1u]*(reference_softsign(e-centers[j],REALTIME_SOLAR_WIDTHS[j])-a)/(b-a);
+ }
+ return clamp(y,0.0,1.0);
+}
 fn reference_solar_coord(h:f32,mu:f32)->f32 {
+ if (p.mapping.y&67108864u)!=0u {return fitted_reference_solar_coord(h,mu);}
  let e=asin(clamp(mu,-1.0,1.0));let hor=asin(horizon(h));
  let d=PI*0.5-e;let scale=PI/36.0;
  let cap=1.0-sqrt(d/(d+scale))/sqrt(PI/(PI+scale));
@@ -327,7 +346,9 @@ fn ray_reference_lookup(s:State,source:bool)->f32 {
   var ground=s.ground;
   if local_source {mu=s.mu;mus=s.mu_s;ground=hits_ground(h,mu);}
   let point=State(h,mu,mus,s.nu,ground);
-  let az=clamp((s.nu-mu*mus)/sqrt(max((1.0-mu*mu)*(1.0-mus*mus),1e-30)),-1.0,1.0);
+  let view_horizontal=sqrt(max(1.0-mu*mu,0.0));let sun_horizontal=sqrt(max(1.0-mus*mus,0.0));
+  let opposite=s.nu<0.0;let vertical=select(mu-mus,mu+mus,opposite);let horizontal_delta=view_horizontal-sun_horizontal;
+  let azimuth_distance=clamp((select(1.0-s.nu,1.0+s.nu,opposite)-0.5*(vertical*vertical+horizontal_delta*horizontal_delta))/max(view_horizontal*sun_horizontal,1e-15),0.0,2.0);
   let sc=solar_coord(h,mus)*f32(p.dims.z-1u);let slo=u32(floor(sc));let st=sc-f32(slo);
   for(var chart=0u;chart<2u;chart++) {
    let weight=select(1.0-blend,blend,chart==1u);if weight<=0.0 {continue;}
@@ -336,7 +357,9 @@ fn ray_reference_lookup(s:State,source:bool)->f32 {
     let si=min(slo+j,p.dims.z-1u);var corner=point;
     if chart==0u {
      let sm=reference_solar(ri,si);
-     corner=State(h,mu,sm,mu*sm+sqrt(max((1.0-mu*mu)*(1.0-sm*sm),0.0))*az,ground);
+     let horizontal=sqrt(max(1.0-sm*sm,0.0));let vertical=select(mu-sm,mu+sm,opposite);let horizontal_delta=view_horizontal-horizontal;
+     let distance=0.5*(vertical*vertical+horizontal_delta*horizontal_delta)+view_horizontal*horizontal*azimuth_distance;
+     corner=State(h,mu,sm,clamp(select(1.0-distance,distance-1.0,opposite),-1.0,1.0),ground);
     }
     let nc=reference_phase_coord(corner)*f32(p.dims.w-1u);
     solar[j]=reference_phase_lookup(corner,ri,si,nc,source);
@@ -613,11 +636,53 @@ fn scattering_density(@builtin(global_invocation_id) id:vec3u) {
     density[i]=value;
 }
 
+// Frozen realtime path allocation; the old distance rule remains bitwise intact.
+struct RayStepPlan { length:f32, middle:f32, hmin:f32, before:f32, after:f32, split:u32 }
+fn path_log1p(x:f32)->f32 {
+    if x<0.001 {return x*(1.0-x*0.5+x*x/3.0);}return log(1.0+x);
+}
+fn path_expm1(x:f32)->f32 {
+    if x<0.001 {return x*(1.0+x*0.5+x*x/6.0);}return exp(x)-1.0;
+}
+fn ray_step_plan(s:State,length:f32,count:u32)->RayStepPlan {
+    var plan=RayStepPlan(length,0.0,0.0,0.0,0.0,0u);
+    if (p.mapping.z&16777216u)==0u || length<=0.0 || count<2u {return plan;}
+    plan.middle=clamp(-(p.planet.x+s.h)*s.mu,0.0,length);
+    plan.hmin=advance(s,plan.middle).h;
+    let hend=advance(s,length).h;
+    plan.before=path_log1p(max(s.h-plan.hmin,0.0)/0.25);
+    plan.after=path_log1p(max(hend-plan.hmin,0.0)/0.25);
+    if plan.before+plan.after<0.00001 {plan.before=0.0;plan.after=0.0;return plan;}
+    plan.split=u32(round(f32(count)*plan.before/(plan.before+plan.after)));
+    if plan.middle<=0.0 {plan.split=0u;}else if plan.middle>=length {plan.split=count;}
+    else {plan.split=clamp(plan.split,1u,count-1u);}
+    // Very shallow high-altitude paths can lack enough distinct f32 heights.
+    // Preserve the distance rule instead of creating zero-width height cells.
+    let a=0.25*path_expm1(plan.before/f32(max(plan.split,1u)));
+    let b=0.25*path_expm1(plan.after/f32(max(count-plan.split,1u)));
+    if (plan.before>0.0 && plan.hmin+a==plan.hmin) || (plan.after>0.0 && plan.hmin+b==plan.hmin) {
+        plan.before=0.0;plan.after=0.0;
+    }
+    return plan;
+}
+fn ray_step_edge(s:State,plan:RayStepPlan,i:u32,count:u32,previous:f32)->f32 {
+    if i>=count {return plan.length;}if i==plan.split {return plan.middle;}
+    let incoming=i<plan.split;var lh=0.0;
+    if incoming {lh=plan.before*(1.0-f32(i)/f32(plan.split));}
+    else {lh=plan.after*f32(i-plan.split)/f32(count-plan.split);}
+    let h=plan.hmin+0.25*path_expm1(lh);let b=(p.planet.x+s.h)*s.mu;
+    let c=(s.h-h)*(2.0*p.planet.x+s.h+h);let root=sqrt(max(b*b-c,0.0));
+    var edge=-b+root;
+    if incoming {edge=c/max(-b+root,1e-20);}else if b>0.0 {edge=-c/max(root+b,1e-20);}
+    return clamp(edge,previous,plan.length);
+}
+
 @compute @workgroup_size(64)
 fn integrate_direct(@builtin(global_invocation_id) id:vec3u) {
     let work=p.work.z+id.x;if work>=p.work.w {return;}let i=work_scatter_index(work);
     if canonical_scatter_index(i)!=i {return;}
-    let s=state(i); let d=distance(s.h,s.mu,s.ground); let dx=d/f32(p.integration.x);
+    let s=state(i);let d=distance(s.h,s.mu,s.ground);let uniform_dx=d/f32(p.integration.x);
+    let plan=ray_step_plan(s,d,p.integration.x);
     // Keep the finite-disc cache below the large private-array pressure cliff.
     // Every original quadrature sample is still evaluated; only summation groups change.
     var phases:array<vec4f,32>;var solar_geometry:array<vec4f,32>;
@@ -631,9 +696,14 @@ fn integrate_direct(@builtin(global_invocation_id) id:vec3u) {
             phases[q]=vec4f(3.0*(1.0+nu*nu)/(16.0*PI),aerosol_phase(0u,nu),aerosol_phase(1u,nu),aerosol_phase(2u,nu))*w;
             solar_geometry[q]=vec4f(aerosol_phase(3u,nu)*w,v.z,nu,0.0);
         }
-        var trans=1.0;var chunk=0.0;
+        var trans=1.0;var chunk=0.0;var previous_edge=0.0;
         for(var j=0u;j<p.integration.x;j++) {
-            let travel=(f32(j)+0.5)*dx;let point=advance(s,travel);let c=coefficients(point.h);let ext=c.a.y;let optical=ext*dx;
+            var dx=uniform_dx;var travel=(f32(j)+0.5)*dx;
+            if plan.before+plan.after>0.0 {
+                let edge=ray_step_edge(s,plan,j+1u,p.integration.x,previous_edge);
+                dx=edge-previous_edge;travel=(edge+previous_edge)*0.5;previous_edge=edge;
+            }
+            let point=advance(s,travel);let c=coefficients(point.h);let ext=c.a.y;let optical=ext*dx;
             var cell_weight=dx;
             if optical<0.001 { cell_weight=dx*(1.0-optical*0.5+optical*optical/6.0); }
             else { cell_weight=(1.0-exp(-optical))/ext; }
@@ -658,10 +728,16 @@ fn integrate_direct(@builtin(global_invocation_id) id:vec3u) {
 fn integrate(@builtin(global_invocation_id) id:vec3u) {
     let work=p.work.z+id.x;if work>=p.work.w {return;}let i=work_scatter_index(work);
     if canonical_scatter_index(i)!=i {return;}
-    let s=state(i);let d=distance(s.h,s.mu,s.ground);let dx=d/f32(p.integration.x);
-    var trans=1.0;var value=0.0;
+    let s=state(i);let d=distance(s.h,s.mu,s.ground);let uniform_dx=d/f32(p.integration.x);
+    let plan=ray_step_plan(s,d,p.integration.x);
+    var trans=1.0;var value=0.0;var previous_edge=0.0;
     for(var j=0u;j<p.integration.x;j++) {
-        let point=advance(s,(f32(j)+0.5)*dx);let ext=coefficients(point.h).a.y;let optical=ext*dx;
+        var dx=uniform_dx;var travel=(f32(j)+0.5)*dx;
+        if plan.before+plan.after>0.0 {
+            let edge=ray_step_edge(s,plan,j+1u,p.integration.x,previous_edge);
+            dx=edge-previous_edge;travel=(edge+previous_edge)*0.5;previous_edge=edge;
+        }
+        let point=advance(s,travel);let ext=coefficients(point.h).a.y;let optical=ext*dx;
         var cell_weight=dx;
         if optical<0.001 {cell_weight=dx*(1.0-optical*0.5+optical*optical/6.0);}
         else {cell_weight=(1.0-exp(-optical))/ext;}

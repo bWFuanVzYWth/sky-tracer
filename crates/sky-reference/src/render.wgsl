@@ -10,6 +10,13 @@ struct ViewParams {
 @group(0) @binding(10) var screen:texture_storage_2d<rgba32float,write>;
 @group(0) @binding(11) var<storage,read_write> rgb_sum:array<vec4f>;
 
+fn unit_direction_cosine(a:vec3f,b:vec3f)->f32 {
+    let cosine=dot(a,b);
+    if cosine>0.5 {let chord=a-b;return clamp(1.0-0.5*dot(chord,chord),-1.0,1.0);}
+    if cosine< -0.5 {let chord=a+b;return clamp(0.5*dot(chord,chord)-1.0,-1.0,1.0);}
+    return clamp(cosine,-1.0,1.0);
+}
+
 @compute @workgroup_size(8,8)
 fn render_spectral(@builtin(global_invocation_id) id:vec3u) {
     if id.x>=frame.size_band.x || id.y>=frame.size_band.y { return; }
@@ -20,7 +27,7 @@ fn render_spectral(@builtin(global_invocation_id) id:vec3u) {
     let right=vec3f(cos(yaw),0.0,-sin(yaw));let up=cross(forward,right);
     let xy=vec2f(uv.x*2.0-1.0,1.0-uv.y*2.0)*vec2f(frame.view.w,1.0)*tan(frame.view.z*0.5);
     let ray=normalize(forward+xy.x*right+xy.y*up);let sun=frame.sun_height.xyz;
-    let h=frame.sun_height.w;let nu=clamp(dot(ray,sun),-1.0,1.0);
+    let h=frame.sun_height.w;let nu=unit_direction_cosine(ray,sun);
     var point=State(h,ray.y,sun.y,nu,hits_ground(h,ray.y));
     var intersects=true;
     if h>p.planet.y {

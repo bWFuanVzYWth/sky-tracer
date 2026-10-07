@@ -19,6 +19,21 @@ pub struct State {
     pub ground: bool,
 }
 
+/// Cosine between unit directions. Chord lengths avoid dot-product rounding
+/// near the forward/backward phase endpoints, where tiny angle changes can
+/// select different cells in a horizon-tangent chart.
+pub fn unit_direction_cosine(a: Vec3, b: Vec3) -> f32 {
+    let dot = a.dot(b);
+    let cosine = if dot > 0.5 {
+        1.0 - 0.5 * (a - b).length_squared()
+    } else if dot < -0.5 {
+        0.5 * (a + b).length_squared() - 1.0
+    } else {
+        dot
+    };
+    cosine.clamp(-1.0, 1.0)
+}
+
 impl Geometry {
     pub fn height_mapped(self, u: f32, mapping: CoordinateMapping) -> f32 {
         if mapping.is_reference() {
@@ -62,6 +77,11 @@ impl Geometry {
     }
     pub fn coords_config(self, s: State, c: &BakeConfig) -> [f32; 4] {
         let mut coords = self.coords_mapped(s, c.scattering, c.mapping);
+        if c.mapping.is_reference() {
+            coords[2] =
+                crate::reference_mapping::solar_coord_config(self, c, s.altitude_km, s.mu_s)
+                    * (c.scattering[2] - 1) as f32;
+        }
         if !c.scattering_altitudes_km.is_empty() {
             coords[0] = crate::reference_mapping::radius_coord(self, c, s.altitude_km);
         }
@@ -76,7 +96,12 @@ impl Geometry {
         if !c.scattering_altitudes_km.is_empty() {
             let [_, nm, ns, nn] = c.scattering;
             s.altitude_km = crate::reference_mapping::radius(self, c, i / (nm * ns * nn));
-            s.mu_s = self.solar_cosine_mapped(s.altitude_km, unit(i / nn % ns, ns), c.mapping);
+            s.mu_s = crate::reference_mapping::solar_cosine_config(
+                self,
+                c,
+                s.altitude_km,
+                unit(i / nn % ns, ns),
+            );
             s.nu = crate::reference_mapping::phase_cosine(self, s, unit(i % nn, nn));
             s.mu = self.cone_view(s.altitude_km, s.mu_s, s.nu, i / (ns * nn) % nm, nm);
         }

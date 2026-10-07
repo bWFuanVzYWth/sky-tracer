@@ -154,10 +154,21 @@ impl RayStencil {
                 };
             }
             let (mu, mus) = (point.mu, point.mu_s);
-            let az = ((point.nu - mu * mus)
-                / ((1.0 - mu * mu) * (1.0 - mus * mus)).max(1e-30).sqrt())
-            .clamp(-1.0, 1.0);
-            let sc = m::solar_coord(g, h, mus) * (ns - 1) as f32;
+            let view_horizontal = (1.0 - mu * mu).max(0.0).sqrt();
+            let sun_horizontal = (1.0 - mus * mus).max(0.0).sqrt();
+            let opposite = point.nu < 0.0;
+            let vertical = if opposite { mu + mus } else { mu - mus };
+            let radial = view_horizontal - sun_horizontal;
+            // Store 1 +/- cos(azimuth) directly: reconstructing cos(azimuth)
+            // and then subtracting its near-one value loses forward accuracy.
+            let azimuth_distance = ((if opposite {
+                1.0 + point.nu
+            } else {
+                1.0 - point.nu
+            } - 0.5 * (vertical * vertical + radial * radial))
+                / (view_horizontal * sun_horizontal).max(1e-15))
+            .clamp(0.0, 2.0);
+            let sc = m::solar_coord_config(g, c, h, mus) * (ns - 1) as f32;
             let slo = sc.floor() as usize;
             row.active = true;
             row.solar_t = sc - slo as f32;
@@ -168,11 +179,20 @@ impl RayStencil {
                 for (j, column) in columns.iter_mut().enumerate() {
                     let si = (slo + j).min(ns - 1);
                     let corner = if chart == 0 {
-                        let mus = m::solar_cosine(g, h, unit(si, ns));
+                        let mus = m::solar_cosine_config(g, c, h, unit(si, ns));
+                        let horizontal = (1.0 - mus * mus).max(0.0).sqrt();
+                        let vertical = if opposite { mu + mus } else { mu - mus };
+                        let radial = view_horizontal - horizontal;
+                        let distance = 0.5 * (vertical * vertical + radial * radial)
+                            + view_horizontal * horizontal * azimuth_distance;
                         State {
                             mu_s: mus,
-                            nu: mu * mus
-                                + ((1.0 - mu * mu) * (1.0 - mus * mus)).max(0.0).sqrt() * az,
+                            nu: (if opposite {
+                                distance - 1.0
+                            } else {
+                                1.0 - distance
+                            })
+                            .clamp(-1.0, 1.0),
                             ..point
                         }
                     } else {

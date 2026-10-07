@@ -61,7 +61,15 @@ target/release/sky-baker.exe reference bake --out out/reference
 target/release/sky-baker.exe reference bake --out out/reference --resume
 ```
 
-`--config` 可以提供完整 JSON，`--band-index` 用于单波段收敛实验。完整默认配置可能需要较大的显存和长时间，优先先烘焙少量代表波段。旧数据继续按 manifest 的映射和版本解释；不要通过改 manifest 把旧数据伪装成新算法输出。
+`--config` 可以提供完整 JSON，`--band-index` 用于单波段收敛实验。完整默认配置可能需要较大的显存和长时间，优先先烘焙少量代表波段。新教师表尺寸上界约 19.001 GB，含容器头和元数据，硬上限为十进制 20 GB；`plan` 会先拒绝超限配置。旧数据继续按 manifest 的映射和版本解释，旧二进制容器保留只读兼容；新烘焙及续烘使用 safetensors，旧表迁移需在新目录重新烘焙。不要通过改 manifest 把旧数据伪装成新算法输出。
+
+采样次数的独立扫描入口，使用新的 JSON 输出路径：
+
+```powershell
+target/release/sky-baker.exe reference sampling-study --out out/teacher-study.json --scattering 40 16 49 65 --bands 450 550 650 --warmup --repeats 2 --only baseline balanced_logheight_192
+```
+
+命令先求较密积分对照，再测指定候选，保存每阶墙钟、固定物理查询的辐亮度、差异分位数和暗部绝对差。`--only` 支持分别扫描 ray、angular、sun、tau 和 orders；`--optical-depth` 可改变共享辅助表网格。完整参考的 GPU 工作集远大于这些小表，不得直接把秒数按状态数量外推。取舍与已测参数在[数值精度与数据分配](numerics.md#采样预算与烘焙时间)中。
 
 CPU 合成与参考显示转换：
 
@@ -103,7 +111,8 @@ python apps/sky-optimizer/main.py preview out/fit-counts --out out/fit-gallery -
 |产物|内容和解释|
 |---|---|
 |PT `asset.json` + EXR|带内积分光谱、线性 sRGB 图像、白点与输运版本；PNG 只是预览|
-|参考 LUT manifest + band 文件|模型指纹、坐标/求解配置、逐带校验和与求解记录|
+|参考 `asset.json` + `band_NNN.safetensors`|模型指纹、坐标/求解配置、完整文件校验和与求解记录；F32 张量 `radiance[height,view,sun,phase]`、`optical_depth[height,view]`、`ground_irradiance[sun]`，末轴最快|
+|RGB / 压缩 LUT safetensors|RGB channel 存 `solar_irradiance` / `radiance`，`spectral_tau` 保留全波段光学厚度；压缩包 `blocks` / `radiance` 存 U32 编码，`sun` 存 F32 太阳表，GPU 解码方式保持不变|
 |RGB 合成 `dataset.json` + `samples.f32`|小端 f32，查询顺序的线性 Rec.2020 三分量；无可见太阳盘|
 |光谱拟合数据|`total/single/boundary.f32` 为波段优先的带内积分量；`queries.json` 保存训练/验证/图像划分|
 |audit 图像|`<scene>_source.f32` / `_sky.f32`，小端 f32 RGBA；相机在查询 JSON 中|

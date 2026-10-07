@@ -4,9 +4,11 @@
 //! before interpolation; this is not hardware filtering of encoded radiance.
 use crate::{
     Result,
-    asset::{Hash, Manifest},
+    asset::{Hash, LutContainer, Manifest},
+    tensor_container,
 };
 use rayon::prelude::*;
+use safetensors::tensor::Dtype;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fs, path::Path, time::Instant};
 
@@ -136,20 +138,9 @@ impl PackedLut {
             .and_then(|r| r.packed.as_ref())
             .ok_or("asset is not packed RGB")?;
         p.validate(m)?;
-        let map = read_words(dir, "blocks.bin", p.map_words, &p.map_checksum)?;
-        let data = read_words(dir, "radiance.bin", p.data_words, &p.data_checksum)?;
-        let sun_words = read_words(
-            dir,
-            "sun.bin",
-            3 * m.config.optical_depth_len(),
-            &p.sun_checksum,
-        )?;
-        let sun: [Vec<f32>; 3] = std::array::from_fn(|c| {
-            sun_words[c * m.config.optical_depth_len()..(c + 1) * m.config.optical_depth_len()]
-                .iter()
-                .map(|&v| f32::from_bits(v))
-                .collect()
-        });
+        let map = read_words(m, dir, "blocks", p.map_words, &p.map_checksum)?;
+        let data = read_words(m, dir, "radiance", p.data_words, &p.data_checksum)?;
+        let sun = read_sun(m, dir, &p.sun_checksum)?;
         if sun.iter().flatten().any(|v| !v.is_finite()) {
             return Err("nonfinite packed Sun table".into());
         }
@@ -200,8 +191,28 @@ impl PackedLut {
         })
     }
 }
-fn read_words(dir: &Path, name: &str, len: usize, checksum: &str) -> Result<Vec<u32>> {
-    let path = dir.join(name);
+fn read_words(
+    m: &Manifest,
+    dir: &Path,
+    name: &str,
+    len: usize,
+    checksum: &str,
+) -> Result<Vec<u32>> {
+    if m.container == LutContainer::Safetensors {
+        let mut tensors = tensor_container::read(
+            &dir.join(format!("{name}.safetensors")),
+            &[(name, Dtype::U32, vec![len])],
+            checksum,
+        )?;
+        let bytes = tensors.pop().ok_or("missing packed tensor")?;
+        return Ok(bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| u32::from_le_bytes(*b))
+            .collect());
+    }
+    let path = dir.join(format!("{name}.bin"));
     if fs::metadata(&path)?.len() != len as u64 * 4 {
         return Err(format!("packed {name} size mismatch").into());
     }
@@ -219,19 +230,37 @@ fn read_words(dir: &Path, name: &str, len: usize, checksum: &str) -> Result<Vec<
         .collect())
 }
 fn write_words(dir: &Path, name: &str, data: &[u32]) -> Result<String> {
-    use std::io::Write;
-    let mut hash = Hash::new();
-    let mut writer = std::io::BufWriter::new(fs::File::create(dir.join(format!("{name}.part")))?);
-    for &word in data {
-        let bytes = word.to_le_bytes();
-        hash.update(&bytes);
-        writer.write_all(&bytes)?;
-    }
-    writer.flush()?;
-    writer.get_ref().sync_all()?;
-    drop(writer);
-    fs::rename(dir.join(format!("{name}.part")), dir.join(name))?;
-    Ok(hash.finish())
+    tensor_container::write(
+        &dir.join(format!("{name}.safetensors")),
+        &[(
+            name,
+            Dtype::U32,
+            vec![data.len()],
+            bytemuck::cast_slice(data),
+        )],
+    )
+}
+
+fn sun_shape(m: &Manifest) -> Vec<usize> {
+    vec![3, m.config.optical_depth[0], m.config.optical_depth[1]]
+}
+
+fn read_sun(m: &Manifest, dir: &Path, checksum: &str) -> Result<[Vec<f32>; 3]> {
+    let values = if m.container == LutContainer::Safetensors {
+        let mut tensors = tensor_container::read(
+            &dir.join("sun.safetensors"),
+            &[("solar_irradiance", Dtype::F32, sun_shape(m))],
+            checksum,
+        )?;
+        tensor_container::f32_values(&tensors.pop().ok_or("missing packed Sun tensor")?, false)?
+    } else {
+        read_words(m, dir, "sun", 3 * m.config.optical_depth_len(), checksum)?
+            .into_iter()
+            .map(f32::from_bits)
+            .collect()
+    };
+    let mut channels = values.chunks_exact(m.config.optical_depth_len());
+    Ok(std::array::from_fn(|_| channels.next().unwrap().to_vec()))
 }
 
 pub fn compress(source: &Path, output: &Path, block_texels: usize) -> Result<Manifest> {
@@ -251,7 +280,7 @@ pub fn compress(source: &Path, output: &Path, block_texels: usize) -> Result<Man
     for c in 0..3 {
         let (s, r) = crate::rgb::read_channel(&m, source, c)?;
         radiance.push(r);
-        solar.extend(s.iter().map(|v| v.to_bits()));
+        solar.extend(s);
         eprintln!("CPU packing: read and verified channel {c}");
     }
     let n = m.config.scattering_len();
@@ -322,9 +351,17 @@ pub fn compress(source: &Path, output: &Path, block_texels: usize) -> Result<Man
         map_words: map.len(),
         data_words: data.len(),
         unique_blocks: dictionary.len(),
-        map_checksum: write_words(output, "blocks.bin", &map)?,
-        data_checksum: write_words(output, "radiance.bin", &data)?,
-        sun_checksum: write_words(output, "sun.bin", &solar)?,
+        map_checksum: write_words(output, "blocks", &map)?,
+        data_checksum: write_words(output, "radiance", &data)?,
+        sun_checksum: tensor_container::write(
+            &output.join("sun.safetensors"),
+            &[(
+                "solar_irradiance",
+                Dtype::F32,
+                sun_shape(&m),
+                bytemuck::cast_slice(&solar),
+            )],
+        )?,
         source_rgb: source.to_string_lossy().into(),
     };
     let report = serde_json::json!({"source":source,"format":FORMAT,"block_texels":block_texels,"scattering_texels":n,
@@ -335,6 +372,7 @@ pub fn compress(source: &Path, output: &Path, block_texels: usize) -> Result<Man
         "grid_unchanged":true,"spectral_tau_embedded":false,"finite_segment_rendering_supported":false,
         "reference_quality_accepted":false,"comparison_baseline":"v6 RGB node export; spectral interpolation error is separate"});
     m.scalar_format = FORMAT.into();
+    m.container = LutContainer::Safetensors;
     m.rgb.as_mut().unwrap().packed = Some(packed);
     m.save(output)?;
     fs::write(

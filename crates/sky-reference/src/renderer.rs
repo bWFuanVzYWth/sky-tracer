@@ -216,10 +216,12 @@ impl SpectralRenderer {
                     | ((c.phase_interpolation as u32) << 8)
                     | ((c.view_interpolation as u32) << 16)
                     | (u32::from(!c.scattering_altitudes_km.is_empty()) << 24)
-                    | ((c.height_interpolation as u32) << 25),
+                    | ((c.height_interpolation as u32) << 25)
+                    | ((c.coordinate_allocation as u32) << 26),
                 c.angular_integration as u32
                     | ((c.iteration_scheme as u32) << 8)
-                    | ((c.source_mapping as u32) << 16),
+                    | ((c.source_mapping as u32) << 16)
+                    | ((c.ray_step_mapping as u32) << 24),
                 c.cone_mapping as u32,
             ] {
                 bytes.extend_from_slice(&v.to_ne_bytes());
