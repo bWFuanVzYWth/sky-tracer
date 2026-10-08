@@ -19,8 +19,13 @@ const AUTO_PARALLEL_PATHS: u32 = 32_768;
 const AUTO_MAX_BATCH: u32 = 1024;
 pub const MAX_WORK_PATHS: u32 = 4096;
 pub const WORK_TRANSITIONS: u32 = 128;
+/// Preview retains the measured responsive finite budget. Larger 256/512
+/// candidates increased full-frame dispatch latency and were rejected.
+pub const PREVIEW_WORK_TRANSITIONS: u32 = 128;
 pub const WORK_PROGRESS_BYTES: u64 = 32;
 const PATH_STATE_BYTES: u64 = 288;
+const DIRECTIONAL_ENVIRONMENT: u32 = 8;
+const FULL_FRAME_PREVIEW: u32 = 16;
 // The spatial proposal's one-voxel numerical halo assumes coordinate arithmetic
 // is well below a voxel ULP. Extremely distant origins must use CPU f64.
 const MAX_INDEX_MAGNITUDE: f64 = 262_144.0;
@@ -82,6 +87,9 @@ impl Diagnostics {
         if self.flags & 32 != 0 {
             causes.push("sparse hash lookup exhausted its validated capacity");
         }
+        if self.flags & 64 != 0 {
+            causes.push("directional environment or sunlight contains invalid RGB radiance");
+        }
         Err(format!("cloud GPU film invalid at pixel {}, sample {}: {} (flags 0x{:x}); no reference image can be exported",
             self.first_pixel, self.first_sample, causes.join(", "), self.flags).into())
     }
@@ -89,6 +97,8 @@ impl Diagnostics {
 
 /// One completed bounded submission. Samples advance only at a whole-image
 /// batch boundary; partially updated pixels are for display, not film export.
+/// Preview reports cumulative completed paths for the full current sample;
+/// offline mode reports completed paths within the current bounded tile.
 #[derive(Clone, Copy, Debug)]
 pub struct WorkProgress {
     pub samples_per_pixel: u32,
@@ -112,6 +122,9 @@ pub struct ProgressiveRenderer {
     pipeline: wgpu::ComputePipeline,
     reduce_pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
+    bind_group_layout: wgpu::BindGroupLayout,
+    volume_buffers: [wgpu::Buffer; 4],
+    default_environment: wgpu::TextureView,
     uniform: wgpu::Buffer,
     mean: wgpu::Buffer,
     m2: wgpu::Buffer,
@@ -125,6 +138,7 @@ pub struct ProgressiveRenderer {
     target_spp: u32,
     poisoned: Cell<bool>,
     work_capacity: u32,
+    full_frame_preview: bool,
     active: Option<WorkBatch>,
     in_flight: Option<[u32; 4]>,
     epoch: u64,
@@ -140,6 +154,36 @@ impl ProgressiveRenderer {
         camera: &Camera,
         settings: &TransportSettings,
         config: &RenderConfig,
+    ) -> Result<Self> {
+        Self::new_with_schedule(device, queue, volume, camera, settings, config, false)
+    }
+
+    /// Interactive estimator with one persistent path per film pixel. Bounded
+    /// submissions visit a fixed permutation of pixels in round-robin order,
+    /// spreading each submission over the image and advancing each
+    /// slice without waiting for its longest path. Completed pixels commit in
+    /// sample order; a completed full frame remains identical to offline mode.
+    /// `sample_batch_size` is ignored: preview uses one sample at a time.
+    /// Insufficient full-frame storage is an error, never a tiled fallback.
+    pub fn new_preview(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        volume: &SparseGpuVolume,
+        camera: &Camera,
+        settings: &TransportSettings,
+        config: &RenderConfig,
+    ) -> Result<Self> {
+        Self::new_with_schedule(device, queue, volume, camera, settings, config, true)
+    }
+
+    fn new_with_schedule(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        volume: &SparseGpuVolume,
+        camera: &Camera,
+        settings: &TransportSettings,
+        config: &RenderConfig,
+        full_frame_preview: bool,
     ) -> Result<Self> {
         config.validate()?;
         settings.validate()?;
@@ -169,11 +213,32 @@ impl ProgressiveRenderer {
         // operations. This increases null events; it never clamps density.
         params.optics[1] = volume.majorant * (1.0 + 1.0 / 1_048_576.0);
         configure(&mut params, camera, settings)?;
+        if full_frame_preview {
+            params.storage[3] |= FULL_FRAME_PREVIEW;
+            // Unused bounds padding carries an exact small integer. The
+            // multiplication is guarded by preview_pixel_stride on the CPU.
+            params.index_min[3] = preview_pixel_stride(config.width * config.height) as f32;
+        }
         let film_bytes = u64::from(config.width) * u64::from(config.height) * 16;
         let limits = device.limits();
-        let sample_batch_capacity = batch_capacity(config, &limits)?;
+        let sample_batch_capacity = if full_frame_preview {
+            1
+        } else {
+            batch_capacity(config, &limits)?
+        };
         let work_capacity = work_pool_capacity(&limits)?;
-        let sample_batch_bytes = u64::from(work_capacity) * PATH_STATE_BYTES;
+        let stored_paths = if full_frame_preview {
+            config.width * config.height
+        } else {
+            work_capacity
+        };
+        let sample_batch_bytes = u64::from(stored_paths) * PATH_STATE_BYTES;
+        if full_frame_preview
+            && (sample_batch_bytes > u64::from(limits.max_storage_buffer_binding_size)
+                || sample_batch_bytes > limits.max_buffer_size)
+        {
+            return Err(format!("full-frame cloud preview requires {sample_batch_bytes} bytes of path state, exceeding device storage limits; choose a lower preview resolution").into());
+        }
         let storage_sizes = [
             film_bytes,
             (volume.hash.len() as u64) * 16,
@@ -191,7 +256,8 @@ impl ProgressiveRenderer {
             }
         }
         if limits.max_storage_buffers_per_shader_stage < 8
-            || limits.max_bindings_per_bind_group < 9
+            || limits.max_bindings_per_bind_group < 11
+            || limits.max_sampled_textures_per_shader_stage < 2
             || limits.max_uniform_buffer_binding_size < std::mem::size_of::<Params>() as u64
             || limits.max_compute_workgroup_size_x < 64
             || limits.max_compute_invocations_per_workgroup < 64
@@ -256,7 +322,7 @@ impl ProgressiveRenderer {
         });
         // Every entry point uses this explicit layout, including bindings it
         // does not access. An automatic layout would remove unused bindings.
-        let layout_entries: Vec<_> = (0..=8)
+        let mut layout_entries: Vec<_> = (0..=8)
             .map(|binding| wgpu::BindGroupLayoutEntry {
                 binding,
                 visibility: wgpu::ShaderStages::COMPUTE,
@@ -274,6 +340,16 @@ impl ProgressiveRenderer {
                 count: None,
             })
             .collect();
+        layout_entries.extend((9..=10).map(|binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        }));
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("cloud common compute bindings"),
             entries: &layout_entries,
@@ -296,6 +372,24 @@ impl ProgressiveRenderer {
         let pipeline = make_pipeline("cloud bounded path continuation", "trace_work");
         let reduce_pipeline =
             make_pipeline("cloud completed-pixel ordered accumulation", "reduce_work");
+        // A valid binding remains necessary even when the shader takes the
+        // original constant-sky path. Wgpu initializes this texture to zero.
+        let default_environment = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("cloud disabled environment placeholder"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba32Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("cloud path tracing scene"),
             layout: &layout,
@@ -309,6 +403,8 @@ impl ProgressiveRenderer {
                 entry(6, &diagnostics),
                 entry(7, &majorant_hash),
                 entry(8, &path_states),
+                texture_entry(9, &default_environment),
+                texture_entry(10, &default_environment),
             ],
         });
         let result = Self {
@@ -316,6 +412,9 @@ impl ProgressiveRenderer {
             pipeline,
             reduce_pipeline,
             bind_group,
+            bind_group_layout: layout,
+            volume_buffers: [hash, values, tiles, majorant_hash],
+            default_environment,
             uniform,
             mean,
             m2,
@@ -329,6 +428,7 @@ impl ProgressiveRenderer {
             target_spp: config.spp,
             poisoned: Cell::new(false),
             work_capacity,
+            full_frame_preview,
             active: None,
             in_flight: None,
             epoch: 0,
@@ -380,6 +480,7 @@ impl ProgressiveRenderer {
             });
         }
         let active = self.active.as_mut().unwrap();
+        let initialize = !active.initialized;
         if !active.initialized {
             encoder.clear_buffer(&self.path_states, 0, None);
             active.initialized = true;
@@ -393,7 +494,11 @@ impl ProgressiveRenderer {
             count,
             active.tile_start,
             active.tile_pixels,
-            WORK_TRANSITIONS,
+            if self.full_frame_preview {
+                PREVIEW_WORK_TRANSITIONS
+            } else {
+                WORK_TRANSITIONS
+            },
         ];
         self.params.work = [
             self.epoch as u32,
@@ -413,7 +518,11 @@ impl ProgressiveRenderer {
             0,
             std::mem::size_of::<Params>() as u64,
         );
-        encoder.clear_buffer(&self.diagnostics, 12, Some(4));
+        // Preview accumulates each newly finished pixel exactly once across
+        // all slices; offline counts the current tile's terminal paths anew.
+        if !self.full_frame_preview || initialize {
+            encoder.clear_buffer(&self.diagnostics, 12, Some(4));
+        }
         encoder.copy_buffer_to_buffer(
             &upload,
             std::mem::offset_of!(Params, work) as u64,
@@ -485,7 +594,8 @@ impl ProgressiveRenderer {
     pub fn sample_batch_capacity(&self) -> u32 {
         self.sample_batch_capacity
     }
-    /// Persistent continuation storage, independent of full-film pixel count.
+    /// Persistent continuation storage. Preview keeps one state per pixel;
+    /// offline mode uses the fixed bounded pool.
     pub fn sample_batch_storage_bytes(&self) -> u64 {
         self.sample_batch_bytes
     }
@@ -513,7 +623,12 @@ impl ProgressiveRenderer {
             return Err(error);
         }
         let active = self.active.as_mut().ok_or("missing cloud active batch")?;
-        let total_paths = active.count * active.tile_pixels;
+        let total_pixels = self.params.image[0] * self.params.image[1];
+        let total_paths = if self.full_frame_preview {
+            total_pixels
+        } else {
+            active.count * active.tile_pixels
+        };
         if words[3] > total_paths {
             self.poisoned.set(true);
             self.in_flight = None;
@@ -524,12 +639,21 @@ impl ProgressiveRenderer {
             completed_paths: words[3],
             total_paths,
             tile_start: active.tile_start,
-            total_pixels: self.params.image[0] * self.params.image[1],
+            total_pixels,
             batch_samples: active.count,
             batch_finished: false,
         };
         self.in_flight = None;
-        if words[3] == total_paths {
+        if self.full_frame_preview {
+            if words[3] == total_paths {
+                self.samples += active.count;
+                self.active = None;
+                progress.samples_per_pixel = self.samples;
+                progress.batch_finished = true;
+            } else {
+                advance_preview_slice(active, total_pixels, self.work_capacity);
+            }
+        } else if words[3] == total_paths {
             if advance_tile(active, progress.total_pixels, self.work_capacity) {
                 self.samples += active.count;
                 self.active = None;
@@ -562,18 +686,94 @@ impl ProgressiveRenderer {
         }
         let mut next = self.params;
         configure(&mut next, camera, settings)?;
-        self.params = next;
-        self.samples = 0;
-        self.params.image[2] = 0;
-        self.epoch = self
+        let epoch = self
             .epoch
             .checked_add(1)
             .ok_or("cloud scene epoch exhausted")?;
+        self.params = next;
+        self.clear_accumulation(device, queue, epoch);
+        Ok(())
+    }
+
+    /// Replace the infinite directional boundary and delta-sun irradiance.
+    /// Both views must be D2 float textures, with finite, nonnegative linear
+    /// RGB. `environment` is an equirectangular table: world Y is up,
+    /// u=atan2(direction.x,direction.z)/(2*pi) wrapped, v=acos(direction.y)/pi.
+    /// The sunlight view is exactly 1x1 and excludes the solar disk from the
+    /// environment, since the path tracer already estimates a delta sun.
+    ///
+    /// Change bindings only immediately after creation or `reset` (zero
+    /// samples, no pending work). This setter submits no GPU work; wait for the
+    /// preceding reset clear, then encode environment generation before tracing.
+    /// Their contents must remain unchanged until reset, including during
+    /// partial batches.
+    /// Reset preserves these bindings. Passing None restores offline constants.
+    pub fn set_environment(
+        &mut self,
+        device: &wgpu::Device,
+        _queue: &wgpu::Queue,
+        environment: Option<(&wgpu::TextureView, &wgpu::TextureView)>,
+    ) -> Result<()> {
+        if self.in_flight.is_some()
+            || self.active.is_some()
+            || self.samples != 0
+            || self.poisoned.get()
+        {
+            return Err("reset the cloud film before changing its environment".into());
+        }
+        let epoch = self
+            .epoch
+            .checked_add(1)
+            .ok_or("cloud scene epoch exhausted")?;
+        let (sky, sun) =
+            environment.unwrap_or((&self.default_environment, &self.default_environment));
+        let [hash, values, tiles, majorants] = &self.volume_buffers;
+        self.bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cloud path tracing scene and directional boundary"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                entry(0, &self.uniform),
+                entry(1, hash),
+                entry(2, values),
+                entry(3, tiles),
+                entry(4, &self.mean),
+                entry(5, &self.m2),
+                entry(6, &self.diagnostics),
+                entry(7, majorants),
+                entry(8, &self.path_states),
+                texture_entry(9, sky),
+                texture_entry(10, sun),
+            ],
+        });
+        if environment.is_some() {
+            self.params.storage[3] |= DIRECTIONAL_ENVIRONMENT;
+        } else {
+            self.params.storage[3] &= !DIRECTIONAL_ENVIRONMENT;
+        }
+        self.epoch = epoch;
+        Ok(())
+    }
+
+    /// Change the stopping target after a reset. The continuation pool and
+    /// logical batch capacity remain fixed; rendering more samples reuses them.
+    pub fn set_target_samples(&mut self, spp: u32) -> Result<()> {
+        validate_target_change(
+            spp,
+            self.samples,
+            self.active.is_some() || self.in_flight.is_some(),
+        )?;
+        self.target_spp = spp;
+        Ok(())
+    }
+
+    fn clear_accumulation(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, epoch: u64) {
+        self.samples = 0;
+        self.params.image[2] = 0;
+        self.epoch = epoch;
         self.active = None;
         self.encoded_work = false;
         self.poisoned.set(false);
         self.clear(device, queue);
-        Ok(())
     }
 
     fn clear(&self, device: &wgpu::Device, queue: &wgpu::Queue) {
@@ -776,6 +976,31 @@ fn advance_tile(active: &mut WorkBatch, total_pixels: u32, pool: u32) -> bool {
     active.initialized = false;
     false
 }
+fn advance_preview_slice(active: &mut WorkBatch, total_pixels: u32, pool: u32) {
+    active.tile_start += active.tile_pixels;
+    if active.tile_start == total_pixels {
+        active.tile_start = 0;
+    }
+    active.tile_pixels = (total_pixels - active.tile_start).min(pool);
+    // The full-image path state persists across slices and sweeps.
+    debug_assert!(active.initialized);
+}
+fn preview_pixel_stride(pixels: u32) -> u32 {
+    let mut stride = 511.min(u32::MAX / pixels.saturating_sub(1).max(1));
+    if stride % 2 == 0 {
+        stride -= 1;
+    }
+    loop {
+        let (mut a, mut b) = (pixels, stride);
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        if a == 1 {
+            return stride;
+        }
+        stride -= 2;
+    }
+}
 fn progress_words(bytes: &[u8], ticket: [u32; 4]) -> Result<[u32; 8]> {
     if bytes.len() != WORK_PROGRESS_BYTES as usize {
         return Err("cloud progress must contain exactly32 bytes".into());
@@ -799,6 +1024,16 @@ fn validate_batch_count(count: u32, capacity: u32, samples: u32, target_spp: u32
         .is_none_or(|end| end > target_spp)
     {
         return Err("cloud sample batch exceeds its configured samples per pixel".into());
+    }
+    Ok(())
+}
+
+fn validate_target_change(spp: u32, samples: u32, pending: bool) -> Result<()> {
+    if spp == 0 || spp > MAX_EXACT_SAMPLES {
+        return Err(format!("GPU sample target must be in 1..={MAX_EXACT_SAMPLES}").into());
+    }
+    if samples != 0 || pending {
+        return Err("reset the cloud film before changing its sample target".into());
     }
     Ok(())
 }
@@ -856,12 +1091,12 @@ fn configure(params: &mut Params, camera: &Camera, settings: &TransportSettings)
     params.sun_direction = vec4(sun_direction, 0.0)?;
     params.sun_irradiance = vec4(settings.sun_irradiance, 0.0)?;
     params.sky_radiance = vec4(settings.sky_radiance, 0.0)?;
+    params.storage[3] &= DIRECTIONAL_ENVIRONMENT | FULL_FRAME_PREVIEW;
     if let Some(ground) = &settings.ground {
-        params.storage[3] = 1;
+        params.storage[3] |= 1;
         params.optics[3] = finite_f32(ground.height)?;
         params.ground_albedo = vec4(ground.albedo, 0.0)?;
     } else {
-        params.storage[3] = 0;
         params.optics[3] = 0.0;
         params.ground_albedo = [0.0; 4];
     }
@@ -1033,6 +1268,12 @@ fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
         resource: buffer.as_entire_binding(),
     }
 }
+fn texture_entry(binding: u32, texture: &wgpu::TextureView) -> wgpu::BindGroupEntry<'_> {
+    wgpu::BindGroupEntry {
+        binding,
+        resource: wgpu::BindingResource::TextureView(texture),
+    }
+}
 fn read_buffers(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -1131,7 +1372,7 @@ mod tests {
             .validate()
             .is_ok()
         );
-        for flags in [1, 2, 4, 8, 16, 32, 63] {
+        for flags in [1, 2, 4, 8, 16, 32, 64, 127] {
             assert!(
                 Diagnostics {
                     flags,
@@ -1143,6 +1384,107 @@ mod tests {
             );
         }
         assert_eq!(std::mem::size_of::<Params>(), 288);
+    }
+    #[test]
+    fn camera_reset_preserves_directional_environment_and_updates_transport_flags() {
+        let mut params = Params::zeroed();
+        params.transform[3] = 1.0;
+        params.optics[1] = 1.0;
+        params.storage[3] = DIRECTIONAL_ENVIRONMENT | FULL_FRAME_PREVIEW;
+        let mut settings = TransportSettings::default();
+        configure(&mut params, &Camera::default(), &settings).unwrap();
+        assert_eq!(
+            params.storage[3] & DIRECTIONAL_ENVIRONMENT,
+            DIRECTIONAL_ENVIRONMENT
+        );
+        assert_eq!(params.storage[3] & 1, 1);
+        assert_eq!(params.storage[3] & FULL_FRAME_PREVIEW, FULL_FRAME_PREVIEW);
+        settings.ground = None;
+        settings.spatial_majorants = false;
+        settings.shadow_roulette = !settings.shadow_roulette;
+        configure(&mut params, &Camera::default(), &settings).unwrap();
+        assert_eq!(
+            params.storage[3] & DIRECTIONAL_ENVIRONMENT,
+            DIRECTIONAL_ENVIRONMENT
+        );
+        assert_eq!(params.storage[3] & 1, 0);
+        assert_eq!(params.storage[3] & FULL_FRAME_PREVIEW, FULL_FRAME_PREVIEW);
+        assert_eq!(params.storage[3] & 2, 2);
+        assert_eq!(params.storage[3] & 4 != 0, settings.shadow_roulette);
+        params.storage[3] &= !DIRECTIONAL_ENVIRONMENT;
+        configure(&mut params, &Camera::default(), &settings).unwrap();
+        assert_eq!(params.storage[3] & DIRECTIONAL_ENVIRONMENT, 0);
+    }
+    #[test]
+    fn target_change_requires_zero_samples_and_no_pending_chunk_or_batch() {
+        assert!(validate_target_change(1, 0, false).is_ok());
+        assert!(validate_target_change(MAX_EXACT_SAMPLES, 0, false).is_ok());
+        assert!(validate_target_change(0, 0, false).is_err());
+        assert!(validate_target_change(MAX_EXACT_SAMPLES + 1, 0, false).is_err());
+        assert!(validate_target_change(1024, 1, false).is_err());
+        assert!(validate_target_change(1024, 0, true).is_err());
+    }
+    #[test]
+    fn directional_boundary_table_is_centered_wrapped_and_clamped() {
+        use glam::{Vec2, Vec3};
+        // Independent CPU mirror of the shader's manual unfilterable lookup.
+        let sample = |direction: Vec3, table: &[[f32; 3]], width: i32, height: i32| {
+            let phi = direction
+                .x
+                .atan2(direction.z)
+                .rem_euclid(2.0 * std::f32::consts::PI);
+            let uv = Vec2::new(
+                phi / (2.0 * std::f32::consts::PI),
+                direction.y.clamp(-1.0, 1.0).acos() / std::f32::consts::PI,
+            );
+            let xy = uv * Vec2::new(width as f32, height as f32) - Vec2::splat(0.5);
+            let base = xy.floor();
+            let f = xy - base;
+            let texel = |x: i32, y: i32| {
+                Vec3::from_array(
+                    table[(y.clamp(0, height - 1) * width + x.rem_euclid(width)) as usize],
+                )
+            };
+            let a = texel(base.x as i32, base.y as i32);
+            let b = texel(base.x as i32 + 1, base.y as i32);
+            let c = texel(base.x as i32, base.y as i32 + 1);
+            let d = texel(base.x as i32 + 1, base.y as i32 + 1);
+            a.lerp(b, f.x).lerp(c.lerp(d, f.x), f.y)
+        };
+        let table: Vec<_> = (0..8)
+            .map(|i| [i as f32, (i / 4) as f32, (i % 4) as f32])
+            .collect();
+        for y in 0..2 {
+            for x in 0..4 {
+                let phi = (x as f32 + 0.5) / 4.0 * 2.0 * std::f32::consts::PI;
+                let theta = (y as f32 + 0.5) / 2.0 * std::f32::consts::PI;
+                let direction = Vec3::new(
+                    theta.sin() * phi.sin(),
+                    theta.cos(),
+                    theta.sin() * phi.cos(),
+                );
+                let actual = sample(direction, &table, 4, 2);
+                assert!(
+                    (actual - Vec3::from_array(table[y * 4 + x]))
+                        .abs()
+                        .max_element()
+                        < 3e-6
+                );
+            }
+        }
+        let left = sample(Vec3::new(-1e-6, 0.0, 1.0).normalize(), &table, 4, 2);
+        let right = sample(Vec3::new(1e-6, 0.0, 1.0).normalize(), &table, 4, 2);
+        assert!((left - right).abs().max_element() < 1e-5);
+        assert_eq!(sample(Vec3::Y, &table, 4, 2).y, 0.0);
+        assert_eq!(sample(-Vec3::Y, &table, 4, 2).y, 1.0);
+        let constant = [[0.03, 0.07, 0.23]; 1];
+        for direction in [Vec3::Y, -Vec3::Y, Vec3::Z, Vec3::X, -Vec3::Z, -Vec3::X] {
+            assert_eq!(
+                sample(direction, &constant, 1, 1),
+                Vec3::from_array(constant[0])
+            );
+        }
+        assert!(sample(Vec3::X, &table, 4, 2).z < sample(-Vec3::X, &table, 4, 2).z);
     }
     #[test]
     fn bounded_pool_tiles_cover_images_and_preserve_sample_order() {
@@ -1209,6 +1551,76 @@ mod tests {
         assert!(!advance_tile(&mut active, 2050, 4096));
         assert_eq!((active.tile_start, active.tile_pixels), (2048, 2));
         assert!(advance_tile(&mut active, 2050, 4096));
+    }
+    #[test]
+    fn full_frame_preview_visits_all_pixels_before_a_long_path_finishes() {
+        let total = 128 * 72;
+        let stride = preview_pixel_stride(total);
+        let mut active = WorkBatch {
+            count: 1,
+            tile_start: 0,
+            tile_pixels: MAX_WORK_PATHS,
+            initialized: true,
+        };
+        let mut visits = vec![0; total as usize];
+        let mut finished = vec![false; total as usize];
+        let mut complete = 0;
+        // Pixel0 requires seven visits, every other pixel at most two. State
+        // survives each unconditional slice advance, including wraparound.
+        for dispatch in 0..21 {
+            let expected_start = [0, 4096, 8192][dispatch % 3];
+            assert_eq!(active.tile_start, expected_start);
+            assert!(active.tile_pixels <= MAX_WORK_PATHS);
+            for slot in active.tile_start..active.tile_start + active.tile_pixels {
+                let pixel = slot * stride % total;
+                let i = pixel as usize;
+                if !finished[i] {
+                    visits[i] += 1;
+                    let required = if pixel == 0 { 7 } else { 1 + pixel % 2 };
+                    if visits[i] == required {
+                        finished[i] = true;
+                        complete += 1;
+                    }
+                }
+            }
+            assert_eq!(complete, finished.iter().filter(|&&v| v).count() as u32);
+            advance_preview_slice(&mut active, total, MAX_WORK_PATHS);
+            if dispatch == 2 {
+                assert!(visits.iter().all(|&n| n == 1));
+                assert!(!finished[0]);
+                assert!(complete > 0 && complete < total);
+                assert_eq!(active.tile_start, 0);
+            }
+        }
+        assert_eq!(complete, total);
+        assert!(finished.iter().all(|&v| v));
+        assert!(active.initialized);
+    }
+    #[test]
+    fn preview_permutation_is_bijective_spreads_each_slice_and_cannot_overflow() {
+        for pixels in [1, 2, 8, 9, 511, 9216, 1920 * 1080, u32::MAX] {
+            let stride = preview_pixel_stride(pixels);
+            assert!((1..=511).contains(&stride));
+            assert!(pixels.saturating_sub(1).checked_mul(stride).is_some());
+            if pixels <= 9216 {
+                let mut seen = vec![false; pixels as usize];
+                for slot in 0..pixels {
+                    let pixel = slot * stride % pixels;
+                    assert!(!seen[pixel as usize]);
+                    seen[pixel as usize] = true;
+                }
+                assert!(seen.iter().all(|&v| v));
+            }
+        }
+        let stride = preview_pixel_stride(128 * 72);
+        let mut rows = [0; 72];
+        for slot in 0..MAX_WORK_PATHS {
+            rows[(slot * stride % (128 * 72) / 128) as usize] += 1;
+        }
+        assert!(
+            rows.iter().all(|&n| n > 0),
+            "the first chunk must span every image row"
+        );
     }
     #[test]
     fn gpu_precision_guards_are_checked_on_cpu() {

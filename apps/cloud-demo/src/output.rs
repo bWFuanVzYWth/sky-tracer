@@ -23,6 +23,25 @@ pub struct Record {
     pub backend: String,
     pub adapter: Option<String>,
     pub asset_attribution: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment: Option<EnvironmentRecord>,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct EnvironmentRecord {
+    pub kind: &'static str,
+    pub size: [u32; 2],
+    pub altitude_km: f32,
+    pub sea_level_world_y: f64,
+    pub sun_direction: [f64; 3],
+    pub sun_irradiance: [f64; 3],
+    pub realtime_medium_key: String,
+    pub realtime_config: sky_realtime::Config,
+    pub mapping: serde_json::Value,
+    pub wavelengths: sky_realtime::Wavelengths,
+    pub reconstruction: &'static str,
+    pub color_space: &'static str,
+    pub solar_disk: &'static str,
+    pub approximation: &'static str,
 }
 pub fn save(directory: &Path, film: &Film, record: &Record, exposure: f32) -> Result<()> {
     film.validate()?;
@@ -77,9 +96,13 @@ pub fn save(directory: &Path, film: &Film, record: &Record, exposure: f32) -> Re
         "dimensions":[film.width,film.height],"samples_per_pixel":film.samples_per_pixel,
         "sample_variance_valid":film.samples_per_pixel>1,
         "complete_requested_samples":film.samples_per_pixel==record.render.spp,
-        "color_space":"linear RGB (Disney example values); independent cloud model",
+        "color_space":"linear sRGB (Disney example values); independent cloud model",
         "density_reconstruction":"selected original VDB lattice, trilinear; inactive values and uniform tiles retained",
-        "estimator":"delta tracking, ratio-tracked delta sun NEE, ambient escape, HG, Lambert ground, unbiased roulette",
+        "estimator":if record.environment.is_some() {
+            "delta tracking, ratio-tracked atmosphere-attenuated delta sun NEE, frozen directional RGB sky escape, HG, optional Lambert ground, unbiased roulette"
+        } else {
+            "delta tracking, ratio-tracked delta sun NEE, constant RGB sky escape, HG, Lambert ground, unbiased roulette"
+        },
         "hard_scattering_depth_limit":null,"transmittance_threshold":null,
         "failed_paths_discarded":false,"diagnostics_passed":true,
         "shadow_roulette":{"enabled":record.transport.shadow_roulette,"candidate_interval":16,"weight_trigger":1e-4,"survival_probability":0.5,"survivor_weight_multiplier":2.0},
@@ -151,6 +174,7 @@ mod tests {
             backend: "cpu-f64".into(),
             adapter: None,
             asset_attribution: None,
+            environment: None,
         };
         save(&directory, &film, &record, 10.0).unwrap();
         assert_eq!(read_rgb(&directory.join("radiance.exr")), film.mean);

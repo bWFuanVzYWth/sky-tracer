@@ -624,6 +624,7 @@ struct FrameKey {
     sky_view: bool,
     segment: f32,
     spectral: bool,
+    environment: bool,
 }
 
 pub struct Renderer {
@@ -642,6 +643,7 @@ pub struct Renderer {
     frame_params: wgpu::Buffer,
     sky_group: Option<wgpu::BindGroup>,
     project_group: Option<wgpu::BindGroup>,
+    environment_group: Option<wgpu::BindGroup>,
     direct_group: Option<wgpu::BindGroup>,
     target: wgpu::Texture,
     target_view: wgpu::TextureView,
@@ -683,6 +685,7 @@ impl Renderer {
             "build_sky",
             "project_sky",
             "render",
+            "project_environment",
         ]
         .iter()
         .map(|&entry| {
@@ -772,6 +775,7 @@ impl Renderer {
             frame_params: uniform(d),
             sky_group: None,
             project_group: None,
+            environment_group: None,
             direct_group: None,
             target,
             target_view,
@@ -1153,6 +1157,19 @@ impl Renderer {
                 (20, self.sky_mapping.as_entire_binding()),
             ],
         ));
+        self.environment_group = Some(group(
+            d,
+            &self.pipelines[9],
+            &[
+                (0, self.frame_params.as_entire_binding()),
+                (2, tv(&self.tau_view)),
+                (6, wgpu::BindingResource::Sampler(&self.sampler)),
+                (12, tv(&self.target_view)),
+                (13, tv(&self.transmittance_view)),
+                (15, tv(&self.sky_view)),
+                (20, self.sky_mapping.as_entire_binding()),
+            ],
+        ));
     }
     pub fn resize(&mut self, d: &wgpu::Device, size: [u32; 2]) -> bool {
         let ts = if self.use_sky_view && self.segment_km <= 0.0 && !self.spectral_output {
@@ -1187,6 +1204,23 @@ impl Renderer {
     pub fn render(&mut self, q: &wgpu::Queue, e: &mut wgpu::CommandEncoder, view: View) {
         self.render_profiled(q, e, view, None);
     }
+    /// Full-sphere equirectangular linear Rec.2020 boundary radiance, without
+    /// the separately evaluated solar disk. Uses the same solved SkyView.
+    /// Longitude is atan2(direction.x, direction.z), latitude is acos(y).
+    /// Camera angles and FOV are ignored. Resize selects the environment size.
+    /// The 1x1 transmittance texture receives four-wave direct solar T.
+    pub fn render_environment(
+        &mut self,
+        q: &wgpu::Queue,
+        e: &mut wgpu::CommandEncoder,
+        view: View,
+    ) {
+        assert!(
+            self.segment_km <= 0.0 && !self.spectral_output,
+            "environment projection requires full-path RGB radiance"
+        );
+        self.render_projection(q, e, view, None, true);
+    }
     /// Instruments the same rendering/cache path as `render`; no extra solve or
     /// projection is introduced. With None, no profiling clock is read.
     pub fn render_profiled(
@@ -1195,6 +1229,16 @@ impl Renderer {
         e: &mut wgpu::CommandEncoder,
         view: View,
         timestamps: Option<FrameTimestamps<'_>>,
+    ) -> FrameProfile {
+        self.render_projection(q, e, view, timestamps, false)
+    }
+    fn render_projection(
+        &mut self,
+        q: &wgpu::Queue,
+        e: &mut wgpu::CommandEncoder,
+        view: View,
+        timestamps: Option<FrameTimestamps<'_>>,
+        environment: bool,
     ) -> FrameProfile {
         let mut profile = FrameProfile::default();
         assert!(
@@ -1207,7 +1251,8 @@ impl Renderer {
             steps: self.steps.clamp(4, 512),
             multiple: self.multiple_scattering,
         };
-        let use_sky_view = self.use_sky_view && self.segment_km <= 0.0 && !self.spectral_output;
+        let use_sky_view =
+            (self.use_sky_view || environment) && self.segment_km <= 0.0 && !self.spectral_output;
         let frame = FrameKey {
             view,
             sky,
@@ -1215,6 +1260,7 @@ impl Renderer {
             sky_view: use_sky_view,
             segment: self.segment_km,
             spectral: self.spectral_output,
+            environment,
         };
         if self.last_frame == Some(frame) {
             return profile;
@@ -1258,7 +1304,8 @@ impl Renderer {
             bottom: self.medium.params.sun[3],
             top: self.medium.params.sun[3] + self.medium.params.medium[0],
         };
-        let needs_ground = !self.config.skip_unused_ground || !pure_sky_frustum(g, view);
+        let needs_ground =
+            environment || !self.config.skip_unused_ground || !pure_sky_frustum(g, view);
         if use_sky_view && (self.last_sky != Some(sky) || needs_ground && !self.last_sky_has_ground)
         {
             let mapping_start = timestamps.is_some().then(Instant::now);
@@ -1314,7 +1361,9 @@ impl Renderer {
             0,
             bytemuck::bytes_of(&params(view, self.size, self.include_sun_disk)),
         );
-        let (p, g) = if use_sky_view {
+        let (p, g) = if environment {
+            (&self.pipelines[9], self.environment_group.as_ref().unwrap())
+        } else if use_sky_view {
             (&self.pipelines[7], self.project_group.as_ref().unwrap())
         } else {
             (&self.pipelines[8], self.direct_group.as_ref().unwrap())

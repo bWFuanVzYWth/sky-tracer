@@ -1,7 +1,10 @@
 mod analysis;
 mod app;
 mod benchmark;
+mod controller;
 mod output;
+mod sky_bridge;
+mod viewer_ui;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use cloud_pt::{
@@ -74,6 +77,9 @@ enum Command {
         /// Diagnostic window run: exit after this many completed presentations.
         #[arg(long)]
         smoke_frames: Option<u64>,
+        /// Diagnostic only: asynchronously save a rendered UI preview PNG.
+        #[arg(long)]
+        capture_preview: Option<PathBuf>,
     },
     /// Save linear EXR and sample statistics. GPU rendering is explicitly selected.
     Render {
@@ -105,7 +111,7 @@ struct Options {
     height: Option<u32>,
     #[arg(long)]
     spp: Option<u32>,
-    /// GPU samples per logical batch: 0 selects occupancy-based sizing, 1 uses one sample. Paths advance in bounded chunks.
+    /// Offline GPU samples per logical batch; the full-frame viewer uses one sample at a time.
     #[arg(long)]
     sample_batch_size: Option<u32>,
     #[arg(long)]
@@ -247,7 +253,7 @@ fn record(
         source: options.vdb.clone(), source_bytes: fs::metadata(&options.vdb)?.len(),
         grid: options.grid.clone(), volume_stats: volume.stats.clone(),
         camera: scene.camera.clone(), transport: scene.transport.clone(), render: scene.render.clone(),
-        backend: backend.into(), adapter: None,
+        backend: backend.into(), adapter: None, environment: None,
         asset_attribution: options.vdb.file_name().and_then(|n| n.to_str())
             .filter(|n| n.starts_with("wdas_cloud")).map(|_| "Walt Disney Animation Studios Cloud Data Set, Copyright 2017 Disney Enterprises, Inc.; CC BY-SA 3.0; source photograph Kevin Udy / Colorado Clouds Blog".into()),
     })
@@ -279,9 +285,16 @@ fn main() -> Result<()> {
             options,
             exit_after_seconds,
             smoke_frames,
+            capture_preview,
         } => {
-            let view_options = view_options(exit_after_seconds, smoke_frames)?;
-            let scene = options.resolve_view()?;
+            let view_options = view_options(exit_after_seconds, smoke_frames, capture_preview)?;
+            let mut scene = options.resolve_view()?;
+            // The full-sphere sky includes its distant spherical ground. Keep
+            // the legacy local plane only when an explicit scene requests it.
+            if options.scene.is_none() {
+                scene.transport.ground = None;
+            }
+            scene.render.sample_batch_size = 1;
             let volume = load(&options)?;
             let record = record(&options, &scene, &volume, "gpu-f32")?;
             let packed = volume.pack_gpu()?;
@@ -442,6 +455,7 @@ fn main() -> Result<()> {
 fn view_options(
     exit_after_seconds: Option<f64>,
     smoke_frames: Option<u64>,
+    capture_preview: Option<PathBuf>,
 ) -> Result<app::ViewOptions> {
     let exit_after = if let Some(seconds) = exit_after_seconds {
         if !seconds.is_finite() || !(0.001..=3600.0).contains(&seconds) {
@@ -454,9 +468,19 @@ fn view_options(
     if smoke_frames.is_some_and(|n| !(1..=10000).contains(&n)) {
         return Err("--smoke-frames must be in [1, 10000]".into());
     }
+    if let Some(path) = &capture_preview {
+        if path.exists()
+            || path
+                .extension()
+                .is_none_or(|e| !e.eq_ignore_ascii_case("png"))
+        {
+            return Err("--capture-preview requires a new .png file".into());
+        }
+    }
     Ok(app::ViewOptions {
         exit_after,
         smoke_frames,
+        capture_preview,
     })
 }
 
@@ -506,6 +530,7 @@ mod viewer_cli_tests {
             options,
             exit_after_seconds,
             smoke_frames,
+            capture_preview,
         } = cli.command
         else {
             panic!("expected view");
@@ -513,15 +538,15 @@ mod viewer_cli_tests {
         let scene = options.resolve_view().unwrap();
         assert_eq!([scene.render.width, scene.render.height], [192, 108]);
         assert_eq!(
-            view_options(exit_after_seconds, smoke_frames)
+            view_options(exit_after_seconds, smoke_frames, capture_preview)
                 .unwrap()
                 .exit_after,
             Some(Duration::from_secs(3))
         );
         for duration in [f64::NAN, f64::INFINITY, -1.0, 0.0, 3601.0] {
-            assert!(view_options(Some(duration), None).is_err());
+            assert!(view_options(Some(duration), None, None).is_err());
         }
-        assert!(view_options(None, Some(0)).is_err());
-        assert!(view_options(None, Some(10001)).is_err());
+        assert!(view_options(None, Some(0), None).is_err());
+        assert!(view_options(None, Some(10001), None).is_err());
     }
 }

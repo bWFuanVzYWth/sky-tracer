@@ -7,6 +7,10 @@ license.workspace = true
 
 [dependencies]
 cloud-pt = { path = "../../crates/cloud-pt" }
+sky-realtime = { path = "../../crates/sky-realtime" }
+egui = "0.35.0"
+egui-wgpu = "0.35.0"
+egui-winit = "0.35.0"
 bytemuck.workspace = true
 clap.workspace = true
 exr.workspace = true
@@ -17,3 +21,6 @@ serde.workspace = true
 serde_json.workspace = true
 wgpu.workspace = true
 winit.workspace = true
+
+[dev-dependencies]
+naga = { version = "29.0.3", features = ["wgsl-in", "spv-out"] }

@@ -121,6 +121,8 @@ SkyView 单独对同配置逐像素积分的最坏场景 P95：一般/高空 1.1
 
 ## 有限线段与体积效果
 
+`Renderer::render_environment` 提供同一 SkyView 的全方向 equirectangular 线性 Rec.2020 输出，使用完整天空与地面 chart。经纬采用 `phi=atan2(direction.x,direction.z)`、`theta=acos(direction.y)`，相机朝向/FOV 不参与投影，`resize` 指定环境图尺寸。该输出排除独立太阳盘，1×1 transmittance texture 同时返回四波长太阳透射率；应用可统一转换色彩和照度，用于其他求解器的边界照明。环境与普通相机投影分别参与帧缓存，切回普通天空不复用错误的输出图。
+
 实时核心提供四波长的有限段 L/T，验证包含：
 
 ```text

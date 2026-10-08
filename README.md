@@ -30,7 +30,7 @@ apps/
   sky-demo/        实时显示、参考 LUT 显示、PT 对照和性能测量
   sky-audit/       固定场景评估、缓存与输运恒等式检查
   sky-optimizer/   Python / CPU 波长搜索、候选比较和图集
-  cloud-demo/      云渐进路径追踪窗口、CPU/GPU 离线 EXR、CPU 资产与成本分析
+  cloud-demo/      全帧云 PT + 实时天空、参数 UI/移动相机、离线 EXR 与资产分析
 experiments/
   validation/     已纳入版本管理的相机与掠角回归场景
 scripts/          架构检查与通用二进制图像对比

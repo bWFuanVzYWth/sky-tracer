@@ -10,6 +10,8 @@
 
 应用可以依赖多个核心，但只组合公开 API，分别构造输入。`sky-baker reference compare` 会检查独立输入表与参考指纹，拒绝把介质不同的结果当作同一问题对照。文件交换是研究工具的显式输入，不成为实时核心对参考核心的隐藏依赖。
 
+`cloud-demo` 在应用层组合 `sky-realtime::Renderer::render_environment` 与 `cloud-pt::ProgressiveRenderer::set_environment`。前者求解大气并输出方向光和太阳透射率，后者只读取通用线性 RGB 纹理；色彩/照度换算和画面投影归应用。云核心仍不依赖大气核心或其数据，SkyView CDF 和大气积分仍归实时核心。这个接口定义冻结的远场边界，不提供云内大气的联合路径追踪。
+
 优化器是 Python CPU 应用：它实现拟合和实验统计，不实现大气输运。光谱数据生成的单散射积分位于参考核心 `spectral_dataset` / `direct`，命令行只负责路径和参数。这样搜索目标可以改，天空的物理定义仍有明确归属。
 
 ## 独立数据的来源和演化

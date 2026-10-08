@@ -31,9 +31,15 @@ for name in sorted(CORES):
     print(f"{name}: independent crate" + (" and owned tables" if name in ATMOSPHERE_CORES else " and VDB transport"))
 assert not (ROOT / "data").exists(), "No shared root input directory"
 for path in (ROOT / "apps").rglob("*.wgsl"):
-    assert path.parent.name == "shaders" and path.name in {
+    display = path.parent.name == "shaders" and path.name in {
         "fullscreen_debug.wgsl", "hdr_ui_composite.wgsl", "present_texture.wgsl", "reinhard_gamut.wgsl"
-    }, f"Atmospheric shader belongs in a solver: {path}"
+    }
+    # Only image projection/color conversion lives in the cloud application.
+    # SkyView CDF decoding and atmospheric transport stay in sky-realtime.
+    cloud_display = path.parent == ROOT / "apps/cloud-demo/src/shaders" and path.name in {
+        "cloud_composite.wgsl", "cloud_environment_convert.wgsl"
+    }
+    assert display or cloud_display, f"Atmospheric shader belongs in a solver: {path}"
 for member in members:
     assert (ROOT / member / "Cargo.toml").is_file(), member
 print(f"Architecture OK: {len(CORES)} independent solvers, {len(members)} Rust packages")

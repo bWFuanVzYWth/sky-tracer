@@ -107,3 +107,15 @@ fn view_transmittance(ray:vec3<f32>)->vec4<f32>{
     }
     textureStore(output,vec2<i32>(id.xy),vec4<f32>(rgb,1.0));
 }
+// Directional boundary for external renderers. The delta sun is supplied by
+// their direct-light estimator, so its visible disk is deliberately excluded.
+@compute @workgroup_size(8,8) fn project_environment(@builtin(global_invocation_id) id:vec3<u32>) {
+    if any(id.xy>=p.size_steps.xy){return;}
+    let uv=(vec2<f32>(id.xy)+0.5)/vec2<f32>(p.size_steps.xy);
+    let phi=2.0*PI*uv.x;let theta=PI*uv.y;
+    let ray=vec3<f32>(sin(phi)*sin(theta),cos(theta),cos(phi)*sin(theta));
+    textureStore(output,vec2<i32>(id.xy),vec4<f32>(sky_sample(ray),1.0));
+    if all(id.xy==vec2<u32>(0u)){
+        textureStore(output_t,vec2<i32>(0),view_transmittance(world_sun()));
+    }
+}

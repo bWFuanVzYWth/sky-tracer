@@ -3,9 +3,18 @@
 #[path = "../src/app.rs"]
 #[allow(dead_code)]
 mod app;
+#[path = "../src/controller.rs"]
+#[allow(dead_code)]
+mod controller;
 #[path = "../src/output.rs"]
 #[allow(dead_code)]
 mod output;
+#[path = "../src/sky_bridge.rs"]
+#[allow(dead_code)]
+mod sky_bridge;
+#[path = "../src/viewer_ui.rs"]
+#[allow(dead_code)]
+mod viewer_ui;
 
 use cloud_pt::{
     Result,
@@ -141,6 +150,7 @@ fn main() -> Result<()> {
             backend: "gpu-f32".into(),
             adapter: Some(adapter),
             asset_attribution: Some("WDAS Cloud Data Set, CC BY-SA3.0".into()),
+            environment: None,
         },
         0.0,
     )?;

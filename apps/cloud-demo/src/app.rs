@@ -1,14 +1,17 @@
 //! Explicit GPU viewer with bounded work, asynchronous readbacks and idle time.
+use crate::controller::{Controller, MoveKey, same_pose, sun_angles, sun_direction};
 use crate::output::{self, Record};
+use crate::sky_bridge::{COMPOSITE_SHADER, SkyBackground};
+use crate::viewer_ui::{self, Controls, Progress, ViewerUi};
 use bytemuck::{Pod, Zeroable};
 use cloud_pt::{
     Result,
     config::{Camera, RenderConfig},
-    gpu::{PRESENT_SHADER, ProgressiveRenderer, WORK_PROGRESS_BYTES, WorkProgress},
-    transport::TransportSettings,
+    gpu::{ProgressiveRenderer, WORK_PROGRESS_BYTES, WorkProgress},
+    transport::{GroundPlane, TransportSettings},
     volume::SparseGpuVolume,
 };
-use glam::DQuat;
+use image::ImageEncoder;
 use std::{
     any::Any,
     fs,
@@ -31,19 +34,20 @@ use winit::{
     window::{Window, WindowId},
 };
 
-const POLL_INTERVAL: Duration = Duration::from_millis(5);
-const MIN_WORK_REST: Duration = Duration::from_millis(16);
+const POLL_INTERVAL: Duration = Duration::from_millis(1);
+const MIN_WORK_REST: Duration = Duration::from_millis(1);
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ViewOptions {
     pub exit_after: Option<Duration>,
     pub smoke_frames: Option<u64>,
+    pub capture_preview: Option<PathBuf>,
 }
 impl ViewOptions {
-    fn diagnostic(self) -> bool {
-        self.exit_after.is_some() || self.smoke_frames.is_some()
+    fn diagnostic(&self) -> bool {
+        self.exit_after.is_some() || self.smoke_frames.is_some() || self.capture_preview.is_some()
     }
 }
 
@@ -51,7 +55,7 @@ pub fn run(
     volume: SparseGpuVolume,
     camera: Camera,
     settings: TransportSettings,
-    config: RenderConfig,
+    mut config: RenderConfig,
     exposure_ev: f32,
     record: Record,
     options: ViewOptions,
@@ -59,11 +63,21 @@ pub fn run(
     camera.basis()?;
     settings.validate()?;
     config.validate()?;
+    // Interactive accumulation keeps one persistent path per film pixel. The
+    // offline renderer retains its independently configured logical batching.
+    config.sample_batch_size = 1;
     if !exposure_ev.is_finite() {
         return Err("display exposure must be finite".into());
     }
+    if options
+        .capture_preview
+        .as_ref()
+        .is_some_and(|path| path.exists())
+    {
+        return Err("--capture-preview path already exists".into());
+    }
     println!(
-        "Cloud viewer: {}x{}, target {} spp. Space pause; left drag orbit; wheel zoom; R reset; I/K sun elevation; J/L azimuth; [ / ] exposure; S snapshot; Esc exit.",
+        "Cloud + realtime sky viewer: {}x{}, target {} spp. WASD move; Q/E down/up; Shift fast; right drag look; left drag orbit; wheel zoom. Space pause; R reset; I/K sun elevation; J/L azimuth; [ / ] exposure; sidebar Save (Ctrl+S); Esc exit.",
         config.width, config.height, config.spp
     );
     println!(
@@ -89,12 +103,20 @@ pub fn run(
         error_window: None,
         paused: false,
         dragging: false,
+        looking: false,
+        control_pressed: false,
+        controller: Controller::default(),
+        sky_enabled: true,
+        last_motion: Instant::now(),
+        next_motion: Instant::now(),
         cursor: None,
         fatal: None,
         exiting: false,
         reset_pending: false,
         save_requested: false,
         save_job: None,
+        preview_job: None,
+        capture_written: false,
         message: None,
     };
     match catch_unwind(AssertUnwindSafe(|| event_loop.run_app(&mut app))) {
@@ -108,8 +130,26 @@ pub fn run(
     if let Some(job) = app.save_job.take() {
         let _ = job.thread.join();
     }
+    if let Some(job) = app.preview_job.take() {
+        match job.thread.join() {
+            Ok(Ok(path)) => {
+                app.capture_written = true;
+                println!(
+                    "Diagnostic UI preview: {} (not a reference)",
+                    path.display()
+                );
+            }
+            Ok(Err(error)) => return Err(error.into()),
+            Err(payload) => return Err(panic_message(payload).into()),
+        }
+    }
     if let Some(error) = app.fatal {
         return Err(error.into());
+    }
+    if app.options.capture_preview.is_some() && !app.capture_written {
+        return Err(
+            "diagnostic stopped before the UI preview readback completed; no PNG captured".into(),
+        );
     }
     Ok(())
 }
@@ -118,7 +158,12 @@ pub fn run(
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Display {
     image: [u32; 4],
+    viewport: [f32; 4],
     exposure: [f32; 4],
+    camera_forward: [f32; 4],
+    camera_right: [f32; 4],
+    camera_up: [f32; 4],
+    ambient: [f32; 4],
 }
 
 /// Readback copies are encoded with the corresponding GPU work. Mapping starts
@@ -129,6 +174,59 @@ struct AsyncReadback {
     sender: Option<Sender<std::result::Result<(), String>>>,
 }
 impl AsyncReadback {
+    fn texture(
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        texture: &wgpu::Texture,
+        width: u32,
+        height: u32,
+    ) -> Result<(Self, u32)> {
+        let row_bytes = width
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(255))
+            .map(|n| n / 256 * 256)
+            .ok_or("preview row size overflow")?;
+        let size = u64::from(row_bytes) * u64::from(height);
+        if size == 0 || size > device.limits().max_buffer_size {
+            return Err("preview readback exceeds buffer limit".into());
+        }
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("diagnostic UI preview readback"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row_bytes),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let (sender, receiver) = mpsc::channel();
+        Ok((
+            Self {
+                buffer,
+                receiver,
+                sender: Some(sender),
+            },
+            row_bytes,
+        ))
+    }
     fn encode(
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
@@ -183,6 +281,15 @@ impl AsyncReadback {
     }
 }
 enum Pending {
+    Preview {
+        readback: AsyncReadback,
+        started: Instant,
+        width: u32,
+        height: u32,
+        row_bytes: u32,
+        format: wgpu::TextureFormat,
+        path: PathBuf,
+    },
     Work {
         readback: AsyncReadback,
         started: Instant,
@@ -208,6 +315,7 @@ impl Pending {
     fn started(&self) -> Instant {
         match self {
             Self::Work { started, .. }
+            | Self::Preview { started, .. }
             | Self::Display { started, .. }
             | Self::Barrier { started, .. }
             | Self::Snapshot { started, .. } => *started,
@@ -218,7 +326,18 @@ struct SaveJob {
     receiver: Receiver<std::result::Result<(PathBuf, u32), String>>,
     thread: JoinHandle<()>,
 }
+struct PreviewJob {
+    thread: JoinHandle<std::result::Result<PathBuf, String>>,
+}
 enum Completion {
+    Preview {
+        bytes: Vec<u8>,
+        width: u32,
+        height: u32,
+        row_bytes: u32,
+        format: wgpu::TextureFormat,
+        path: PathBuf,
+    },
     Work,
     Barrier,
     Display,
@@ -242,6 +361,11 @@ struct View {
     focused: bool,
     resize_pending: bool,
     renderer: ProgressiveRenderer,
+    sky: SkyBackground,
+    ui: ViewerUi,
+    sky_dirty: bool,
+    ui_repaint_at: Option<Instant>,
+    capture_path: Option<PathBuf>,
     display_uniform: wgpu::Buffer,
     display_bind_group: wgpu::BindGroup,
     display_pipeline: wgpu::RenderPipeline,
@@ -302,6 +426,7 @@ impl View {
         camera: &Camera,
         settings: &TransportSettings,
         config: &RenderConfig,
+        capture_path: Option<PathBuf>,
     ) -> Result<Self> {
         let size = window.inner_size();
         let instance = wgpu::Instance::default();
@@ -337,8 +462,27 @@ impl View {
             .first()
             .copied()
             .ok_or("surface has no alpha mode")?;
+        if capture_path.is_some() && !capabilities.usages.contains(wgpu::TextureUsages::COPY_SRC) {
+            return Err("this surface does not support optional --capture-preview COPY_SRC".into());
+        }
+        if capture_path.is_some()
+            && !matches!(
+                format,
+                wgpu::TextureFormat::Bgra8Unorm
+                    | wgpu::TextureFormat::Bgra8UnormSrgb
+                    | wgpu::TextureFormat::Rgba8Unorm
+                    | wgpu::TextureFormat::Rgba8UnormSrgb
+            )
+        {
+            return Err("optional --capture-preview requires an RGBA8/BGRA8 surface".into());
+        }
         let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | if capture_path.is_some() {
+                    wgpu::TextureUsages::COPY_SRC
+                } else {
+                    wgpu::TextureUsages::empty()
+                },
             format,
             width: size.width.max(1),
             height: size.height.max(1),
@@ -350,7 +494,10 @@ impl View {
         if size.width > 0 && size.height > 0 {
             surface.configure(&device, &surface_config);
         }
-        let renderer = ProgressiveRenderer::new(&device, &queue, volume, camera, settings, config)?;
+        let sky = SkyBackground::new(&device, &queue, settings)?;
+        let renderer =
+            ProgressiveRenderer::new_preview(&device, &queue, volume, camera, settings, config)?;
+        let ui = ViewerUi::new(&window, &device, format);
         let display_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("cloud display transform"),
             contents: bytemuck::bytes_of(&Display::zeroed()),
@@ -358,11 +505,52 @@ impl View {
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cloud film display"),
-            source: wgpu::ShaderSource::Wgsl(PRESENT_SHADER.into()),
+            source: wgpu::ShaderSource::Wgsl(COMPOSITE_SHADER.into()),
         });
+        let display_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("cloud linear sky composite bindings"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let display_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("cloud sky composite layout"),
+                bind_group_layouts: &[Some(&display_layout)],
+                immediate_size: 0,
+            });
         let display_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("cloud display"),
-            layout: None,
+            layout: Some(&display_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
@@ -387,7 +575,7 @@ impl View {
         });
         let display_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("cloud display film"),
-            layout: &display_pipeline.get_bind_group_layout(0),
+            layout: &display_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -396,6 +584,10 @@ impl View {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: display_uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(sky.view()),
                 },
             ],
         });
@@ -416,6 +608,11 @@ impl View {
             focused: true,
             resize_pending: false,
             renderer,
+            sky,
+            ui,
+            sky_dirty: true,
+            ui_repaint_at: None,
+            capture_path,
             display_uniform,
             display_bind_group,
             display_pipeline,
@@ -462,9 +659,9 @@ impl View {
             return Ok(None);
         };
         let ready = match pending {
-            Pending::Work { readback, .. } | Pending::Snapshot { readback, .. } => {
-                readback.try_bytes()?
-            }
+            Pending::Work { readback, .. }
+            | Pending::Snapshot { readback, .. }
+            | Pending::Preview { readback, .. } => readback.try_bytes()?,
             Pending::Display { receiver, .. } | Pending::Barrier { receiver, .. } => {
                 match receiver.try_recv() {
                     Ok(()) => Some(Vec::new()),
@@ -483,6 +680,24 @@ impl View {
         };
         let pending = self.pending.take().unwrap();
         match pending {
+            Pending::Preview {
+                width,
+                height,
+                row_bytes,
+                format,
+                path,
+                ..
+            } => {
+                self.frames += 1;
+                Ok(Some(Completion::Preview {
+                    bytes,
+                    width,
+                    height,
+                    row_bytes,
+                    format,
+                    path,
+                }))
+            }
             Pending::Work { started, .. } => {
                 let p = self.renderer.complete_work(&bytes)?;
                 let elapsed = now.duration_since(started);
@@ -590,10 +805,15 @@ impl View {
         });
         Ok(())
     }
-    fn redraw(&mut self, exposure: f32) -> Result<()> {
+    fn redraw(
+        &mut self,
+        model: &mut Controls,
+        progress: &Progress,
+        ignore_film: bool,
+    ) -> Result<viewer_ui::Actions> {
         self.redraw_requested = false;
         if !self.drawable() || self.pending.is_some() {
-            return Ok(());
+            return Ok(viewer_ui::Actions::default());
         }
         if self.resize_pending {
             self.surface_config.width = self.size.width;
@@ -607,17 +827,48 @@ impl View {
             wgpu::CurrentSurfaceTexture::Suboptimal(f) => (f, true),
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 self.resize_pending = true;
-                return Ok(());
+                return Ok(viewer_ui::Actions::default());
             }
-            wgpu::CurrentSurfaceTexture::Timeout => return Ok(()),
+            wgpu::CurrentSurfaceTexture::Timeout => return Ok(viewer_ui::Actions::default()),
             wgpu::CurrentSurfaceTexture::Occluded => {
                 self.occluded = true;
-                return Ok(());
+                return Ok(viewer_ui::Actions::default());
             }
             wgpu::CurrentSurfaceTexture::Validation => {
                 return Err("cloud surface validation failed".into());
             }
         };
+        // Prepare after acquisition succeeds: input/texture deltas are consumed
+        // exactly once, and UI rendering shares this tracked queue submission.
+        let (actions, prepared) =
+            self.ui
+                .prepare(&self.window, model, progress, self.renderer.size());
+        let target = frame.texture.create_view(&Default::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("cloud sky + controls display"),
+            });
+        if self.sky_dirty {
+            self.sky.encode(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                &model.camera,
+                &model.transport,
+                model.sky_enabled,
+            )?;
+            self.renderer.set_environment(
+                &self.device,
+                &self.queue,
+                model
+                    .sky_enabled
+                    .then(|| (self.sky.view(), self.sky.sunlight_view())),
+            )?;
+            self.sky_dirty = false;
+        }
+        let (forward, right, up) = model.camera.basis()?;
+        let pack = |v: glam::DVec3, w: f32| [v.x as f32, v.y as f32, v.z as f32, w];
         self.queue.write_buffer(
             &self.display_uniform,
             0,
@@ -628,27 +879,34 @@ impl View {
                     self.size.width,
                     self.size.height,
                 ],
+                viewport: prepared.viewport.map(|n| n as f32),
                 exposure: [
-                    exposure,
+                    model.exposure,
                     if self.surface_config.format.is_srgb() {
                         0.0
                     } else {
                         1.0
                     },
-                    0.0,
-                    0.0,
+                    f32::from(model.sky_enabled),
+                    f32::from(
+                        ignore_film
+                            || actions.physical_changed
+                            || actions.target_changed
+                            || actions.reset,
+                    ),
                 ],
+                camera_forward: pack(
+                    forward,
+                    (model.camera.horizontal_fov_deg.to_radians() * 0.5).tan() as f32,
+                ),
+                camera_right: pack(right, 0.0),
+                camera_up: pack(up, 0.0),
+                ambient: pack(model.transport.sky_radiance, 0.0),
             }),
         );
-        let target = frame.texture.create_view(&Default::default());
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("cloud display"),
-            });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("cloud display"),
+                label: Some("cloud sky composite"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &target,
                     depth_slice: None,
@@ -663,25 +921,70 @@ impl View {
                 timestamp_writes: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.display_pipeline);
-            pass.set_bind_group(0, &self.display_bind_group, &[]);
-            pass.draw(0..3, 0..1);
+            let [x, y, w, h] = prepared.viewport;
+            if w > 0 && h > 0 {
+                pass.set_viewport(x as f32, y as f32, w as f32, h as f32, 0.0, 1.0);
+                pass.set_scissor_rect(x, y, w, h);
+                pass.set_pipeline(&self.display_pipeline);
+                pass.set_bind_group(0, &self.display_bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
         }
-        self.queue.submit([encoder.finish()]);
+        let commands = self
+            .ui
+            .encode(&self.device, &self.queue, &mut encoder, &target, &prepared);
+        let capture = if self.chunks >= 20
+            || self.renderer.sample_count() >= self.renderer.target_samples()
+        {
+            if let Some(path) = self.capture_path.take() {
+                let (readback, row_bytes) = AsyncReadback::texture(
+                    &self.device,
+                    &mut encoder,
+                    &frame.texture,
+                    self.size.width,
+                    self.size.height,
+                )?;
+                Some((readback, row_bytes, path))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        self.queue.submit(
+            commands
+                .into_iter()
+                .chain(std::iter::once(encoder.finish())),
+        );
         let (sender, receiver) = mpsc::channel();
         self.queue.on_submitted_work_done(move || {
             let _ = sender.send(());
         });
-        self.pending = Some(Pending::Display {
-            receiver,
-            started: Instant::now(),
-        });
+        self.pending = if let Some((mut readback, row_bytes, path)) = capture {
+            readback.arm();
+            Some(Pending::Preview {
+                readback,
+                started: Instant::now(),
+                width: self.size.width,
+                height: self.size.height,
+                row_bytes,
+                format: self.surface_config.format,
+                path,
+            })
+        } else {
+            Some(Pending::Display {
+                receiver,
+                started: Instant::now(),
+            })
+        };
         frame.present();
+        self.ui.submitted(&prepared);
+        self.ui_repaint_at = Instant::now().checked_add(prepared.repaint_after);
         self.needs_redraw = false;
         if suboptimal {
             self.resize_pending = true;
         }
-        Ok(())
+        Ok(actions)
     }
 }
 fn work_rest(elapsed: Duration) -> Duration {
@@ -708,12 +1011,20 @@ struct App {
     error_window: Option<Arc<Window>>,
     paused: bool,
     dragging: bool,
+    looking: bool,
+    control_pressed: bool,
+    controller: Controller,
+    sky_enabled: bool,
+    last_motion: Instant,
+    next_motion: Instant,
     cursor: Option<PhysicalPosition<f64>>,
     fatal: Option<String>,
     exiting: bool,
     reset_pending: bool,
     save_requested: bool,
     save_job: Option<SaveJob>,
+    preview_job: Option<PreviewJob>,
+    capture_written: bool,
     message: Option<String>,
 }
 impl App {
@@ -766,8 +1077,8 @@ impl App {
             .as_ref()
             .map(|p| {
                 format!(
-                    " | tile {} / {} | paths {} / {}",
-                    p.tile_start, p.total_pixels, p.completed_paths, p.total_paths
+                    " | current pass pixels completed {} / {}",
+                    p.completed_paths, p.total_paths
                 )
             })
             .unwrap_or_default();
@@ -794,6 +1105,7 @@ impl App {
         self.reset_pending = true;
         self.save_requested = false;
         self.message = None;
+        self.mark_redraw();
         self.title();
         Ok(())
     }
@@ -806,47 +1118,84 @@ impl App {
         {
             return Ok(());
         }
+        if same_pose(&self.camera, &camera) {
+            return Ok(());
+        }
         self.camera = camera;
         self.reset_film()
     }
     fn orbit(&mut self, delta: PhysicalPosition<f64>) -> Result<()> {
-        if !delta.x.is_finite() || !delta.y.is_finite() {
-            return Ok(());
+        if let Some(camera) = Controller::orbit(&self.camera, delta.x, delta.y) {
+            self.update_camera(camera)?;
         }
-        let offset = self.camera.origin - self.camera.target;
-        let up = self.camera.up.normalize();
-        let yawed = DQuat::from_axis_angle(up, -delta.x * 0.005) * offset;
-        let right = (-yawed.normalize()).cross(up).normalize();
-        let pitched = DQuat::from_axis_angle(right, -delta.y * 0.005) * yawed;
-        let offset = if pitched.normalize().dot(up).abs() < 0.995 {
-            pitched
-        } else {
-            yawed
-        };
-        let mut camera = self.camera.clone();
-        camera.origin = camera.target + offset;
-        self.update_camera(camera)
+        Ok(())
     }
     fn zoom(&mut self, amount: f64) -> Result<()> {
-        if !amount.is_finite() {
-            return Ok(());
+        if let Some(camera) = Controller::zoom(&self.camera, amount) {
+            self.update_camera(camera)?;
         }
-        let offset = self.camera.origin - self.camera.target;
-        let distance = (offset.length() * (-amount).exp().clamp(0.2, 5.0)).clamp(0.1, 1e9);
-        let mut camera = self.camera.clone();
-        camera.origin = camera.target + offset.normalize() * distance;
-        self.update_camera(camera)
+        Ok(())
     }
     fn move_sun(&mut self, elevation_delta: f64, azimuth_delta: f64) -> Result<()> {
-        let dir = self.settings.sun_direction.normalize();
-        let elevation =
-            (dir.y.asin() + elevation_delta).clamp(-89.0_f64.to_radians(), 89.0_f64.to_radians());
-        let azimuth = dir.z.atan2(dir.x) + azimuth_delta;
-        self.settings.sun_direction = glam::DVec3::new(
-            elevation.cos() * azimuth.cos(),
-            elevation.sin(),
-            elevation.cos() * azimuth.sin(),
+        let [elevation, azimuth] = sun_angles(self.settings.sun_direction);
+        self.settings.sun_direction = sun_direction(
+            (elevation + elevation_delta.to_degrees()).clamp(-89.0, 89.0),
+            azimuth + azimuth_delta.to_degrees(),
         );
+        self.reset_film()
+    }
+    fn draw(&mut self) -> Result<()> {
+        let mut model = Controls {
+            camera: self.camera.clone(),
+            transport: self.settings.clone(),
+            target_spp: self.config.spp,
+            paused: self.paused,
+            exposure: self.exposure_ev,
+            speed: self.controller.speed,
+            sky_enabled: self.sky_enabled,
+            local_ground: self.initial_settings.ground.unwrap_or(GroundPlane {
+                height: -1000.0,
+                albedo: glam::DVec3::splat(0.2),
+            }),
+        };
+        let Some(view) = &mut self.view else {
+            return Ok(());
+        };
+        let p = view.progress.as_ref();
+        let progress = Progress {
+            samples: view.renderer.sample_count(),
+            completed_paths: p.map_or(0, |p| p.completed_paths),
+            total_paths: p.map_or(0, |p| p.total_paths),
+            message: self.message.clone(),
+        };
+        let actions = view.redraw(&mut model, &progress, self.reset_pending)?;
+        self.record.environment = view.sky.metadata();
+        self.paused = model.paused;
+        self.exposure_ev = model.exposure;
+        self.controller.speed = model.speed;
+        if actions.physical_changed || actions.target_changed {
+            model.camera.basis()?;
+            model.transport.validate()?;
+            self.camera = model.camera;
+            self.settings = model.transport;
+            self.sky_enabled = model.sky_enabled;
+            self.config.spp = model.target_spp;
+            self.reset_film()?;
+        }
+        if actions.reset {
+            self.restore_initial()?;
+        }
+        if actions.save {
+            self.request_save();
+        }
+        self.title();
+        Ok(())
+    }
+    fn restore_initial(&mut self) -> Result<()> {
+        self.camera = self.initial_camera.clone();
+        self.settings = self.initial_settings.clone();
+        self.sky_enabled = true;
+        self.controller.clear();
         self.reset_film()
     }
     fn request_save(&mut self) {
@@ -893,6 +1242,46 @@ impl App {
         if self.fatal.is_some() {
             return Ok(());
         }
+        if self
+            .preview_job
+            .as_ref()
+            .is_some_and(|job| job.thread.is_finished())
+        {
+            match self.preview_job.take().unwrap().thread.join() {
+                Ok(Ok(path)) => {
+                    self.capture_written = true;
+                    println!(
+                        "Diagnostic UI preview: {} (not a reference)",
+                        path.display()
+                    );
+                }
+                Ok(Err(error)) => return Err(error.into()),
+                Err(payload) => return Err(panic_message(payload).into()),
+            }
+            if self.options.exit_after.is_none() && self.options.smoke_frames.is_none() {
+                self.exiting = true;
+                event_loop.exit();
+                return Ok(());
+            }
+        }
+        let camera_input = self
+            .view
+            .as_ref()
+            .is_some_and(|v| v.focused && v.drawable() && !v.ui.keyboard_captured());
+        if camera_input && self.controller.moving() && now >= self.next_motion {
+            let dt = now.duration_since(self.last_motion).as_secs_f64();
+            self.last_motion = now;
+            self.next_motion = now + FRAME_INTERVAL;
+            if let Some(camera) =
+                self.controller
+                    .advance(&self.camera, dt, self.settings.ground.map(|g| g.height))
+            {
+                self.update_camera(camera)?;
+            }
+        } else if !camera_input || !self.controller.moving() {
+            self.last_motion = now;
+            self.next_motion = now + FRAME_INTERVAL;
+        }
         if let Some(job) = &self.save_job {
             match job.receiver.try_recv() {
                 Ok(Ok((path, n))) => {
@@ -922,6 +1311,29 @@ impl App {
         } else {
             None
         };
+        if let Some(Completion::Preview {
+            bytes,
+            width,
+            height,
+            row_bytes,
+            format,
+            path,
+        }) = &completion
+        {
+            let bytes = bytes.clone();
+            let width = *width;
+            let height = *height;
+            let row_bytes = *row_bytes;
+            let format = *format;
+            let path = path.clone();
+            self.preview_job = Some(PreviewJob {
+                thread: std::thread::spawn(move || {
+                    write_preview_png(&path, &bytes, width, height, row_bytes, format)
+                        .map(|()| path)
+                        .map_err(|error| error.to_string())
+                }),
+            });
+        }
         if let Some(Completion::Snapshot {
             film,
             record,
@@ -947,6 +1359,10 @@ impl App {
         let Some(view) = &mut self.view else {
             return Ok(());
         };
+        if view.ui_repaint_at.is_some_and(|at| now >= at) {
+            view.ui_repaint_at = None;
+            view.needs_redraw = true;
+        }
         if self.options.smoke_frames.is_some_and(|n| view.frames >= n) {
             println!(
                 "Cloud diagnostic completed {} displays / {} bounded work chunks; no reference exported.",
@@ -960,6 +1376,7 @@ impl App {
             if self.reset_pending {
                 view.renderer
                     .reset(&view.device, &view.queue, &self.camera, &self.settings)?;
+                view.renderer.set_target_samples(self.config.spp)?;
                 let (sender, receiver) = mpsc::channel();
                 view.queue.on_submitted_work_done(move || {
                     let _ = sender.send(());
@@ -970,6 +1387,7 @@ impl App {
                 });
                 view.batch_active = false;
                 view.progress = None;
+                view.sky_dirty = true;
                 view.needs_redraw = true;
                 view.next_work = now + MIN_WORK_REST;
                 self.reset_pending = false;
@@ -989,6 +1407,7 @@ impl App {
                 record.camera = self.camera.clone();
                 record.transport = self.settings.clone();
                 record.render = self.config.clone();
+                record.environment = view.sky.metadata();
                 view.snapshot(record, self.exposure_ev)?;
                 self.save_requested = false;
             } else if view.needs_redraw && view.drawable() && now >= view.next_frame {
@@ -998,6 +1417,7 @@ impl App {
                 }
             } else if view.drawable()
                 && view.focused
+                && !view.sky_dirty
                 && (!self.paused || self.save_requested)
                 && view.renderer.sample_count() < view.renderer.target_samples()
                 && now >= view.next_work
@@ -1023,8 +1443,23 @@ impl App {
         if self.save_job.is_some() {
             add(now + POLL_INTERVAL);
         }
+        if self.preview_job.is_some() {
+            add(now + POLL_INTERVAL);
+        }
         if self.fatal.is_none() {
             if let Some(view) = &self.view {
+                if view.drawable()
+                    && view.focused
+                    && self.controller.moving()
+                    && !view.ui.keyboard_captured()
+                {
+                    add(self.next_motion);
+                }
+                if view.drawable() && !view.redraw_requested {
+                    if let Some(at) = view.ui_repaint_at {
+                        add(at.max(view.next_frame));
+                    }
+                }
                 if view.pending.is_some() {
                     add(view.next_poll);
                 } else {
@@ -1033,6 +1468,7 @@ impl App {
                     }
                     if view.drawable()
                         && view.focused
+                        && !view.sky_dirty
                         && !view.redraw_requested
                         && (!self.paused || self.save_requested)
                         && view.renderer.sample_count() < view.renderer.target_samples()
@@ -1058,6 +1494,30 @@ impl App {
         event_loop: &ActiveEventLoop,
         event: WindowEvent,
     ) -> Result<()> {
+        let consumed = if !self.exiting && self.fatal.is_none() {
+            if let Some(view) = &mut self.view {
+                let response = view.ui.on_event(&view.window, &event);
+                if response.repaint {
+                    view.needs_redraw = true;
+                }
+                response.consumed
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let keyboard_captured = self.view.as_ref().is_some_and(|v| v.ui.keyboard_captured());
+        let pointer_ok = !consumed
+            && self.view.as_ref().is_some_and(|v| {
+                !v.ui.pointer_captured()
+                    && self
+                        .cursor
+                        .is_some_and(|p| v.ui.pointer_in_viewport(p, v.window.scale_factor()))
+            });
+        if keyboard_captured {
+            self.controller.clear();
+        }
         match event {
             WindowEvent::CloseRequested => {
                 self.exiting = true;
@@ -1068,15 +1528,10 @@ impl App {
                     && event.physical_key == PhysicalKey::Code(KeyCode::Escape) =>
             {
                 self.exiting = true;
-                event_loop.exit()
+                event_loop.exit();
             }
             _ if self.fatal.is_some() || self.exiting => {}
-            WindowEvent::RedrawRequested => {
-                if let Some(view) = &mut self.view {
-                    view.redraw(self.exposure_ev)?;
-                }
-                self.title();
-            }
+            WindowEvent::RedrawRequested => self.draw()?,
             WindowEvent::Resized(size) => {
                 if let Some(view) = &mut self.view {
                     view.resize(size);
@@ -1089,6 +1544,9 @@ impl App {
                         view.needs_redraw = true;
                     }
                 }
+                if occluded {
+                    self.controller.clear();
+                }
             }
             WindowEvent::Focused(focused) => {
                 if let Some(view) = &mut self.view {
@@ -1099,62 +1557,113 @@ impl App {
                 }
                 if !focused {
                     self.dragging = false;
+                    self.looking = false;
+                    self.control_pressed = false;
                     self.cursor = None;
+                    self.controller.clear();
                 }
                 self.title();
             }
-            WindowEvent::MouseInput {
-                state,
-                button: MouseButton::Left,
-                ..
-            } => self.dragging = state == ElementState::Pressed,
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.control_pressed = modifiers.state().control_key();
+                self.controller.set_key(
+                    MoveKey::Fast,
+                    modifiers.state().shift_key() && !keyboard_captured,
+                );
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                let pressed = state == ElementState::Pressed && pointer_ok;
+                if pressed {
+                    if let Some(view) = &self.view {
+                        view.ui.release_keyboard_focus();
+                    }
+                }
+                if button == MouseButton::Left {
+                    self.dragging = pressed;
+                }
+                if button == MouseButton::Right {
+                    self.looking = pressed;
+                }
+            }
             WindowEvent::CursorMoved { position, .. } => {
-                if self.dragging {
+                let inside = self.view.as_ref().is_some_and(|v| {
+                    !v.ui.pointer_captured()
+                        && v.ui.pointer_in_viewport(position, v.window.scale_factor())
+                });
+                if !consumed && inside {
                     if let Some(old) = self.cursor {
-                        self.orbit(PhysicalPosition::new(
-                            position.x - old.x,
-                            position.y - old.y,
-                        ))?;
+                        let delta = PhysicalPosition::new(position.x - old.x, position.y - old.y);
+                        if self.looking {
+                            if let Some(camera) = Controller::look(&self.camera, delta.x, delta.y) {
+                                self.update_camera(camera)?;
+                            }
+                        } else if self.dragging {
+                            self.orbit(delta)?;
+                        }
                     }
                 }
                 self.cursor = Some(position);
             }
             WindowEvent::CursorLeft { .. } => {
                 self.dragging = false;
+                self.looking = false;
                 self.cursor = None;
             }
-            WindowEvent::MouseWheel { delta, .. } => {
+            WindowEvent::MouseWheel { delta, .. } if pointer_ok => {
                 let amount = match delta {
                     MouseScrollDelta::LineDelta(_, y) => f64::from(y) * 0.1,
                     MouseScrollDelta::PixelDelta(p) => p.y * 0.002,
                 };
                 self.zoom(amount)?;
             }
-            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+            WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(key) = event.physical_key {
-                    match key {
-                        KeyCode::Space if !event.repeat => self.paused = !self.paused,
-                        KeyCode::KeyR if !event.repeat => {
-                            self.camera = self.initial_camera.clone();
-                            self.settings = self.initial_settings.clone();
-                            self.reset_film()?;
-                        }
-                        KeyCode::BracketLeft => {
-                            self.exposure_ev = (self.exposure_ev - 0.25).max(-30.0);
+                    if key == KeyCode::KeyS && self.control_pressed {
+                        self.controller.set_key(MoveKey::Backward, false);
+                        if event.state == ElementState::Pressed
+                            && !event.repeat
+                            && !consumed
+                            && !keyboard_captured
+                        {
+                            self.request_save();
                             self.mark_redraw();
                         }
-                        KeyCode::BracketRight => {
-                            self.exposure_ev = (self.exposure_ev + 0.25).min(30.0);
-                            self.mark_redraw();
-                        }
-                        KeyCode::KeyI => self.move_sun(2.0_f64.to_radians(), 0.0)?,
-                        KeyCode::KeyK => self.move_sun(-2.0_f64.to_radians(), 0.0)?,
-                        KeyCode::KeyJ => self.move_sun(0.0, -2.0_f64.to_radians())?,
-                        KeyCode::KeyL => self.move_sun(0.0, 2.0_f64.to_radians())?,
-                        KeyCode::KeyS if !event.repeat => self.request_save(),
-                        _ => {}
+                        return Ok(());
                     }
-                    self.title();
+                    if let Some(movement) = move_key(key) {
+                        if event.state == ElementState::Released {
+                            self.controller.set_key(movement, false);
+                        } else if !consumed && !keyboard_captured {
+                            if !self.controller.moving() {
+                                self.last_motion = Instant::now();
+                                self.next_motion = self.last_motion;
+                            }
+                            self.controller.set_key(movement, true);
+                        }
+                    }
+                    if event.state == ElementState::Pressed && !consumed && !keyboard_captured {
+                        match key {
+                            KeyCode::Space if !event.repeat => {
+                                self.paused = !self.paused;
+                                self.mark_redraw();
+                            }
+                            KeyCode::KeyR if !event.repeat => self.restore_initial()?,
+                            KeyCode::BracketLeft => {
+                                self.exposure_ev = (self.exposure_ev - 0.25).max(-30.0);
+                                self.mark_redraw();
+                            }
+                            KeyCode::BracketRight => {
+                                self.exposure_ev = (self.exposure_ev + 0.25).min(30.0);
+                                self.mark_redraw();
+                            }
+                            KeyCode::KeyI => self.move_sun(2.0_f64.to_radians(), 0.0)?,
+                            KeyCode::KeyK => self.move_sun(-2.0_f64.to_radians(), 0.0)?,
+                            KeyCode::KeyJ => self.move_sun(0.0, -2.0_f64.to_radians())?,
+                            KeyCode::KeyL => self.move_sun(0.0, 2.0_f64.to_radians())?,
+                            _ => {}
+                        }
+                        self.title();
+                    }
                 }
             }
             _ => {}
@@ -1173,8 +1682,8 @@ impl ApplicationHandler for App {
                     Window::default_attributes()
                         .with_title("Cloud viewer | initializing")
                         .with_inner_size(LogicalSize::new(
-                            app.config.width.max(640),
-                            app.config.height.max(360),
+                            app.config.width.max(960),
+                            app.config.height.max(540),
                         )),
                 )?,
             );
@@ -1186,6 +1695,7 @@ impl ApplicationHandler for App {
                 &app.camera,
                 &app.settings,
                 &app.config,
+                app.options.capture_preview.clone(),
             ))?);
             app.record.adapter = app.view.as_ref().map(|view| view.adapter_name.clone());
             app.title();
@@ -1207,10 +1717,87 @@ impl ApplicationHandler for App {
         self.wait_control_flow(event_loop);
     }
 }
+fn move_key(key: KeyCode) -> Option<MoveKey> {
+    match key {
+        KeyCode::KeyW => Some(MoveKey::Forward),
+        KeyCode::KeyS => Some(MoveKey::Backward),
+        KeyCode::KeyA => Some(MoveKey::Left),
+        KeyCode::KeyD => Some(MoveKey::Right),
+        KeyCode::KeyQ => Some(MoveKey::Down),
+        KeyCode::KeyE => Some(MoveKey::Up),
+        _ => None,
+    }
+}
 fn unix_nanos() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos())
+}
+fn write_preview_png(
+    path: &std::path::Path,
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+    row_bytes: u32,
+    format: wgpu::TextureFormat,
+) -> Result<()> {
+    if path.exists() {
+        return Err("diagnostic preview path already exists".into());
+    }
+    let rgba = preview_rgba(bytes, width, height, row_bytes, format)?;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    image::codecs::png::PngEncoder::new(file).write_image(
+        &rgba,
+        width,
+        height,
+        image::ExtendedColorType::Rgba8,
+    )?;
+    Ok(())
+}
+fn preview_rgba(
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+    row_bytes: u32,
+    format: wgpu::TextureFormat,
+) -> Result<Vec<u8>> {
+    let packed_row = width.checked_mul(4).ok_or("preview width overflow")?;
+    if width == 0
+        || height == 0
+        || row_bytes < packed_row
+        || u64::from(row_bytes) * u64::from(height) != bytes.len() as u64
+    {
+        return Err("diagnostic preview readback size mismatch".into());
+    }
+    let bgra = matches!(
+        format,
+        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+    );
+    if !bgra
+        && !matches!(
+            format,
+            wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb
+        )
+    {
+        return Err("unsupported preview surface format".into());
+    }
+    let mut rgba = Vec::with_capacity(packed_row as usize * height as usize);
+    for row in bytes.chunks_exact(row_bytes as usize) {
+        for pixel in row[..packed_row as usize].chunks_exact(4) {
+            if bgra {
+                rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+            } else {
+                rgba.extend_from_slice(pixel);
+            }
+        }
+    }
+    Ok(rgba)
 }
 fn write_error_log(error: &str, record: &Record) -> PathBuf {
     let path = PathBuf::from(format!("out/cloud-demo-view-error-{}.log", unix_nanos()));
@@ -1235,11 +1822,63 @@ fn panic_message(payload: Box<dyn Any + Send>) -> String {
 mod tests {
     use super::*;
     #[test]
+    fn diagnostic_preview_unpads_rows_and_preserves_rgba_colors() {
+        let mut bytes = vec![99; 512];
+        bytes[..8].copy_from_slice(&[3, 2, 1, 255, 6, 5, 4, 255]);
+        bytes[256..264].copy_from_slice(&[9, 8, 7, 255, 12, 11, 10, 255]);
+        let rgba = preview_rgba(&bytes, 2, 2, 256, wgpu::TextureFormat::Bgra8UnormSrgb).unwrap();
+        assert_eq!(
+            rgba,
+            vec![1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255]
+        );
+        assert_eq!(
+            preview_rgba(&rgba, 2, 2, 8, wgpu::TextureFormat::Rgba8UnormSrgb).unwrap(),
+            rgba
+        );
+        assert!(preview_rgba(&bytes, 2, 2, 4, wgpu::TextureFormat::Bgra8UnormSrgb).is_err());
+        assert!(
+            preview_rgba(
+                &bytes[..511],
+                2,
+                2,
+                256,
+                wgpu::TextureFormat::Bgra8UnormSrgb
+            )
+            .is_err()
+        );
+        assert!(preview_rgba(&bytes, 2, 2, 256, wgpu::TextureFormat::Rgba16Float).is_err());
+        let path = std::env::temp_dir().join(format!("cloud-ui-preview-cpu-{}.png", unix_nanos()));
+        write_preview_png(
+            &path,
+            &bytes,
+            2,
+            2,
+            256,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+        )
+        .unwrap();
+        let decoded = image::open(&path).unwrap().to_rgba8();
+        assert_eq!(decoded.dimensions(), (2, 2));
+        assert_eq!(decoded.into_raw(), rgba);
+        assert!(
+            write_preview_png(
+                &path,
+                &bytes,
+                2,
+                2,
+                256,
+                wgpu::TextureFormat::Bgra8UnormSrgb
+            )
+            .is_err()
+        );
+        fs::remove_file(path).unwrap();
+    }
+    #[test]
     fn idle_gap_is_positive_and_scales_with_observed_work() {
-        assert_eq!(work_rest(Duration::ZERO), Duration::from_millis(16));
+        assert_eq!(work_rest(Duration::ZERO), Duration::from_millis(1));
         assert_eq!(
             work_rest(Duration::from_millis(1)),
-            Duration::from_millis(16)
+            Duration::from_millis(3)
         );
         assert_eq!(
             work_rest(Duration::from_millis(10)),
@@ -1256,14 +1895,16 @@ mod tests {
         assert!(
             ViewOptions {
                 exit_after: Some(Duration::from_secs(1)),
-                smoke_frames: None
+                smoke_frames: None,
+                capture_preview: None,
             }
             .diagnostic()
         );
         assert!(
             ViewOptions {
                 exit_after: None,
-                smoke_frames: Some(2)
+                smoke_frames: Some(2),
+                capture_preview: None,
             }
             .diagnostic()
         );

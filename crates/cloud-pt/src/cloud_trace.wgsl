@@ -8,7 +8,7 @@ struct Params {
     camera_right: vec4<f32>,
     camera_up: vec4<f32>,
     camera_forward: vec4<f32>,
-    index_min: vec4<f32>,
+    index_min: vec4<f32>, // w: safe coprime pixel permutation stride for preview
     index_max: vec4<f32>,
     transform: vec4<f32>, // translation xyz, positive uniform scale
     optics: vec4<f32>, // extinction scale, density majorant, HG g, ground y
@@ -34,6 +34,8 @@ struct Diagnostics {
 @group(0) @binding(5) var<storage, read_write> film_m2: array<vec4<f32>>;
 @group(0) @binding(6) var<storage, read_write> diagnostics: Diagnostics;
 @group(0) @binding(7) var<storage, read> cell_majorant_hash: array<vec4<u32>>;
+@group(0) @binding(9) var environment: texture_2d<f32>;
+@group(0) @binding(10) var sunlight: texture_2d<f32>;
 
 // Private state belongs to one invocation and is only used for diagnostics.
 var<private> current_sample_index: u32;
@@ -47,6 +49,7 @@ const ERROR_STAGNATION: u32 = 4u;
 const ERROR_WATCHDOG: u32 = 8u;
 const ERROR_PRECISION: u32 = 16u;
 const ERROR_LOOKUP: u32 = 32u;
+const ERROR_ENVIRONMENT: u32 = 64u;
 // Static volume/camera transforms retain the host's 2^18 budget. Paired-float
 // slab arithmetic permits continuation/ground origins up to 2^40 voxel scales.
 const MAX_RAY_INDEX_MAGNITUDE: f32 = 1099511627776.0;
@@ -532,6 +535,43 @@ fn resume_path_tracking(state: ptr<function, PathState>, pixel: u32) {
     (*state).rng = rng;
     (*state).events = events;
 }
+fn valid_boundary_rgb(value: vec3<f32>) -> bool {
+    return finite3(value) && all(value >= vec3<f32>(0.0));
+}
+fn boundary_radiance(direction: vec3<f32>, pixel: u32) -> vec3<f32> {
+    if (p.storage.w & 8u) == 0u { return p.sky_radiance.xyz; }
+    let size = vec2<i32>(textureDimensions(environment));
+    var phi = atan2(direction.x, direction.z);
+    if phi < 0.0 { phi += 2.0 * PI; }
+    let uv = vec2<f32>(phi / (2.0 * PI), acos(clamp(direction.y, -1.0, 1.0)) / PI);
+    let xy = uv * vec2<f32>(size) - vec2<f32>(0.5);
+    let base = vec2<i32>(floor(xy));
+    let f = fract(xy);
+    let x0 = ((base.x % size.x) + size.x) % size.x;
+    let x1 = (x0 + 1) % size.x;
+    let y0 = clamp(base.y, 0, size.y - 1);
+    let y1 = clamp(base.y + 1, 0, size.y - 1);
+    let a = textureLoad(environment, vec2<i32>(x0, y0), 0).xyz;
+    let b = textureLoad(environment, vec2<i32>(x1, y0), 0).xyz;
+    let c = textureLoad(environment, vec2<i32>(x0, y1), 0).xyz;
+    let d = textureLoad(environment, vec2<i32>(x1, y1), 0).xyz;
+    if !valid_boundary_rgb(a) || !valid_boundary_rgb(b) || !valid_boundary_rgb(c) || !valid_boundary_rgb(d) {
+        fail(ERROR_ENVIRONMENT, pixel); return vec3<f32>(0.0);
+    }
+    // Manual interpolation works with unfilterable RGBA32Float textures.
+    // Difference-form interpolation preserves a constant boundary exactly.
+    let row0 = a + (b - a) * f.x;
+    let row1 = c + (d - c) * f.x;
+    return row0 + (row1 - row0) * f.y;
+}
+fn direct_sun_irradiance(pixel: u32) -> vec3<f32> {
+    if (p.storage.w & 8u) == 0u { return p.sun_irradiance.xyz; }
+    let value = textureLoad(sunlight, vec2<i32>(0), 0).xyz;
+    if !valid_boundary_rgb(value) {
+        fail(ERROR_ENVIRONMENT, pixel); return vec3<f32>(0.0);
+    }
+    return value;
+}
 fn path_step(state: ptr<function, PathState>, pixel: u32) {
     if (*state).stage == PATH_INIT {
         var rng = mix_bits(p.control.x ^ mix_bits(p.control.y) ^ mix_bits(pixel) ^ mix_bits(current_sample_index + 0x9e3779b9u));
@@ -579,16 +619,17 @@ fn path_step(state: ptr<function, PathState>, pixel: u32) {
             (*state).vertex_kind = 0u;
             direct = max(0.0, p.sun_direction.y) / PI;
         } else {
-            (*state).radiance += (*state).beta * p.sky_radiance.xyz;
+            (*state).radiance += (*state).beta * boundary_radiance((*state).direction, pixel);
             if !finite3((*state).radiance) { fail(ERROR_NONFINITE, pixel); return; }
             (*state).stage = PATH_DONE; return;
         }
         if all((*state).beta == vec3<f32>(0.0)) { (*state).stage = PATH_DONE; return; }
         // Preserve the original RNG schedule even if a tiny positive cosine
         // makes cosine/PI round to zero in f32.
-        if any(p.sun_irradiance.xyz > vec3<f32>(0.0))
+        let sun = direct_sun_irradiance(pixel);
+        if any(sun > vec3<f32>(0.0))
             && ((*state).vertex_kind == 1u || p.sun_direction.y > 0.0) {
-            (*state).nee = (*state).beta * p.sun_irradiance.xyz * direct;
+            (*state).nee = (*state).beta * sun * direct;
             (*state).tracking = begin_tracking(Ray((*state).vertex, p.sun_direction.xyz), MAX_FLOAT, 1u, pixel);
             (*state).stage = PATH_SHADOW;
         } else { (*state).stage = PATH_SCATTER; }
@@ -622,22 +663,30 @@ fn path_step(state: ptr<function, PathState>, pixel: u32) {
 fn trace_work(@builtin(global_invocation_id) id: vec3<u32>) {
     let slots = p.batch.x * p.batch.z;
     if id.x >= slots || atomicLoad(&diagnostics.flags) != 0u { return; }
-    let pixel = p.batch.y + id.x % p.batch.z;
+    let preview = (p.storage.w & 16u) != 0u;
+    let path_slot = p.batch.y + id.x;
+    var pixel = p.batch.y + id.x % p.batch.z;
+    if preview { pixel = (path_slot * u32(p.index_min.w)) % (p.image.x * p.image.y); }
     current_pixel_index = pixel;
     current_sample_index = p.image.z + id.x / p.batch.z;
-    var state = path_states[id.x];
+    let path_index = select(id.x, path_slot, preview);
+    var state = path_states[path_index];
+    let already_done = state.stage == PATH_DONE;
     // Fixed finite work. A long legal path remains pending, never truncated.
     for (var transition = 0u; transition < p.batch.w; transition += 1u) {
         if state.stage == PATH_DONE || atomicLoad(&diagnostics.flags) != 0u { break; }
         path_step(&state, pixel);
     }
-    path_states[id.x] = state;
-    if state.stage == PATH_DONE { atomicAdd(&diagnostics.completed, 1u); }
+    path_states[path_index] = state;
+    if state.stage == PATH_DONE && (!preview || !already_done) { atomicAdd(&diagnostics.completed, 1u); }
 }
 @compute @workgroup_size(64, 1, 1)
 fn reduce_work(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= p.batch.z || atomicLoad(&diagnostics.flags) != 0u { return; }
-    let pixel = p.batch.y + id.x;
+    let preview = (p.storage.w & 16u) != 0u;
+    let path_slot = p.batch.y + id.x;
+    var pixel = path_slot;
+    if preview { pixel = (path_slot * u32(p.index_min.w)) % (p.image.x * p.image.y); }
     // Display completed pixels promptly, without waiting for another pixel's
     // long path. The persisted count deduplicates samples across dispatches.
     // A later finished sample waits for every preceding sample of this pixel.
@@ -645,7 +694,8 @@ fn reduce_work(@builtin(global_invocation_id) id: vec3<u32>) {
     if count < p.image.z || count > p.image.z + p.batch.x { fail(ERROR_NONFINITE, pixel); return; }
     for (var z = count - p.image.z; z < p.batch.x; z += 1u) {
         current_sample_index = p.image.z + z;
-        let sample = path_states[z * p.batch.z + id.x];
+        let path_index = select(z * p.batch.z + id.x, path_slot, preview);
+        let sample = path_states[path_index];
         if sample.stage != PATH_DONE { break; }
         let previous_mean = film_mean[pixel].xyz;
         let delta = sample.radiance - previous_mean;
