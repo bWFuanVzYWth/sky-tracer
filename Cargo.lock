@@ -247,6 +247,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "blosc-src"
+version = "0.3.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9046dd58971db0226346fde214143d16a6eb12f535b5320d0ea94fcea420631"
+dependencies = [
+ "cc",
+ "lz4-sys",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -406,6 +416,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bde03770d3df201d4fb868f2c9c59e66a3e4e2bd06692a0fe701e7103c7e84d4"
 dependencies = [
  "error-code",
+]
+
+[[package]]
+name = "cloud-demo"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "clap",
+ "cloud-pt",
+ "exr",
+ "glam",
+ "image",
+ "pollster",
+ "serde",
+ "serde_json",
+ "wgpu",
+ "winit",
+]
+
+[[package]]
+name = "cloud-pt"
+version = "0.1.0"
+dependencies = [
+ "blosc-src",
+ "bytemuck",
+ "flate2",
+ "glam",
+ "half",
+ "naga",
+ "serde",
+ "wgpu",
 ]
 
 [[package]]
@@ -920,6 +961,9 @@ name = "glam"
 version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fb167719045debebe9f532320accc7b5c993c5a3b813f5696a11d5ca7bdc57b"
+dependencies = [
+ "serde_core",
+]
 
 [[package]]
 name = "glifo"
@@ -1416,6 +1460,16 @@ name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
+
+[[package]]
+name = "lz4-sys"
+version = "1.11.1+lz4-1.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6bd8c0d6c6ed0cd30b3652886bb8711dc4bb01d637a68105a3d5158039b418e6"
+dependencies = [
+ "cc",
+ "libc",
+]
 
 [[package]]
 name = "memchr"
@@ -2428,6 +2482,7 @@ dependencies = [
  "clap",
  "glam",
  "pollster",
+ "serde",
  "serde_json",
  "sky-realtime",
  "sky-reference",

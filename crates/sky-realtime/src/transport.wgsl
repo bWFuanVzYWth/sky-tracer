@@ -82,7 +82,7 @@ fn integrate_at(ray:vec3<f32>,sun:vec3<f32>,initial_height:f32,segment:f32,steps
     let cosine=clamp(nu,-1.0,1.0);let stencil=phase_stencil(cosine);
     solar_phase[0]=vec4<f32>(3.0*(1.0+cosine*cosine)/(16.0*PI));
     for(var k=0u;k<4u;k++){solar_phase[k+1u]=tabulated_phase(stencil,k);}
-    var previous=0.0;
+    var previous=0.0;var cached_phase=0.0;var phase_cached=false;
     for(var i=1u;i<=count;i++) {
         var edge=length*f32(i)/f32(count);
         if before+after>=1e-5&&i<count {
@@ -101,7 +101,15 @@ fn integrate_at(ray:vec3<f32>,sun:vec3<f32>,initial_height:f32,segment:f32,steps
             direct*=sun_t(hp,dot(local_up,sun));direct*=p.solar;
         var source=direct;
         // The first iteration has an exactly zero previous volume source.
-        if p.solve.w!=1u{source+=indirect(hp,dot(local_up,ray),dot(local_up,sun),nu,c);}
+        if p.solve.w!=1u{
+            // Parallel sunlight and a straight ray keep dot(ray,sun) constant.
+            // Only the radial-frame cosines change along the spherical path.
+            // Compute lazily: pure Rayleigh paths never need this coordinate.
+            if CACHE_PHASE_COORDINATE&&!phase_cached&&hp<35.0&&(p.size_steps.w&1u)!=0u{
+                cached_phase=phase_coord(nu);phase_cached=true;
+            }
+            source+=indirect(hp,dot(local_up,ray),dot(local_up,sun),nu,cached_phase,c);
+        }
         let tau=c.extinction*dt;let trans=exp(-tau);
         let integral=select((vec4<f32>(1.0)-trans)/max(c.extinction,vec4<f32>(1e-30)),dt*(vec4<f32>(1.0)-tau*0.5+tau*tau/6.0),tau<vec4<f32>(0.001));
         result.light+=result.transmittance*source*integral;result.transmittance*=trans;

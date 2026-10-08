@@ -47,6 +47,37 @@ python scripts/compare_images.py out/baseline out/check-sky --queries experiment
 
 该工具要求两边文件齐全，检查有限值，分别统计 source / sky。报告逐图 P95/P99/最大差，并保留是否逐位一致。它不运行 GPU，也不把较密解自动标为真值。
 
+同轮比较优化前后的求解成本和不同缓存失效事件，不含设备/管线创建和回读；输出文件必须尚不存在：
+
+```powershell
+target/release/sky-audit.exe benchmark --configs crates/sky-realtime/configs/convolution_baseline.json crates/sky-realtime/configs/balanced.json --startup-repeats 6 --runtime-rounds 3 --warmup-frames 4 --frames 64 --out out/realtime-cost.json
+```
+
+startup 保存各阶段 GPU 时间与整个 rebuild 墙钟；runtime 分别测逐像素积分、太阳变化、海拔变化、仅相机变化和相同输入缓存复用。runtime 的 GPU 区间只包含核心 compute，不含 demo 的显示 pass。输入不变时没有 dispatch，计时值仅是 timestamp 标记开销，不能报告成一次实际天空计算。
+
+固定大气、连续移动太阳的完整 1080p 纯天空成本使用 `profile`；默认包含 SkyView、投影、太阳盘和原有显示 shader。CPU 坐标构造及含编码/提交/等待的整帧墙钟另列，诊断回读在计时外；不含 UI 与 vsync。逐个运行，避免 GPU 竞争：
+
+```powershell
+target/release/sky-audit.exe profile --steps 96 --out out/sky1080-baseline
+# 未指定 --steps 时，与 demo 一样使用 64 步默认。
+target/release/sky-audit.exe profile --out out/sky1080-default
+# 14 个真正 1080p 的敏感姿态；中点 capture 采用与开发验收相同曝光。
+target/release/sky-audit.exe profile --trajectories experiments/validation/moving_sun_1080_anchors.json --frames 3 --warmup-frames 1 --rounds 1 --quality-frames 1 --out out/sky1080-anchors
+```
+
+`inputs.json` 保存配置、代码/shader 指纹、实际步数、相机、曝光和适配器；`profile.json` 保存 GPU 分阶段、CPU 时间和逐帧样本。线性与实际 SDR capture 由独立的非计时重放生成。默认性能轨迹相机全为纯天空；`moving_sun_sensitive.json` 另覆盖暮光、地影和 108/400 km 薄边缘。14 个敏感姿态包含从连续序列中发现的最坏帧，属于开发回归而非盲测。
+
+连续误差验收可在 CPU 生成冻结配置与 8×65 查询，然后显式对照旧 96 步与新 64 步：
+
+```powershell
+python apps/sky-optimizer/prepare_moving_sun_candidates.py --out out/sky-motion-plan
+target/release/sky-audit.exe evaluate --config out/sky-motion-plan/baseline_config.json --steps 96 --queries out/sky-motion-plan/queries_temporal.json --out out/sky-motion-baseline
+target/release/sky-audit.exe evaluate --config out/sky-motion-plan/baseline_config.json --steps 64 --queries out/sky-motion-plan/queries_temporal.json --out out/sky-motion-default
+python apps/sky-optimizer/compare_sky_sequences_cpu.py out/sky-motion-baseline out/sky-motion-default --queries out/sky-motion-plan/queries_temporal.json --out out/sky-motion-difference
+```
+
+比较工具同时报告静态相对差、候选减基线的一阶/二阶时间残差、相邻行残差及最坏帧热图。时间残差先扣除基线本身的自然变化，不能把太阳移动造成的明暗变化全归咎于候选。线性图以每轨迹固定亮度 floor 区分亮天空和近真空；数值尾部需要结合固定曝光、原尺寸显示图审查。工具也支持两组相同 `profile` capture，额外比较实际 SDR 色阶，省略 `--queries` 即可。
+
 ## 烘焙与参考查询
 
 ```powershell
@@ -105,6 +136,40 @@ python apps/sky-optimizer/main.py preview out/fit-counts --out out/fit-gallery -
 `counts --base out/fit-eight` 可加入八波长搜索结果作比较。输出候选 JSON、全部可行三/四节点组合的损失/权重、验证指标和图集。候选通过独立图像与运行时检查后，才把所选参数显式纳入实时核心自己的配置；工具不会自动覆盖默认波长。
 
 所有输出命令应使用新的目录。参考的 `--resume` 是检查过模型、配置和校验和的专用恢复路径，不能用来混合不同实验。
+
+v7 教师的波长重新拟合保留原有训练/验证点，先把不参与拟合的视觉图缩小以控制 CPU 工作量，再穷举 10,660 个三波长和 101,270 个四波长组合。四波长仍选当前节点，权重变化不足 0.001%，所以保持已验证的默认权重。没有把更密实时解当作物理真值。
+
+## 从现有教师拟合 SkyView 坐标
+
+重新分配节点先隔离插值误差。`export_sky_mapping_cpu` 只在 CPU 查询已有教师，无设备、无重烘焙、无重复单散射积分。184 条密集高度/太阳/方位曲线约 80 万点，完整 41 波段 RGB 导出本机耗时 35.47 s；四波段代理可先研究，但正式拟合采用完整光谱。训练与留出按物理海拔/太阳姿态划分，同一姿态的方位不跨划分。
+
+```powershell
+python apps/sky-optimizer/fit_sky_coordinates_cpu.py prepare --out out/sky-coordinates-queries
+cargo run --release -p sky-audit --example export_sky_mapping_cpu -- --source out/teacher_reference_safetensors_v7 --queries out/sky-coordinates-queries/queries.json --out out/sky-coordinates-teacher --threads 8 --full-spectrum
+python apps/sky-optimizer/fit_sky_coordinates_cpu.py fit --dataset out/sky-coordinates-teacher --sizes 256 224 --sky-only --seed 20261008 --iterations 320 --out out/sky-coordinates-fit
+```
+
+只调整现有 `low/upper/space` 的四个权重和三个宽度，保留 softsign CDF 公式、地面映射及源场坐标。天空/地面端点分别从各自边界一侧查询；大气外的数学外切点设为精确真空，最后一个 cell 与 shader 的弦长外推一致。报告明确区分近真空的绝对误差 floor 与亮天空相对差；它只评价固定方位上的垂直插值，不能替代真实四波长积分、水平插值与显示质量检查。
+
+候选不用覆盖生产 JSON。`evaluate/profile/benchmark --mapping CANDIDATE.json` 在任何映射初始化前加载、验证并冻结整份校准；同一进程内不可切换，避免已有 GPU 场和 CPU/GPU 坐标不一致。输出记录实际校准内容。完整天空成本、静态回归与独立运动轨迹分开执行，GPU 不并行：
+
+```powershell
+python apps/sky-optimizer/audit_sky_mapping_gpu.py --phase static --candidate-dir out/sky-coordinates-fit --out out/sky-coordinates-static
+python apps/sky-optimizer/audit_sky_mapping_gpu.py --phase cost --candidate-dir out/sky-coordinates-fit --out out/sky-coordinates-cost
+# 只对完成静态选择的候选使用这组独立轨迹；它不参加拟合或挑选参数。
+python apps/sky-optimizer/audit_sky_mapping_gpu.py --phase motion --candidate 256 --candidate-dir out/sky-coordinates-fit --out out/sky-coordinates-motion
+```
+
+运动留出见 `moving_sun_holdout.json`。每个 GPU 子进程完成后才启动下一个；失败或超时会停整批。旧数值点只有稀疏的方向线，不能直接认证 256²→224² 的细节。实际 GPU 比较还要求 source/optical 载荷不变，检查整幅 HDR、实际 SDR、相邻行和时间残差。
+
+runner 默认使用 `experiments/validation/sky_mapping_candidates_v7/` 中冻结的旧映射、配置、波长和候选；`--candidate-dir` 则审查上面的新拟合产物。43 个标准与 22 个额外查询已版本化，冷复现不需要先前的 `out` 回归目录。`--baseline-mapping/--config/--wavelengths` 可以显式替换实验输入，输出记录实际输入。不要在生产默认变更后把新默认当成旧基线。
+
+```powershell
+python apps/sky-optimizer/analyze_sky_mapping_cpu.py --static out/sky-coordinates-static --cost out/sky-coordinates-cost --out out/sky-coordinates-report
+python apps/sky-optimizer/compare_sky_sequences_cpu.py out/sky-coordinates-motion/baseline_holdout out/sky-coordinates-motion/256_holdout --allow-sky-mapping-change --out out/sky-coordinates-motion-diff
+```
+
+多散射源需要单独处理。沿一条观察射线的 `total−single−boundary` 不是局部源；完整教师的方向辐亮度与已知局部散射系数/相函数可以通过角向卷积恢复该源，再得到归一化源、均值与高空矩。也可以恢复当前实时场的完整导出和 CPU 采样器，做网格误差诊断。本轮先优化更新频率高的 SkyView，保留源场的高度/太阳/相位/绕轴坐标；没有把终端辐亮度差伪装成源场数据。
 
 ## 产物约定
 

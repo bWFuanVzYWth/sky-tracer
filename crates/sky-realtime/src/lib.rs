@@ -4,6 +4,8 @@
 //! cached in an observer SkyView, with a separate perspective projection.
 use bytemuck::{Pod, Zeroable};
 use serde::{Deserialize, Serialize};
+/// Default observer/SkyView integration budget; startup uses Config::ray_steps.
+pub const DEFAULT_RUNTIME_STEPS: u32 = 64;
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct View {
@@ -13,6 +15,25 @@ pub struct View {
     pub sun_azimuth_deg: f32,
     pub sun_elevation_deg: f32,
     pub altitude_km: f32,
+}
+
+/// Optional diagnostic timestamps for the actual cached rendering path.
+/// Each beginning index reserves two adjacent queries (beginning and end).
+#[derive(Clone, Copy)]
+pub struct FrameTimestamps<'a> {
+    pub query_set: &'a wgpu::QuerySet,
+    pub sky_view_begin: u32,
+    pub projection_begin: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct FrameProfile {
+    pub sky_updated: bool,
+    pub projected: bool,
+    /// CPU inverse-coordinate construction only, excluding uploads/encoding.
+    pub observer_mapping_cpu_ms: f64,
+    /// Observer coordinate construction and queue writes for the SkyView update.
+    pub observer_update_cpu_ms: f64,
 }
 
 use crate::{geometry::unit, model::Model};
@@ -65,6 +86,14 @@ pub struct Config {
     pub high_sun_weight: f32,
     /// Zero retains the full-height scratch layout for equivalence diagnostics.
     pub batch_heights: u32,
+    /// Skip convolution work for species with exactly zero source coefficients.
+    /// Active species retain their original sample and accumulation order.
+    pub skip_inactive_species: bool,
+    /// Cache the phase coordinate of the constant ray/Sun cosine once per ray.
+    pub cache_phase_coordinate: bool,
+    /// Omit the unused ground chart when the entire camera frustum is sky.
+    /// A camera change that reveals ground builds it before projection.
+    pub skip_unused_ground: bool,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -88,6 +117,9 @@ impl Default for Config {
             path_height_scale: 0.25,
             high_sun_weight: 1.0,
             batch_heights: 0,
+            skip_inactive_species: true,
+            cache_phase_coordinate: false,
+            skip_unused_ground: true,
         }
     }
 }
@@ -617,6 +649,7 @@ pub struct Renderer {
     transmittance_view: wgpu::TextureView,
     size: [u32; 2],
     last_sky: Option<SkyKey>,
+    last_sky_has_ground: bool,
     last_frame: Option<FrameKey>,
     pub steps: u32,
     pub use_sky_view: bool,
@@ -661,6 +694,14 @@ impl Renderer {
                     medium.params.angular_mapping[0] as f64,
                 ),
                 ("FIXED_CONE_WARP", medium.params.angular_mapping[1] as f64),
+                (
+                    "SKIP_INACTIVE_SPECIES",
+                    config.skip_inactive_species as u32 as f64,
+                ),
+                (
+                    "CACHE_PHASE_COORDINATE",
+                    config.cache_phase_coordinate as u32 as f64,
+                ),
             ];
             d.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(entry),
@@ -738,8 +779,9 @@ impl Renderer {
             transmittance_view,
             size: [1, 1],
             last_sky: None,
+            last_sky_has_ground: false,
             last_frame: None,
-            steps: 96,
+            steps: DEFAULT_RUNTIME_STEPS,
             use_sky_view: true,
             include_sun_disk: false,
             multiple_scattering: true,
@@ -1143,6 +1185,18 @@ impl Renderer {
         &self.transmittance
     }
     pub fn render(&mut self, q: &wgpu::Queue, e: &mut wgpu::CommandEncoder, view: View) {
+        self.render_profiled(q, e, view, None);
+    }
+    /// Instruments the same rendering/cache path as `render`; no extra solve or
+    /// projection is introduced. With None, no profiling clock is read.
+    pub fn render_profiled(
+        &mut self,
+        q: &wgpu::Queue,
+        e: &mut wgpu::CommandEncoder,
+        view: View,
+        timestamps: Option<FrameTimestamps<'_>>,
+    ) -> FrameProfile {
+        let mut profile = FrameProfile::default();
         assert!(
             self.field.is_some(),
             "call rebuild before rendering the hybrid atmosphere"
@@ -1163,7 +1217,7 @@ impl Renderer {
             spectral: self.spectral_output,
         };
         if self.last_frame == Some(frame) {
-            return;
+            return profile;
         }
         self.last_frame = Some(frame);
         let sky_rows = self.config.sky_size * 3 / 4;
@@ -1200,43 +1254,60 @@ impl Renderer {
             ];
             p
         };
-        if use_sky_view && self.last_sky != Some(sky) {
-            let g = geometry::Geometry {
-                bottom: self.medium.params.sun[3],
-                top: self.medium.params.sun[3] + self.medium.params.medium[0],
-            };
-            let (cache, _) = mapping::sky_cache(
+        let g = geometry::Geometry {
+            bottom: self.medium.params.sun[3],
+            top: self.medium.params.sun[3] + self.medium.params.medium[0],
+        };
+        let needs_ground = !self.config.skip_unused_ground || !pure_sky_frustum(g, view);
+        if use_sky_view && (self.last_sky != Some(sky) || needs_ground && !self.last_sky_has_ground)
+        {
+            let mapping_start = timestamps.is_some().then(Instant::now);
+            let (cache, _) = mapping::sky_cache_for_view(
                 g,
                 sky.height,
                 view.sun_elevation_deg.to_radians(),
                 self.config.sky_size,
                 self.config.mapping_flags & 32 != 0,
+                needs_ground,
             );
+            profile.observer_mapping_cpu_ms =
+                mapping_start.map_or(0.0, |start| start.elapsed().as_secs_f64() * 1000.0);
             q.write_buffer(&self.sky_mapping, 0, bytemuck::cast_slice(&cache));
-            q.write_buffer(
-                &self.sky_params,
-                0,
-                bytemuck::bytes_of(&params(
-                    View {
-                        sun_azimuth_deg: 0.0,
-                        ..view
-                    },
-                    [self.config.sky_size, self.config.sky_size],
-                    false,
-                )),
+            let mut build_params = params(
+                View {
+                    sun_azimuth_deg: 0.0,
+                    ..view
+                },
+                [self.config.sky_size, self.config.sky_size],
+                false,
             );
+            if !needs_ground {
+                // Reject workgroup padding rows for sizes not divisible by 32.
+                // Projection keeps the full texture height in its own uniform.
+                build_params.sky[1] = sky_rows;
+            }
+            q.write_buffer(&self.sky_params, 0, bytemuck::bytes_of(&build_params));
+            profile.observer_update_cpu_ms =
+                mapping_start.map_or(0.0, |start| start.elapsed().as_secs_f64() * 1000.0);
             dispatch(
                 e,
                 &self.pipelines[6],
                 self.sky_group.as_ref().unwrap(),
                 [
                     self.config.sky_size.div_ceil(8),
-                    self.config.sky_size.div_ceil(8),
+                    if needs_ground {
+                        self.config.sky_size
+                    } else {
+                        sky_rows
+                    }
+                    .div_ceil(8),
                 ],
-                None,
+                timestamps.map(|t| (t.query_set, t.sky_view_begin)),
             );
             self.stats.sky_updates += 1;
             self.last_sky = Some(sky);
+            self.last_sky_has_ground = needs_ground;
+            profile.sky_updated = true;
         }
         q.write_buffer(
             &self.frame_params,
@@ -1253,15 +1324,40 @@ impl Renderer {
             p,
             g,
             [self.size[0].div_ceil(8), self.size[1].div_ceil(8)],
-            None,
+            timestamps.map(|t| (t.query_set, t.projection_begin)),
         );
         self.stats.projections += 1;
+        profile.projected = true;
+        profile
     }
     /// Small diagnostic export permits auditing the actual solved source and
     /// iteration deltas without retaining any temporary incident ray fields.
     pub fn export_source(&self, d: &wgpu::Device, q: &wgpu::Queue) -> Result<Vec<u8>> {
         read_texture(d, q, &self.field.as_ref().ok_or("not solved")?.source, 8)
     }
+}
+/// Conservative full-frustum test, including pixels beyond their centers.
+/// For a downward lower edge, its vertical center is lower than the corners;
+/// a positive edge puts every ray above the nonpositive geometric horizon.
+fn pure_sky_frustum(g: geometry::Geometry, view: View) -> bool {
+    if !view.pitch_deg.is_finite()
+        || !view.fov_y_deg.is_finite()
+        || !view.altitude_km.is_finite()
+        || view.pitch_deg.abs() > 90.0
+        || !(0.0..179.0).contains(&view.fov_y_deg)
+    {
+        return false;
+    }
+    let bottom = view.pitch_deg - view.fov_y_deg * 0.5;
+    let horizon_mu = g.horizon(view.altitude_km.max(0.0));
+    // At extreme distances the horizon and normalized pixel rays can both
+    // round to -1. Keep the full chart rather than relying on an angle margin.
+    if horizon_mu <= -0.9999 {
+        return false;
+    }
+    let horizon = horizon_mu.asin().to_degrees();
+    // Keep margins in both angle and f32 cosine near the tangent endpoints.
+    bottom > horizon + 0.01 && (bottom >= 0.0 || bottom.to_radians().sin() > horizon_mu + 2e-6)
 }
 fn dispatch(
     e: &mut wgpu::CommandEncoder,
@@ -1367,6 +1463,66 @@ mod tests {
         )
         .validate(&module)
         .unwrap();
+    }
+    #[test]
+    fn pure_sky_culling_is_conservative_for_pixels_and_aspect_ratios() {
+        let g = super::geometry::Geometry {
+            bottom: 6360.0,
+            top: 6480.0,
+        };
+        for altitude in [0.0, 0.2, 12.0, 108.0, 120.0, 400.0, 600.0] {
+            for pitch in [-89.0f32, -30.0, -15.0, 0.0, 15.0, 55.0, 89.0] {
+                for fov in [2.0f32, 30.0, 60.0, 120.0, 170.0] {
+                    let v = super::View {
+                        altitude_km: altitude,
+                        pitch_deg: pitch,
+                        fov_y_deg: fov,
+                        yaw_deg: 0.0,
+                        sun_elevation_deg: 0.0,
+                        sun_azimuth_deg: 0.0,
+                    };
+                    if !super::pure_sky_frustum(g, v) {
+                        continue;
+                    }
+                    for aspect in [0.25f32, 1.0, 16.0 / 9.0, 4.0] {
+                        for y in 0..33 {
+                            for x in 0..33 {
+                                let ux = (x as f32 / 16.0 - 1.0)
+                                    * (fov.to_radians() * 0.5).tan()
+                                    * aspect;
+                                let uy = (y as f32 / 16.0 - 1.0) * (fov.to_radians() * 0.5).tan();
+                                let mu = (pitch.to_radians().sin() - pitch.to_radians().cos() * uy)
+                                    / (1.0 + ux * ux + uy * uy).sqrt();
+                                assert!(mu > g.horizon(altitude), "{v:?}/{aspect}/{x}/{y}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn pure_sky_culling_keeps_ground_when_far_horizon_rounds_to_minus_one() {
+        let g = super::geometry::Geometry {
+            bottom: 6360.0,
+            top: 6480.0,
+        };
+        let v = super::View {
+            altitude_km: 16_765_127.0,
+            pitch_deg: -89.4,
+            fov_y_deg: 1.178,
+            yaw_deg: 0.0,
+            sun_elevation_deg: 0.0,
+            sun_azimuth_deg: 0.0,
+        };
+        assert!(!super::pure_sky_frustum(g, v));
+        let ordinary = super::View {
+            altitude_km: 600.0,
+            pitch_deg: -22.6,
+            fov_y_deg: 2.6,
+            ..v
+        };
+        assert!(super::pure_sky_frustum(g, ordinary));
     }
 }
 

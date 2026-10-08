@@ -1,0 +1,19 @@
+[package]
+name = "cloud-demo"
+default-run = "cloud-demo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cloud-pt = { path = "../../crates/cloud-pt" }
+bytemuck.workspace = true
+clap.workspace = true
+exr.workspace = true
+glam = { workspace = true, features = ["serde"] }
+image.workspace = true
+pollster.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+wgpu.workspace = true
+winit.workspace = true

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/sky-assets", "crates/sky-pt", "crates/sky-reference", "crates/sky-realtime", "apps/sky-baker", "apps/sky-demo", "apps/sky-audit"]
+members = ["crates/sky-assets", "crates/sky-pt", "crates/sky-reference", "crates/sky-realtime", "crates/cloud-pt", "apps/sky-baker", "apps/sky-demo", "apps/sky-audit", "apps/cloud-demo"]
 resolver = "3"
 
 [workspace.package]

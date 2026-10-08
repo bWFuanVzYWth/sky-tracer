@@ -1,0 +1,144 @@
+{
+  "images": [
+    {
+      "name": "horizon_crossing_032",
+      "width": 1920,
+      "height": 1080,
+      "yaw": 0.0,
+      "pitch": 8.2,
+      "horizontal_fov": 30,
+      "sun_elevation_deg": 0.0,
+      "altitude_km": 0.2
+    },
+    {
+      "name": "horizon_crossing_061",
+      "width": 1920,
+      "height": 1080,
+      "yaw": 0.0,
+      "pitch": 8.2,
+      "horizontal_fov": 30,
+      "sun_elevation_deg": -0.453125,
+      "altitude_km": 0.2
+    },
+    {
+      "name": "blue_forward_032",
+      "width": 1920,
+      "height": 1080,
+      "yaw": 0.0,
+      "pitch": 8.2,
+      "horizontal_fov": 30,
+      "sun_elevation_deg": -6.2,
+      "altitude_km": 0.2
+    },
+    {
+      "name": "blue_backward_032",
+      "width": 1920,
+      "height": 1080,
+      "yaw": 180.0,
+      "pitch": 8.2,
+      "horizontal_fov": 30,
+      "sun_elevation_deg": -6.2,
+      "altitude_km": 0.2
+    },
+    {
+      "name": "high_shadow_032",
+      "width": 1920,
+      "height": 1080,
+      "yaw": 0.0,
+      "pitch": 5.2,
+      "horizontal_fov": 30,
+      "sun_elevation_deg": -9.0,
+      "altitude_km": 12
+    },
+    {
+      "name": "thin_limb_032",
+      "width": 1920,
+      "height": 1080,
+      "yaw": 0.0,
+      "pitch": -1.8,
+      "horizontal_fov": 30,
+      "sun_elevation_deg": -15.2,
+      "altitude_km": 108
+    },
+    {
+      "name": "orbital_limb_032",
+      "width": 1920,
+      "height": 1080,
+      "yaw": 0.0,
+      "pitch": -11.2,
+      "horizontal_fov": 30,
+      "sun_elevation_deg": -21.2,
+      "altitude_km": 400
+    },
+    {
+      "name": "azimuth_crossing_032",
+      "width": 1920,
+      "height": 1080,
+      "yaw": 0.0,
+      "pitch": 30,
+      "horizontal_fov": 90,
+      "sun_elevation_deg": 8.0,
+      "altitude_km": 0.2
+    },
+    {
+      "name": "blue_forward_052",
+      "width": 1920,
+      "height": 1080,
+      "yaw": 0.0,
+      "pitch": 8.2,
+      "horizontal_fov": 30,
+      "sun_elevation_deg": -8.2,
+      "altitude_km": 0.2
+    },
+    {
+      "name": "blue_forward_064",
+      "width": 1920,
+      "height": 1080,
+      "yaw": 0.0,
+      "pitch": 8.2,
+      "horizontal_fov": 30,
+      "sun_elevation_deg": -9.4,
+      "altitude_km": 0.2
+    },
+    {
+      "name": "high_shadow_058",
+      "width": 1920,
+      "height": 1080,
+      "yaw": 0.0,
+      "pitch": 5.2,
+      "horizontal_fov": 30,
+      "sun_elevation_deg": -10.625,
+      "altitude_km": 12
+    },
+    {
+      "name": "high_shadow_064",
+      "width": 1920,
+      "height": 1080,
+      "yaw": 0.0,
+      "pitch": 5.2,
+      "horizontal_fov": 30,
+      "sun_elevation_deg": -11.0,
+      "altitude_km": 12
+    },
+    {
+      "name": "thin_limb_061",
+      "width": 1920,
+      "height": 1080,
+      "yaw": 0.0,
+      "pitch": -1.8,
+      "horizontal_fov": 30,
+      "sun_elevation_deg": -18.099999999999998,
+      "altitude_km": 108
+    },
+    {
+      "name": "thin_limb_064",
+      "width": 1920,
+      "height": 1080,
+      "yaw": 0.0,
+      "pitch": -1.8,
+      "horizontal_fov": 30,
+      "sun_elevation_deg": -18.4,
+      "altitude_km": 108
+    }
+  ]
+}

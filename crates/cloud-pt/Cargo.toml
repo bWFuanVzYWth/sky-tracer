@@ -1,0 +1,17 @@
+[package]
+name = "cloud-pt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytemuck.workspace = true
+glam = { workspace = true, features = ["serde"] }
+serde.workspace = true
+wgpu.workspace = true
+flate2 = "1"
+half = "2"
+blosc-src = { version = "0.3.8", features = ["lz4"] }
+
+[dev-dependencies]
+naga = { version = "29.0.3", features = ["wgsl-in", "spv-out"] }

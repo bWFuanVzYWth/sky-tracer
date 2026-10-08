@@ -3,9 +3,119 @@
 use crate::geometry::Geometry;
 use std::{f32::consts::PI, sync::OnceLock};
 
+struct Calibration {
+    values: serde_json::Value,
+    source: String,
+}
+static CALIBRATION: OnceLock<Calibration> = OnceLock::new();
+
+fn calibration() -> &'static Calibration {
+    CALIBRATION.get_or_init(|| Calibration {
+        values: serde_json::from_str(CALIBRATION_JSON).expect("embedded mapping calibration"),
+        source: CALIBRATION_JSON.to_owned(),
+    })
+}
+
+/// Freeze an experiment's calibration before creating any renderer or mapping.
+/// Once initialized it cannot change, including while a GPU solution is cached.
+/// The application reads files; the core only validates the supplied JSON.
+pub fn load_calibration_json(source: &str) -> crate::Result<()> {
+    let values: serde_json::Value = serde_json::from_str(source)?;
+    validate_calibration(&values)?;
+    CALIBRATION
+        .set(Calibration {
+            values,
+            source: source.to_owned(),
+        })
+        .map_err(|_| "mapping calibration is already initialized; use a fresh process".into())
+}
+
+/// Exact JSON used by both CPU node generation and GPU lookup coefficients.
+pub fn calibration_json() -> &'static str {
+    &calibration().source
+}
+
+fn validate_calibration(v: &serde_json::Value) -> crate::Result<()> {
+    let array = |value: &serde_json::Value, length: usize, name: &str| -> crate::Result<Vec<f32>> {
+        let a = value
+            .as_array()
+            .ok_or_else(|| format!("mapping {name} must be an array"))?;
+        if a.len() != length {
+            return Err(format!("mapping {name} needs {length} values").into());
+        }
+        a.iter()
+            .map(|x| {
+                let f = x
+                    .as_f64()
+                    .ok_or_else(|| format!("mapping {name} must contain numbers"))?
+                    as f32;
+                if !f.is_finite() {
+                    return Err(format!("mapping {name} must contain finite f32 values").into());
+                }
+                Ok(f)
+            })
+            .collect()
+    };
+    let heights_len = v["source_height"].as_array().map_or(0, Vec::len);
+    if !(8..=128).contains(&heights_len) {
+        return Err("mapping source_height needs 8..=128 nodes".into());
+    }
+    let heights = array(&v["source_height"], heights_len, "source_height")?;
+    if heights[0] != 0.0
+        || *heights.last().unwrap() != 120.0
+        || !heights.windows(2).all(|h| h[1] > h[0])
+    {
+        return Err("mapping heights must increase strictly from 0 to 120 km".into());
+    }
+    let weights = |value: &serde_json::Value, count: usize, name: &str| -> crate::Result<()> {
+        let w = array(value, count, name)?;
+        if w.iter().any(|x| *x < 0.0) || w[0] < 0.001 || (w.iter().sum::<f32>() - 1.0).abs() > 1e-5
+        {
+            return Err(format!(
+                "mapping {name} needs nonnegative unit-sum weights and a positive uniform component"
+            )
+            .into());
+        }
+        Ok(())
+    };
+    let widths = |value: &serde_json::Value, name: &str| -> crate::Result<()> {
+        let w = array(value, 3, name)?;
+        if w.iter().any(|x| !(1e-6..=PI).contains(x)) {
+            return Err(format!("mapping {name} widths must be in [1e-6, pi] radians").into());
+        }
+        Ok(())
+    };
+    weights(&v["solar_weights"], 5, "solar_weights")?;
+    widths(&v["solar_widths"], "solar_widths")?;
+    for name in ["low", "upper", "space", "ground", "ground_near"] {
+        weights(&v["sky"][name]["weights"], 4, name)?;
+        widths(&v["sky"][name]["widths"], name)?;
+    }
+    for (name, lo, hi) in [("phase_weight", 0.0, 1.0), ("cone_warp", -1.0, 0.99)] {
+        let value = v[name]
+            .as_f64()
+            .ok_or_else(|| format!("missing numeric mapping {name}"))? as f32;
+        if !value.is_finite() || !(lo..=hi).contains(&value) {
+            return Err(format!("mapping {name} is outside [{lo}, {hi}]").into());
+        }
+    }
+    let anchors = array(&v["optical"]["anchors_km"], 7, "optical.anchors_km")?;
+    let indices = array(&v["optical"]["indices"], 7, "optical.indices")?;
+    if anchors != [0.0, 1.0, 2.0, 11.0, 12.0, 35.0, 120.0]
+        || indices[0] != 0.0
+        || indices[6] != 255.0
+        || !indices.windows(2).all(|x| x[1] > x[0])
+    {
+        return Err(
+            "mapping optical anchors must retain material boundaries and increasing indices 0..255"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 fn fit() -> &'static serde_json::Value {
-    static FIT: OnceLock<serde_json::Value> = OnceLock::new();
-    FIT.get_or_init(|| serde_json::from_str(include_str!("../configs/mapping_fit.json")).unwrap())
+    &calibration().values
 }
 fn numbers(value: &serde_json::Value) -> Vec<f32> {
     value
@@ -278,6 +388,19 @@ pub fn sky_cache(
     size: u32,
     fitted: bool,
 ) -> (Vec<[f32; 4]>, [u32; 4]) {
+    sky_cache_for_view(g, h, sun, size, fitted, true)
+}
+
+/// The ground rows may be omitted only when projection cannot query them.
+/// Sky texel coordinates and both sky charts retain their original layout.
+pub fn sky_cache_for_view(
+    g: Geometry,
+    h: f32,
+    sun: f32,
+    size: u32,
+    fitted: bool,
+    include_ground: bool,
+) -> (Vec<[f32; 4]>, [u32; 4]) {
     let sky_rows = size * 3 / 4;
     let lower = if fitted && h >= g.top_height() {
         sky_rows
@@ -288,6 +411,10 @@ pub fn sky_cache(
     let mut coefficients = Vec::new();
     let mut rows = Vec::new();
     for chart in 0..3 {
+        if chart == 2 && !include_ground {
+            coefficients.extend([[0.0; 4]; 4]);
+            continue;
+        }
         let c = SkyChart::new(g, h, sun, chart, fitted);
         coefficients.extend(c.coefficients());
         for y in 0..counts[chart] {
@@ -303,6 +430,37 @@ pub fn sky_cache(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn calibration_rejects_nonmonotone_and_singular_coordinates() {
+        let mut v: serde_json::Value = serde_json::from_str(CALIBRATION_JSON).unwrap();
+        validate_calibration(&v).unwrap();
+        v["sky"]["space"]["widths"][0] = 0.0.into();
+        assert!(validate_calibration(&v).is_err());
+        v = serde_json::from_str(CALIBRATION_JSON).unwrap();
+        v["source_height"][3] = v["source_height"][2].clone();
+        assert!(validate_calibration(&v).is_err());
+        v = serde_json::from_str(CALIBRATION_JSON).unwrap();
+        v["sky"]["low"]["weights"][0] = (-0.1).into();
+        assert!(validate_calibration(&v).is_err());
+    }
+    #[test]
+    fn omitted_ground_rows_preserve_all_sky_coordinates() {
+        let g = Geometry {
+            bottom: 6360.0,
+            top: 6480.0,
+        };
+        for h in [0.0, 0.2, 12.0, 108.0, 120.0, 400.0] {
+            for sun in [-16.0f32, -6.0, 0.0, 85.0] {
+                let (full, layout) = sky_cache(g, h, sun.to_radians(), 256, true);
+                let (sky, sky_layout) =
+                    sky_cache_for_view(g, h, sun.to_radians(), 256, true, false);
+                assert_eq!(layout, sky_layout);
+                assert_eq!(sky.len(), 12 + layout[3] as usize);
+                assert_eq!(&sky[..8], &full[..8]);
+                assert_eq!(&sky[12..], &full[12..sky.len()]);
+            }
+        }
+    }
     #[test]
     fn fitted_nodes_and_inverses_cover_domain() {
         let g = Geometry {

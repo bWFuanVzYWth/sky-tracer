@@ -4,7 +4,8 @@ import re
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
-CORES = {"sky-pt", "sky-reference", "sky-realtime"}
+ATMOSPHERE_CORES = {"sky-pt", "sky-reference", "sky-realtime"}
+CORES = ATMOSPHERE_CORES | {"cloud-pt"}
 TABLES = {"atmosphere_profile.csv", "aerosol_profile.csv", "aerosol_optics.csv",
           "mie_phase.csv", "bands.csv", "CIE_xyz_1931_2deg.csv"}
 workspace = tomllib.loads((ROOT / "Cargo.toml").read_text())
@@ -18,15 +19,16 @@ for name in sorted(CORES):
             assert not dep.startswith("sky-"), (name, dep)
             assert not isinstance(spec, dict) or "path" not in spec, (name, dep)
     assert not manifest.get("target"), "Review target-specific dependencies explicitly"
-    for filename in TABLES:
-        path = core / "data" / filename
-        assert path.is_file() and not path.is_symlink() and path.stat().st_nlink == 1, path
+    if name in ATMOSPHERE_CORES:
+        for filename in TABLES:
+            path = core / "data" / filename
+            assert path.is_file() and not path.is_symlink() and path.stat().st_nlink == 1, path
     for path in core.rglob("*.rs"):
         text = path.read_text(encoding="utf-8")
         for other in (CORES | {'sky-assets'}) - {name}:
             assert other.replace('-', '_') + '::' not in text, (path, other)
         assert not re.search(r'(?:include_str!|include_bytes!)\([^\n]*out[/\\]', text), path
-    print(f"{name}: independent crate and owned tables")
+    print(f"{name}: independent crate" + (" and owned tables" if name in ATMOSPHERE_CORES else " and VDB transport"))
 assert not (ROOT / "data").exists(), "No shared root input directory"
 for path in (ROOT / "apps").rglob("*.wgsl"):
     assert path.parent.name == "shaders" and path.name in {

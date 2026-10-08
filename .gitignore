@@ -4,6 +4,8 @@ out_skyview/
 out_skyview_search/
 target/primary_search*/
 
+assets/
+
 run_deepseek*
 __pycache__/
 *.pyc

@@ -1,0 +1,172 @@
+{
+  "trajectories": [
+    {
+      "name": "horizon_crossing_032",
+      "altitude_km": 0.2,
+      "yaw_deg": 0.0,
+      "pitch_deg": 8.2,
+      "fov_y_deg": 17.142372262265418,
+      "sun_elevation_start_deg": 0.0,
+      "sun_elevation_end_deg": 0.0,
+      "sun_azimuth_start_deg": -0.1,
+      "sun_azimuth_end_deg": 0.1,
+      "exposure": 0.5
+    },
+    {
+      "name": "horizon_crossing_061",
+      "altitude_km": 0.2,
+      "yaw_deg": 0.0,
+      "pitch_deg": 8.2,
+      "fov_y_deg": 17.142372262265418,
+      "sun_elevation_start_deg": -0.453125,
+      "sun_elevation_end_deg": -0.453125,
+      "sun_azimuth_start_deg": -0.1,
+      "sun_azimuth_end_deg": 0.1,
+      "exposure": 0.5
+    },
+    {
+      "name": "blue_forward_032",
+      "altitude_km": 0.2,
+      "yaw_deg": 0.0,
+      "pitch_deg": 8.2,
+      "fov_y_deg": 17.142372262265418,
+      "sun_elevation_start_deg": -6.2,
+      "sun_elevation_end_deg": -6.2,
+      "sun_azimuth_start_deg": -0.1,
+      "sun_azimuth_end_deg": 0.1,
+      "exposure": 30
+    },
+    {
+      "name": "blue_backward_032",
+      "altitude_km": 0.2,
+      "yaw_deg": 180.0,
+      "pitch_deg": 8.2,
+      "fov_y_deg": 17.142372262265418,
+      "sun_elevation_start_deg": -6.2,
+      "sun_elevation_end_deg": -6.2,
+      "sun_azimuth_start_deg": -0.1,
+      "sun_azimuth_end_deg": 0.1,
+      "exposure": 30
+    },
+    {
+      "name": "high_shadow_032",
+      "altitude_km": 12,
+      "yaw_deg": 0.0,
+      "pitch_deg": 5.2,
+      "fov_y_deg": 17.142372262265418,
+      "sun_elevation_start_deg": -9.0,
+      "sun_elevation_end_deg": -9.0,
+      "sun_azimuth_start_deg": -0.1,
+      "sun_azimuth_end_deg": 0.1,
+      "exposure": 0.5
+    },
+    {
+      "name": "thin_limb_032",
+      "altitude_km": 108,
+      "yaw_deg": 0.0,
+      "pitch_deg": -1.8,
+      "fov_y_deg": 17.142372262265418,
+      "sun_elevation_start_deg": -15.2,
+      "sun_elevation_end_deg": -15.2,
+      "sun_azimuth_start_deg": -0.1,
+      "sun_azimuth_end_deg": 0.1,
+      "exposure": 0.5
+    },
+    {
+      "name": "orbital_limb_032",
+      "altitude_km": 400,
+      "yaw_deg": 0.0,
+      "pitch_deg": -11.2,
+      "fov_y_deg": 17.142372262265418,
+      "sun_elevation_start_deg": -21.2,
+      "sun_elevation_end_deg": -21.2,
+      "sun_azimuth_start_deg": -0.1,
+      "sun_azimuth_end_deg": 0.1,
+      "exposure": 0.5
+    },
+    {
+      "name": "azimuth_crossing_032",
+      "altitude_km": 0.2,
+      "yaw_deg": 0.0,
+      "pitch_deg": 30,
+      "fov_y_deg": 58.71550708558254,
+      "sun_elevation_start_deg": 8.0,
+      "sun_elevation_end_deg": 8.0,
+      "sun_azimuth_start_deg": -0.1,
+      "sun_azimuth_end_deg": 0.1,
+      "exposure": 0.5
+    },
+    {
+      "name": "blue_forward_052",
+      "altitude_km": 0.2,
+      "yaw_deg": 0.0,
+      "pitch_deg": 8.2,
+      "fov_y_deg": 17.142372262265418,
+      "sun_elevation_start_deg": -8.2,
+      "sun_elevation_end_deg": -8.2,
+      "sun_azimuth_start_deg": -0.1,
+      "sun_azimuth_end_deg": 0.1,
+      "exposure": 30
+    },
+    {
+      "name": "blue_forward_064",
+      "altitude_km": 0.2,
+      "yaw_deg": 0.0,
+      "pitch_deg": 8.2,
+      "fov_y_deg": 17.142372262265418,
+      "sun_elevation_start_deg": -9.4,
+      "sun_elevation_end_deg": -9.4,
+      "sun_azimuth_start_deg": -0.1,
+      "sun_azimuth_end_deg": 0.1,
+      "exposure": 30
+    },
+    {
+      "name": "high_shadow_058",
+      "altitude_km": 12,
+      "yaw_deg": 0.0,
+      "pitch_deg": 5.2,
+      "fov_y_deg": 17.142372262265418,
+      "sun_elevation_start_deg": -10.625,
+      "sun_elevation_end_deg": -10.625,
+      "sun_azimuth_start_deg": -0.1,
+      "sun_azimuth_end_deg": 0.1,
+      "exposure": 0.5
+    },
+    {
+      "name": "high_shadow_064",
+      "altitude_km": 12,
+      "yaw_deg": 0.0,
+      "pitch_deg": 5.2,
+      "fov_y_deg": 17.142372262265418,
+      "sun_elevation_start_deg": -11.0,
+      "sun_elevation_end_deg": -11.0,
+      "sun_azimuth_start_deg": -0.1,
+      "sun_azimuth_end_deg": 0.1,
+      "exposure": 0.5
+    },
+    {
+      "name": "thin_limb_061",
+      "altitude_km": 108,
+      "yaw_deg": 0.0,
+      "pitch_deg": -1.8,
+      "fov_y_deg": 17.142372262265418,
+      "sun_elevation_start_deg": -18.099999999999998,
+      "sun_elevation_end_deg": -18.099999999999998,
+      "sun_azimuth_start_deg": -0.1,
+      "sun_azimuth_end_deg": 0.1,
+      "exposure": 0.5
+    },
+    {
+      "name": "thin_limb_064",
+      "altitude_km": 108,
+      "yaw_deg": 0.0,
+      "pitch_deg": -1.8,
+      "fov_y_deg": 17.142372262265418,
+      "sun_elevation_start_deg": -18.4,
+      "sun_elevation_end_deg": -18.4,
+      "sun_azimuth_start_deg": -0.1,
+      "sun_azimuth_end_deg": 0.1,
+      "exposure": 0.5
+    }
+  ]
+}

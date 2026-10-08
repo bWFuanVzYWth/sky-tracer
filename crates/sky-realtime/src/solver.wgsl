@@ -11,6 +11,8 @@ override SPECIALIZE:bool=false;
 override FIXED_MAPPING_FLAGS:u32=63u;
 override FIXED_PHASE_WEIGHT:f32=0.61;
 override FIXED_CONE_WARP:f32=0.164285714;
+override SKIP_INACTIVE_SPECIES:bool=false;
+override CACHE_PHASE_COORDINATE:bool=false;
 @group(0) @binding(0) var<uniform> p:Params;
 @group(0) @binding(1) var<storage,read> data:array<vec4<f32>>;
 @group(0) @binding(2) var tau_read:texture_2d<f32>;
@@ -65,7 +67,7 @@ fn high_shape(hi:u32,si:u32,b:vec4<f32>)->vec4<f32>{
     for(var k=0u;k<5u;k++){m[k]=textureLoad(high_read,vec2<i32>(i32(si*5u+k),i32(hi+1u-p.offsets1.y)),0);}
     return (m[0]+m[1]*b.y+m[2]*b.z+m[3]*b.w)/max(dot(m[4],b),1e-20);
 }
-fn indirect(h:f32,mu:f32,mu_s:f32,nu:f32,c:Medium)->vec4<f32>{
+fn indirect(h:f32,mu:f32,mu_s:f32,nu:f32,cached_phase:f32,c:Medium)->vec4<f32>{
     if (p.size_steps.w&1u)==0u{return vec4<f32>(0.0);}
     var lo=0u;var hi=p.dims.x-1u;
     while hi-lo>1u{let mid=(lo+hi)/2u;if data[mid].x<=h{lo=mid;}else{hi=mid;}}
@@ -82,7 +84,9 @@ fn indirect(h:f32,mu:f32,mu_s:f32,nu:f32,c:Medium)->vec4<f32>{
     let cp=clamp((mu-mu_s*nu)/sqrt(max((1.0-mu_s*mu_s)*(1.0-nu*nu),1e-20)),-1.0,1.0);
     var angle=0.0;
     if (mapping_flags()&8u)!=0u{let t=(1.0-cp)*0.5;angle=t+fitted_cone_warp()*t*(1.0-t)*(2.0*t-1.0);}else{angle=acos(cp)/PI;}
-    let uv=vec2<f32>(phase_coord(nu),angle);
+    var phase=cached_phase;
+    if !CACHE_PHASE_COORDINATE{phase=phase_coord(nu);}
+    let uv=vec2<f32>(phase,angle);
     let v=mix(mix(shape(lo,i0,uv),shape(lo,i0+1u,uv),t0),mix(shape(hi,i1,uv),shape(hi,i1+1u,uv),t1),th);
     var sigma=vec4<f32>(0.0);for(var k=0u;k<5u;k++){sigma+=c.scattering[k];}
     return max(v*brightness*sigma,vec4<f32>(0.0));
@@ -172,6 +176,13 @@ fn ground_light(mu_s:f32)->vec4<f32>{
     // Rayleigh is exactly degree two: no directional phase loop above aerosols.
     if h<35.0 {
         var sums:array<vec4<f32>,4>;var norms:array<vec4<f32>,4>;
+        // The coefficient is fixed for this source height and shared by every
+        // incoming direction. A zero coefficient makes the species contribution
+        // exactly zero; preserve the original loop order for active species.
+        var species_enabled:array<bool,4>;
+        for(var species=0u;species<4u;species++){
+            species_enabled[species]=!SKIP_INACTIVE_SPECIES||any(data[coeff+species+1u]!=vec4<f32>(0.0));
+        }
         for(var j=0u;j<p.solve.x;j++){
             let q=directions[local_state*p.solve.x+j];let l=incoming[local_state*p.solve.x+j];
             let a=q.y*v.y+q.z*v.z;let b=q.x*v.x;
@@ -179,6 +190,7 @@ fn ground_light(mu_s:f32)->vec4<f32>{
             let positive=phase_stencil(clamp(a+b,-1.0,1.0));
             let negative=phase_stencil(clamp(a-b,-1.0,1.0));
             for(var species=0u;species<4u;species++){
+                if !species_enabled[species]{continue;}
                 let weight=(tabulated_phase(positive,species)+tabulated_phase(negative,species))*(0.5*q.w);
                 sums[species]+=l*weight;norms[species]+=weight;
             }

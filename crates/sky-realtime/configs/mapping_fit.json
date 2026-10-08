@@ -95,48 +95,56 @@
   "sky": {
     "low": {
       "weights": [
-        0.28717395663261414,
-        0.044344790279865265,
-        0.2831573188304901,
-        0.38532397150993347
+        0.30340912393459674,
+        0.07966319735704107,
+        0.08707282020483663,
+        0.5298548585035255
       ],
       "widths": [
-        0.0033508469350636005,
-        0.0030857601668685675,
-        0.029294535517692566
+        0.0016795311295156354,
+        0.006308665576321875,
+        0.06966662337324515
       ],
       "train": {
-        "p95": 0.1403888314962387,
-        "p99": 0.8766584396362305,
-        "rms": 0.2701193392276764
+        "p50": 0.0005069330024259432,
+        "p95": 0.17834660721001863,
+        "p99": 0.8722777677092387,
+        "max": 11.002671556877463,
+        "rms": 0.2689984495238553
       },
       "heldout": {
-        "p95": 0.24215789139270782,
-        "p99": 1.2475098371505737,
-        "rms": 0.3671073913574219
+        "p50": 0.0003119322114250427,
+        "p95": 0.18641662968252246,
+        "p99": 1.1519547636686893,
+        "max": 10.75731495997238,
+        "rms": 0.28562470457702993
       }
     },
     "upper": {
       "weights": [
-        0.23954732716083527,
-        0.02231575734913349,
-        0.5578426122665405,
-        0.18029437959194183
+        0.1955515113988905,
+        0.04500127762110954,
+        0.5123894002646004,
+        0.24705781071539956
       ],
       "widths": [
-        0.0869770422577858,
-        0.0739380493760109,
-        0.14374907314777374
+        0.07850541382025757,
+        0.04295307907856753,
+        0.21039347385870494
       ],
       "train": {
-        "p95": 0.07685906440019608,
-        "p99": 0.1780778169631958,
-        "rms": 0.05579118803143501
+        "p50": 0.008395822753852498,
+        "p95": 0.07792479081331923,
+        "p99": 0.16460106040050193,
+        "max": 1.3519559951075317,
+        "rms": 0.044574080910566784
       },
       "heldout": {
-        "p95": 0.07844536006450653,
-        "p99": 0.17159758508205414,
-        "rms": 0.060885392129421234
+        "p50": 0.009125276413408863,
+        "p95": 0.09202100378577263,
+        "p99": 0.2177644996155399,
+        "max": 2.1123627684760944,
+        "rms": 0.06307545521525143
       }
     },
     "ground": {
@@ -164,25 +172,29 @@
     },
     "space": {
       "weights": [
-        0.10427150130271912,
-        0.5162510275840759,
-        0.302908718585968,
-        0.07656880468130112
+        0.1177463741732731,
+        0.3876887822035397,
+        0.3093203717782645,
+        0.18524447184492268
       ],
       "widths": [
-        0.03553646430373192,
-        0.0036403569392859936,
-        0.0031041009351611137
+        0.08532267777505989,
+        0.001549377601912162,
+        0.0019746399508675334
       ],
       "train": {
-        "p95": 0.41569074988365173,
-        "p99": 2.1885993480682373,
-        "rms": 6.983828544616699
+        "p50": 0.016714825897268172,
+        "p95": 0.34389191671128494,
+        "p99": 1.2100443468581012,
+        "max": 48.00557381888928,
+        "rms": 0.49044835660507125
       },
       "heldout": {
-        "p95": 0.6324198842048645,
-        "p99": 3.243624448776245,
-        "rms": 3.555849075317383
+        "p50": 0.012066849261599491,
+        "p95": 0.3675131203157474,
+        "p99": 1.1806235560687035,
+        "max": 23.358963766522677,
+        "rms": 0.3656585383591324
       }
     },
     "ground_near": {
@@ -208,5 +220,60 @@
         "rms": 0.07080916315317154
       }
     }
+  },
+  "sky_fit_provenance": {
+    "kind": "teacher_total_softsign_cdf_cpu_v7",
+    "source": "out/teacher_reference_safetensors_v7",
+    "dataset": "out/sky_coordinate_fit_v7/full41",
+    "points": 800760,
+    "curves": 184,
+    "wavelengths": 41,
+    "cpu_workers": 8,
+    "export_seconds": 35.47,
+    "target_sky_size": 256,
+    "runtime_formula": "unchanged",
+    "ground_and_source_mapping": "unchanged",
+    "claim": "Isolated vertical teacher fit, followed by production GPU static, full1080p cost and independent moving-sun validation; see sky_gpu_validation. Physical model accuracy is unchanged.",
+    "seed": 20261008,
+    "iterations_per_group": 320,
+    "sky_only": true,
+    "ground_search_rng_slots_preserved": true,
+    "input_sha256": {
+      "dataset.json": "a36c0a07ab1b2e49ea728da03f6fd20a73ee27a9c2eddcd6e88f61a3736c9378",
+      "queries.json": "a92759edd78fe8d96ec03b28f034957fa803c0eac97d40cb3bf98393714b1942",
+      "rgb.f32": "2bcbe704f995d503a85017836d613f81ed4ec55a5f541cc1c00216ce867676f0"
+    },
+    "metric_definition": "RGB norm>1e-8; denominator>=max(curveP99 norm*1e-5,1e-7); values in percent",
+    "parameter_sha256": "713f9febdb5e558cbf8541cdb927c3e97743d77ef2835fc6b357d285ebc4af8a"
+  },
+  "sky_gpu_validation": {
+    "date": "2026-10-08",
+    "frozen_candidate_sha256": "e44fdb466d35c23de3bd42f1c88e3d7e532dd5ff991f760887f1eaf9e2cdb721",
+    "selected_sky_size": 256,
+    "runtime_steps": 64,
+    "source_ground_optical_mapping": "unchanged",
+    "source_and_optical_payloads": "bit identical to frozen baseline",
+    "static_cases": {
+      "standard": 43,
+      "extra": 22,
+      "aerosol4x": 6,
+      "high_resolution": 14
+    },
+    "moving_sun_frames": {
+      "regression": 520,
+      "independent": 390
+    },
+    "complete_1080p_gpu_ms": {
+      "baseline": 0.219904,
+      "selected": 0.19968
+    },
+    "complete_1080p_encode_submit_wait_ms": {
+      "baseline": 0.40976,
+      "selected": 0.353
+    },
+    "cost_optimization": "skip unqueried ground chart in pure-sky frustum; mapping fit itself has equal cost",
+    "limits": "Some interpolation tails regress. 13/14 HD frames differ at most 1 LSB; orbital thin edge reaches 9 LSB in 6 pixels. Independent motion residual difference reaches 13 LSB at the existing thin edge; five-frame crops show no new macroscopic band. Does not certify unbiased physical accuracy or all-pixel temporal smoothness.",
+    "report": "out/sky_mapping_gpu_summary_v7_final/recommendation.json",
+    "temporal_inspection": "out/sky_mapping_gpu_summary_v7_final/orbital_temporal_cpu/inspection.json"
   }
 }

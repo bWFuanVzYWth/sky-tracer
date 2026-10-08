@@ -1,0 +1,22 @@
+{
+  "camera": {
+    "origin": [648.064, -82.473, -63.856],
+    "target": [6.021, 100.043, -43.679],
+    "up": [0.273, 0.962, -0.009],
+    "horizontal_fov_deg": 54.43
+  },
+  "transport": {
+    "spatial_majorants": true,
+    "shadow_roulette": true,
+    "extinction_scale": 4.0,
+    "scattering_albedo": [1.0, 1.0, 1.0],
+    "phase_g": 0.877,
+    "sun_direction": [0.5826, 0.766, 0.2717],
+    "sun_irradiance": [2.6, 2.5, 2.3],
+    "sky_radiance": [0.03, 0.07, 0.23],
+    "ground": { "height": -1000.0, "albedo": [0.2, 0.2, 0.2] },
+    "roulette_start": 4,
+    "event_limit": 1000000
+  },
+  "render": { "width": 333, "height": 180, "spp": 1024, "seed": 212261271900168 }
+}

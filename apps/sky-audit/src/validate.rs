@@ -89,6 +89,85 @@ pub fn run(args: Options) -> Result<()> {
         events.push(serde_json::json!({"event":name,"stats":r.stats}));
     }
     assert!(r.set_medium(d, q, &model, &wavelengths, 0.18)?.is_none());
+    // Exercise an initially omitted ground chart, camera reveal, and subsequent
+    // reuse. Compare every pixel to the full-chart renderer, including space.
+    let mut full_config = Config::balanced();
+    full_config.skip_unused_ground = false;
+    let mut full = Renderer::new(d, &model, &wavelengths, 0.18, full_config)?;
+    full.rebuild(d, q)?;
+    full.resize(d, [96, 54]);
+    r.resize(d, [96, 54]);
+    r.multiple_scattering = true;
+    let mut culling_events = Vec::new();
+    let initial_updates = r.stats.sky_updates;
+    for (name, h, pitch, fov, sun, expected_extra) in [
+        ("pure_sky", 0.2, 30.0, 30.0, -6.0, 1),
+        ("ground_reveal", 0.2, -5.0, 30.0, -6.0, 2),
+        ("sky_reuses_complete_chart", 0.2, 30.0, 30.0, -6.0, 2),
+        ("new_sun_pure_sky", 0.2, 30.0, 30.0, -7.0, 3),
+        ("new_sun_ground_reveal", 0.2, -5.0, 30.0, -7.0, 4),
+        ("space_pure_sky", 400.0, -18.0, 2.0, -20.0, 5),
+        ("space_ground_reveal", 400.0, -20.0, 2.0, -20.0, 6),
+    ] {
+        let camera = View {
+            altitude_km: h,
+            pitch_deg: pitch,
+            fov_y_deg: fov,
+            sun_elevation_deg: sun,
+            sun_azimuth_deg: 0.0,
+            yaw_deg: 0.0,
+        };
+        frame(&gpu, &mut r, camera)?;
+        frame(&gpu, &mut full, camera)?;
+        assert_eq!(
+            r.stats.sky_updates,
+            initial_updates + expected_extra,
+            "{name}"
+        );
+        let a = read_texture(d, q, r.target_texture(), 16)?;
+        let b = read_texture(d, q, full.target_texture(), 16)?;
+        assert_eq!(a, b, "ground culling changed image {name}");
+        culling_events.push(serde_json::json!({"event":name,"image_bit_exact":true,
+            "sky_updates":r.stats.sky_updates,"full_chart_sky_updates":full.stats.sky_updates}));
+    }
+    assert_eq!(r.export_source(d, q)?, full.export_source(d, q)?);
+    drop(full);
+    // sky_size=72 has 54 sky rows, so its final workgroup includes padding
+    // inside the texture. Those threads must not touch the omitted chart.
+    let mut padded_config = Config::balanced();
+    padded_config.sky_size = 72;
+    let mut padded = Renderer::new(d, &model, &wavelengths, 0.18, padded_config.clone())?;
+    padded_config.skip_unused_ground = false;
+    let mut padded_full = Renderer::new(d, &model, &wavelengths, 0.18, padded_config)?;
+    padded.rebuild(d, q)?;
+    padded_full.rebuild(d, q)?;
+    padded.resize(d, [96, 54]);
+    padded_full.resize(d, [96, 54]);
+    for (name, pitch, expected) in [
+        ("padded_size_pure_sky", 30.0, 1),
+        ("padded_size_ground_reveal", -5.0, 2),
+    ] {
+        let camera = View {
+            altitude_km: 0.2,
+            pitch_deg: pitch,
+            fov_y_deg: 30.0,
+            sun_elevation_deg: -6.0,
+            sun_azimuth_deg: 0.0,
+            yaw_deg: 0.0,
+        };
+        frame(&gpu, &mut padded, camera)?;
+        frame(&gpu, &mut padded_full, camera)?;
+        assert_eq!(padded.stats.sky_updates, expected);
+        assert_eq!(
+            read_texture(d, q, padded.target_texture(), 16)?,
+            read_texture(d, q, padded_full.target_texture(), 16)?,
+            "{name}"
+        );
+        culling_events.push(serde_json::json!({"event":name,"sky_size":72,
+            "image_bit_exact":true,"sky_updates":padded.stats.sky_updates}));
+    }
+    drop(padded);
+    drop(padded_full);
     let original = r.export_source(d, q)?;
     let changed = sky_realtime::model::Model::earth_with_aerosol_scale(1.1)?;
     assert!(r.set_medium(d, q, &changed, &wavelengths, 0.18)?.is_some());
@@ -160,6 +239,7 @@ pub fn run(args: Options) -> Result<()> {
     std::fs::write(
         args.out,
         serde_json::to_vec_pretty(&serde_json::json!({"cache_events":events,
+        "ground_chart_culling":culling_events,
         "physical_changes_rebuild":true,"changed_medium_changes_actual_source":true,"medium_solves":r.stats.medium_solves,"segments":segments,
         "vacuum":"L=0,T=1","resident_bytes":r.resident_bytes(),"peak_payload_bytes":solve.peak_payload_bytes}))?,
     )?;

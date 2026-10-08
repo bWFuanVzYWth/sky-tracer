@@ -12,7 +12,10 @@ pub struct Options {
     config: Option<PathBuf>,
     #[arg(long)]
     wavelengths: Option<PathBuf>,
-    #[arg(long, default_value_t = 96)]
+    /// Offline-fitted coordinate JSON; immutable for this process.
+    #[arg(long)]
+    mapping: Option<PathBuf>,
+    #[arg(long, default_value_t = sky_realtime::DEFAULT_RUNTIME_STEPS)]
     steps: u32,
     #[arg(long)]
     verify_invalidation: bool,
@@ -27,6 +30,9 @@ pub fn run(a: Options) -> Result<()> {
     pollster::block_on(run_async(a))
 }
 async fn run_async(a: Options) -> Result<()> {
+    if let Some(path) = &a.mapping {
+        sky_realtime::mapping::load_calibration_json(&fs::read_to_string(path)?)?;
+    }
     fs::create_dir_all(&a.out)?;
     let c: Config = if let Some(path) = a.config {
         serde_json::from_slice(&fs::read(path)?)?
@@ -72,7 +78,7 @@ async fn run_async(a: Options) -> Result<()> {
         a.out.join("solve.json"),
         serde_json::to_vec_pretty(
             &serde_json::json!({"config":c,"aerosol_scale":a.aerosol_scale,"wavelengths":w,"adapter":adapter.get_info().name,"pipeline_create_ms":compile_ms,"solve":solve,
-                "mapping_calibration":serde_json::from_str::<serde_json::Value>(sky_realtime::mapping::CALIBRATION_JSON)?,
+                "mapping_calibration":serde_json::from_str::<serde_json::Value>(sky_realtime::mapping::calibration_json())?,
                 "shader_checksum":sky_realtime::checksum(sky_realtime::shader_source().as_bytes())}),
         )?,
     )?;
