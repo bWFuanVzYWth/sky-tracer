@@ -664,12 +664,12 @@ fn trace_work(@builtin(global_invocation_id) id: vec3<u32>) {
     let slots = p.batch.x * p.batch.z;
     if id.x >= slots || atomicLoad(&diagnostics.flags) != 0u { return; }
     let preview = (p.storage.w & 16u) != 0u;
-    let path_slot = p.batch.y + id.x;
+    let path_slot = p.batch.y + id.x % p.batch.z;
     var pixel = p.batch.y + id.x % p.batch.z;
     if preview { pixel = (path_slot * u32(p.index_min.w)) % (p.image.x * p.image.y); }
     current_pixel_index = pixel;
     current_sample_index = p.image.z + id.x / p.batch.z;
-    let path_index = select(id.x, path_slot, preview);
+    let path_index = select(id.x, path_slot * p.batch.x + id.x / p.batch.z, preview);
     var state = path_states[path_index];
     let already_done = state.stage == PATH_DONE;
     // Fixed finite work. A long legal path remains pending, never truncated.
@@ -694,7 +694,7 @@ fn reduce_work(@builtin(global_invocation_id) id: vec3<u32>) {
     if count < p.image.z || count > p.image.z + p.batch.x { fail(ERROR_NONFINITE, pixel); return; }
     for (var z = count - p.image.z; z < p.batch.x; z += 1u) {
         current_sample_index = p.image.z + z;
-        let path_index = select(z * p.batch.z + id.x, path_slot, preview);
+        let path_index = select(z * p.batch.z + id.x, path_slot * p.batch.x + z, preview);
         let sample = path_states[path_index];
         if sample.stage != PATH_DONE { break; }
         let previous_mean = film_mean[pixel].xyz;

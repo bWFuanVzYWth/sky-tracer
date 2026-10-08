@@ -19,6 +19,8 @@ pub struct Controls {
     pub speed: f64,
     pub sky_enabled: bool,
     pub local_ground: GroundPlane,
+    pub gpu_budget_percent: u32,
+    pub work_group_size: u32,
 }
 #[derive(Default)]
 pub struct Actions {
@@ -34,6 +36,11 @@ pub struct Progress {
     pub completed_paths: u32,
     pub total_paths: u32,
     pub message: Option<String>,
+    pub gpu_ms: Option<f64>,
+    pub gpu_duty_percent: Option<f64>,
+    pub gpu_chunk_max_ms: Option<f64>,
+    pub work_groups: u64,
+    pub actual_group_size: u32,
 }
 pub struct Prepared {
     jobs: Vec<egui::ClippedPrimitive>,
@@ -187,7 +194,7 @@ fn build_panel(
                     ui.label(format!("{} / {} spp",progress.samples,model.target_spp));
                     ui.add(egui::ProgressBar::new((progress.samples as f32/model.target_spp.max(1) as f32).min(1.0)).show_percentage());
                     if progress.total_paths>0 {
-                        ui.small(format!("Current pass: {} / {} pixels completed",progress.completed_paths,progress.total_paths));
+                        ui.small(format!("Current batch: {} / {} paths completed",progress.completed_paths,progress.total_paths));
                     }
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut model.paused,"Pause");
@@ -199,6 +206,18 @@ fn build_panel(
                         actions.target_changed|=ui.add(egui::DragValue::new(&mut model.target_spp).range(1..=16_777_216).speed(16)).changed();
                     }).response.on_hover_text("Changing the target starts a fresh fixed-spp accumulation.");
                     actions.display_changed|=ui.add(egui::Slider::new(&mut model.exposure,-30.0..=30.0).text("Exposure EV")).changed();
+                    ui.add(egui::Slider::new(&mut model.gpu_budget_percent,10..=100).text("GPU budget %"))
+                        .on_hover_text("Measured cloud work budget. Callback and CPU waiting do not create extra idle time.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Responsive").on_hover_text("Yield after each short work chunk.").clicked() {model.work_group_size=1;}
+                        if ui.button("Throughput").on_hover_text("Allow up to four short chunks, with measured response time controlling each group.").clicked() {model.work_group_size=4;}
+                    });
+                    ui.small(format!("Work group: {} / {} max | {} completed",progress.actual_group_size.max(1),model.work_group_size,progress.work_groups));
+                    if let (Some(ms),Some(duty),Some(max))=(progress.gpu_ms,progress.gpu_duty_percent,progress.gpu_chunk_max_ms) {
+                        ui.small(format!("Cloud GPU {:.1} ms | duty {:.1}%",ms,duty));
+                        ui.small(format!("Slowest work chunk {:.2} ms",max));
+                    } else if progress.gpu_ms.is_some() {ui.small("GPU timing pending");}
+                    else {ui.small("GPU timestamps unavailable; one work chunk per submission");}
                     if let Some(message)=&progress.message {ui.small(message);}
                     ui.separator();
                     ui.collapsing("Lighting and medium",|ui| {
@@ -288,6 +307,8 @@ mod tests {
             exposure: 0.0,
             speed: 100.0,
             sky_enabled: true,
+            gpu_budget_percent: 80,
+            work_group_size: 4,
             local_ground: GroundPlane {
                 height: -1000.0,
                 albedo: DVec3::splat(0.2),

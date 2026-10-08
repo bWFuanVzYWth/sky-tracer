@@ -80,6 +80,12 @@ enum Command {
         /// Diagnostic only: asynchronously save a rendered UI preview PNG.
         #[arg(long)]
         capture_preview: Option<PathBuf>,
+        /// Desired compute budget; UI can change it without resetting samples.
+        #[arg(long)]
+        gpu_budget_percent: Option<u32>,
+        /// Maximum bounded dispatches per readback; adapts to GPU timing (1..=8).
+        #[arg(long)]
+        work_group_size: Option<u32>,
     },
     /// Save linear EXR and sample statistics. GPU rendering is explicitly selected.
     Render {
@@ -111,7 +117,7 @@ struct Options {
     height: Option<u32>,
     #[arg(long)]
     spp: Option<u32>,
-    /// Offline GPU samples per logical batch; the full-frame viewer uses one sample at a time.
+    /// GPU samples per logical batch: viewer accepts 1..=4 (0 chooses 4).
     #[arg(long)]
     sample_batch_size: Option<u32>,
     #[arg(long)]
@@ -156,6 +162,12 @@ impl Options {
         if self.scene.is_none() {
             scene.render.width = self.width.unwrap_or(128);
             scene.render.height = self.height.unwrap_or(72);
+        }
+        if scene.render.sample_batch_size == 0 {
+            scene.render.sample_batch_size = 4;
+        }
+        if scene.render.sample_batch_size > 4 {
+            return Err("cloud viewer --sample-batch-size must be 0..=4".into());
         }
         scene.render.validate()?;
         Ok(scene)
@@ -286,15 +298,22 @@ fn main() -> Result<()> {
             exit_after_seconds,
             smoke_frames,
             capture_preview,
+            gpu_budget_percent,
+            work_group_size,
         } => {
-            let view_options = view_options(exit_after_seconds, smoke_frames, capture_preview)?;
+            let view_options = view_options(
+                exit_after_seconds,
+                smoke_frames,
+                capture_preview,
+                gpu_budget_percent,
+                work_group_size,
+            )?;
             let mut scene = options.resolve_view()?;
             // The full-sphere sky includes its distant spherical ground. Keep
             // the legacy local plane only when an explicit scene requests it.
             if options.scene.is_none() {
                 scene.transport.ground = None;
             }
-            scene.render.sample_batch_size = 1;
             let volume = load(&options)?;
             let record = record(&options, &scene, &volume, "gpu-f32")?;
             let packed = volume.pack_gpu()?;
@@ -456,6 +475,8 @@ fn view_options(
     exit_after_seconds: Option<f64>,
     smoke_frames: Option<u64>,
     capture_preview: Option<PathBuf>,
+    gpu_budget_percent: Option<u32>,
+    work_group_size: Option<u32>,
 ) -> Result<app::ViewOptions> {
     let exit_after = if let Some(seconds) = exit_after_seconds {
         if !seconds.is_finite() || !(0.001..=3600.0).contains(&seconds) {
@@ -477,10 +498,18 @@ fn view_options(
             return Err("--capture-preview requires a new .png file".into());
         }
     }
+    if gpu_budget_percent.is_some_and(|p| !(10..=100).contains(&p)) {
+        return Err("--gpu-budget-percent must be in 10..=100".into());
+    }
+    if work_group_size.is_some_and(|p| !(1..=8).contains(&p)) {
+        return Err("--work-group-size must be in 1..=8".into());
+    }
     Ok(app::ViewOptions {
         exit_after,
         smoke_frames,
         capture_preview,
+        gpu_budget_percent,
+        work_group_size,
     })
 }
 
@@ -502,6 +531,8 @@ mod viewer_cli_tests {
         );
         assert_eq!(interactive.render.spp, 1024);
         assert_eq!(offline.render.spp, interactive.render.spp);
+        assert_eq!(interactive.render.sample_batch_size, 4);
+        assert_eq!(offline.render.sample_batch_size, 0);
         assert_eq!(
             offline.transport.extinction_scale,
             interactive.transport.extinction_scale
@@ -531,6 +562,8 @@ mod viewer_cli_tests {
             exit_after_seconds,
             smoke_frames,
             capture_preview,
+            gpu_budget_percent,
+            work_group_size,
         } = cli.command
         else {
             panic!("expected view");
@@ -538,15 +571,58 @@ mod viewer_cli_tests {
         let scene = options.resolve_view().unwrap();
         assert_eq!([scene.render.width, scene.render.height], [192, 108]);
         assert_eq!(
-            view_options(exit_after_seconds, smoke_frames, capture_preview)
-                .unwrap()
-                .exit_after,
+            view_options(
+                exit_after_seconds,
+                smoke_frames,
+                capture_preview,
+                gpu_budget_percent,
+                work_group_size
+            )
+            .unwrap()
+            .exit_after,
             Some(Duration::from_secs(3))
         );
         for duration in [f64::NAN, f64::INFINITY, -1.0, 0.0, 3601.0] {
-            assert!(view_options(Some(duration), None, None).is_err());
+            assert!(view_options(Some(duration), None, None, None, None).is_err());
         }
-        assert!(view_options(None, Some(0), None).is_err());
-        assert!(view_options(None, Some(10001), None).is_err());
+        assert!(view_options(None, Some(0), None, None, None).is_err());
+        assert!(view_options(None, Some(10001), None, None, None).is_err());
+    }
+
+    #[test]
+    fn viewer_throughput_overrides_do_not_change_the_reference_budget() {
+        for requested in [0, 1, 4, 5] {
+            let cli = Cli::try_parse_from([
+                "cloud-demo",
+                "view",
+                "--sample-batch-size",
+                &requested.to_string(),
+            ])
+            .unwrap();
+            let Command::View { options, .. } = cli.command else {
+                panic!("expected view");
+            };
+            assert_eq!(
+                options.resolve().unwrap().render.sample_batch_size,
+                requested
+            );
+            if requested == 5 {
+                assert!(options.resolve_view().is_err());
+            } else {
+                assert_eq!(
+                    options.resolve_view().unwrap().render.sample_batch_size,
+                    if requested == 0 { 4 } else { requested }
+                );
+            }
+        }
+        for budget in [0, 9, 101] {
+            assert!(view_options(None, None, None, Some(budget), None).is_err());
+        }
+        for maximum in [0, 9] {
+            assert!(view_options(None, None, None, None, Some(maximum)).is_err());
+        }
+        let view = view_options(None, None, None, Some(100), Some(8)).unwrap();
+        assert_eq!(view.gpu_budget_percent, Some(100));
+        assert_eq!(view.work_group_size, Some(8));
     }
 }

@@ -30,6 +30,23 @@ coverage, and exports no partially sampled reference:
 target\release\examples\environment_smoke.exe out\cloud_preview_work_probe_new --preview-work-probe
 ```
 
+The grouped check compares four parallel samples per pixel with the frozen
+4×2×4 reference using groups of 1, 4 and 8 bounded kernels. A zero-density
+128×72 scene then verifies partial-count rejection, reset, and a four-sample
+batch followed by a three-sample batch. Each group uses ordered uniform
+snapshots and one final progress completion. Individual and whole-group GPU
+timestamps are recorded; kernels retain the 128-transition bound.
+
+```powershell
+target\release\examples\environment_smoke.exe out\cloud_grouped_preview_new --grouped-preview
+target\release\examples\environment_smoke.exe out\cloud_grouped_work_probe_new --grouped-work-probe
+```
+
+The grouped workload probe tries real-cloud group sizes 1, 4 and 8 in sequence.
+It stops above 100 ms and skips a larger size if the preceding group predicts
+that limit. Its short latency observations guide interactive submission size;
+they do not establish throughput over complete paths or a stable P99.
+
 `bounded_smoke` retains the offline scheduling check (dimensions at most 8×4 and
 32 samples), with EXR/variance export and work-ticket/reset checks:
 

@@ -1,5 +1,5 @@
 //! Explicit tiny GPU QA, independent of the application and realtime renderer.
-//! Usage: cargo run -p cloud-demo --example environment_smoke --release -- NEW_DIR [--preview-only|--preview-work-probe]
+//! Usage: cargo run -p cloud-demo --example environment_smoke --release -- NEW_DIR [--preview-only|--preview-work-probe|--grouped-preview|--grouped-work-probe]
 use cloud_pt::{
     Result,
     config::{Camera, RenderConfig},
@@ -285,7 +285,7 @@ fn preview_qa(
         width: 128,
         height: 72,
         spp: 2,
-        sample_batch_size: 1024,
+        sample_batch_size: 1,
         ..Default::default()
     };
     let camera = Camera {
@@ -449,13 +449,278 @@ fn preview_work_probe(
     Ok(())
 }
 
+fn grouped_chunk(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    renderer: &mut ProgressiveRenderer,
+    chunks: u32,
+) -> Result<(cloud_pt::gpu::WorkProgress, f64, Vec<f64>)> {
+    let count = renderer
+        .sample_batch_capacity()
+        .min(renderer.target_samples() - renderer.sample_count());
+    let mut encoder = device.create_command_encoder(&Default::default());
+    renderer.encode_work_group(device, queue, &mut encoder, count, chunks)?;
+    assert_eq!(renderer.work_group_size(), chunks);
+    assert_eq!(
+        renderer.work_chunk_timing_buffer().unwrap().1,
+        u64::from(chunks) * 16
+    );
+    queue.submit([encoder.finish()]);
+    let progress = renderer.read_progress(device, queue)?;
+    let whole = renderer.read_work_milliseconds(device, queue)?.unwrap();
+    let individual = renderer
+        .read_work_chunk_milliseconds(device, queue)?
+        .unwrap();
+    assert_eq!(individual.len(), chunks as usize);
+    assert!(individual.iter().sum::<f64>() <= whole + 0.001);
+    if whole > 100.0 || individual.iter().any(|&ms| ms > 100.0) {
+        return Err(format!("bounded GPU group exceeded100ms: whole{whole}ms, chunks{individual:?}; no new submission").into());
+    }
+    Ok((progress, whole, individual))
+}
+
+fn grouped_preview_qa(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    volume: &SparseGpuVolume,
+    out: &Path,
+    adapter: &str,
+) -> Result<()> {
+    let config = RenderConfig {
+        width: 4,
+        height: 2,
+        spp: 4,
+        sample_batch_size: 4,
+        ..Default::default()
+    };
+    let camera = Camera::default();
+    let settings = TransportSettings::default();
+    let frozen = Path::new("out/cloud_bounded_qa_v1/budget128_4x2x4/reference");
+    let frozen_mean = read_rgb(&frozen.join("radiance.exr"))?;
+    let frozen_variance = read_rgb(&frozen.join("sample_variance.exr"))?;
+    let mut comparisons = Vec::new();
+    for chunks in [1, 4, 8] {
+        let mut renderer =
+            ProgressiveRenderer::new_preview(device, queue, volume, &camera, &settings, &config)?;
+        assert_eq!(renderer.sample_batch_capacity(), 4);
+        let start = Instant::now();
+        let mut whole_times = Vec::new();
+        let mut individual_times = Vec::new();
+        while renderer.sample_count() < config.spp {
+            let (_, whole, individual) = grouped_chunk(device, queue, &mut renderer, chunks)?;
+            whole_times.push(whole);
+            individual_times.extend(individual);
+            if whole_times.len() > 20_000 {
+                return Err("tiny grouped QA exceeds host submission budget".into());
+            }
+        }
+        let film = renderer.read_film(device, queue)?;
+        let mean_diff = bit_differences(&film.mean, &frozen_mean);
+        let variance_diff = bit_differences(&film.sample_variance, &frozen_variance);
+        let result = json!({"group_chunks": chunks, "cohort": 4, "mean_bit_differences": mean_diff,
+            "variance_bit_differences": variance_diff, "mean": film.mean, "sample_variance": film.sample_variance,
+            "timing": metrics(&whole_times, start.elapsed().as_secs_f64()),
+            "individual_dispatch_ms": individual_times,
+            "max_kernel_ms": individual_times.iter().copied().reduce(f64::max)});
+        write_json(&out.join(format!("group{chunks}.json")), &result)?;
+        if mean_diff != 0 || variance_diff != 0 {
+            return Err("grouped preview changed frozen mean/variance bits".into());
+        }
+        comparisons.push(result);
+    }
+    let vacuum = SparseGpuVolume {
+        hash: vec![[0, 0, 0, u32::MAX]],
+        values: Vec::new(),
+        tiles: Vec::new(),
+        majorant_hash: vec![[0, 0, 0, u32::MAX]],
+        transform: UniformTransform {
+            scale: 1.0,
+            translation: DVec3::ZERO,
+        },
+        index_bounds: Bounds {
+            min: DVec3::splat(-1.0),
+            max: DVec3::splat(1.0),
+        },
+        majorant: 1.0,
+    };
+    let config = RenderConfig {
+        width: 128,
+        height: 72,
+        spp: 7,
+        sample_batch_size: 4,
+        ..Default::default()
+    };
+    let camera = Camera {
+        origin: DVec3::ZERO,
+        target: DVec3::Z,
+        up: DVec3::Y,
+        horizontal_fov_deg: 54.43,
+    };
+    let rgb = [0.15f32, 0.3, 0.6];
+    let settings = TransportSettings {
+        ground: None,
+        sun_irradiance: DVec3::ZERO,
+        sky_radiance: DVec3::from_array(rgb.map(f64::from)),
+        ..Default::default()
+    };
+    let sky = constant_texture(device, queue, rgb);
+    let sun = constant_texture(device, queue, [0.0; 3]);
+    let mut renderer =
+        ProgressiveRenderer::new_preview(device, queue, &vacuum, &camera, &settings, &config)?;
+    renderer.set_environment(device, queue, Some((&sky, &sun)))?;
+    let mut encoder = device.create_command_encoder(&Default::default());
+    assert!(
+        renderer
+            .encode_work_group(device, queue, &mut encoder, 4, 0)
+            .is_err()
+    );
+    assert!(
+        renderer
+            .encode_work_group(device, queue, &mut encoder, 4, 9)
+            .is_err()
+    );
+    let (partial, _, _) = grouped_chunk(device, queue, &mut renderer, 4)?;
+    assert_eq!(partial.completed_paths, 4 * 4096);
+    assert_eq!(partial.total_paths, 4 * 128 * 72);
+    assert_eq!(renderer.sample_count(), 0);
+    assert!(renderer.read_film(device, queue).is_err());
+    assert!(renderer.set_target_samples(8).is_err());
+    assert!(renderer.set_environment(device, queue, None).is_err());
+    let counts = read_pixel_counts(device, queue, &renderer)?;
+    assert_eq!(counts.iter().filter(|&&n| n == 4).count(), 4096);
+    assert_eq!(counts.iter().filter(|&&n| n == 0).count(), 5120);
+    renderer.reset(device, queue, &camera, &settings)?;
+    assert!(
+        read_pixel_counts(device, queue, &renderer)?
+            .iter()
+            .all(|&n| n == 0)
+    );
+    renderer.set_target_samples(7)?;
+    renderer.set_environment(device, queue, None)?;
+    grouped_chunk(device, queue, &mut renderer, 4)?;
+    let (finished4, _, _) = grouped_chunk(device, queue, &mut renderer, 8)?;
+    assert_eq!(finished4.completed_paths, 4 * 128 * 72);
+    assert_eq!(renderer.sample_count(), 4);
+    assert!(
+        read_pixel_counts(device, queue, &renderer)?
+            .iter()
+            .all(|&n| n == 4)
+    );
+    let (finished7, _, _) = grouped_chunk(device, queue, &mut renderer, 8)?;
+    assert_eq!(finished7.batch_samples, 3);
+    assert_eq!(finished7.completed_paths, 3 * 128 * 72);
+    assert_eq!(renderer.sample_count(), 7);
+    let film = renderer.read_film(device, queue)?;
+    assert!(
+        film.mean
+            .iter()
+            .all(|pixel| pixel.map(f32::to_bits) == rgb.map(f32::to_bits))
+    );
+    assert!(film.sample_variance.iter().flatten().all(|&v| v == 0.0));
+    write_json(
+        &out.join("summary.json"),
+        &json!({"complete": true, "adapter": adapter,
+        "grouped_preview_reference_bitexact": true, "tested_groups": [1,4,8], "cohort_capacity": 4,
+        "vacuum_dimensions": [128,72], "last_batch_size": 3, "total_samples": 7,
+        "group_must_not_start_next_batch": true, "partial_sample_counts_rejected": true,
+        "reset_cleared_all_partial_pixels": true, "zero_variance_exact": true,
+        "max_slots_per_kernel": MAX_WORK_PATHS, "transitions_per_slot": PREVIEW_WORK_TRANSITIONS,
+        "group_comparisons": comparisons}),
+    )?;
+    println!(
+        "grouped preview QA complete: groups1/4/8cohort4 frozen bitexact;vacuum reset and4+3sample batches exact"
+    );
+    Ok(())
+}
+
+fn grouped_work_probe(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    volume: &SparseGpuVolume,
+    out: &Path,
+    adapter: &str,
+) -> Result<()> {
+    let config = RenderConfig {
+        width: 128,
+        height: 72,
+        spp: 4,
+        sample_batch_size: 4,
+        ..Default::default()
+    };
+    let camera = Camera::default();
+    let settings = TransportSettings {
+        ground: None,
+        ..Default::default()
+    };
+    let sky = constant_texture(device, queue, [0.15, 0.3, 0.6]);
+    let sun = constant_texture(device, queue, [2.6, 2.5, 2.3]);
+    let mut renderer =
+        ProgressiveRenderer::new_preview(device, queue, volume, &camera, &settings, &config)?;
+    renderer.set_environment(device, queue, Some((&sky, &sun)))?;
+    let mut results = Vec::new();
+    let mut previous = None;
+    for chunks in [1, 4, 8] {
+        if let Some((previous_chunks, previous_ms)) = previous {
+            if previous_ms * f64::from(chunks) / f64::from(previous_chunks) > 100.0 {
+                results.push(json!({"group_chunks": chunks, "skipped": true, "reason": "preceding measured group predicts over100ms"}));
+                break;
+            }
+        }
+        let wall = Instant::now();
+        let (progress, whole, individual) = match grouped_chunk(
+            device,
+            queue,
+            &mut renderer,
+            chunks,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                write_json(
+                    &out.join("failure.json"),
+                    &json!({"error": error.to_string(), "previous_results": results, "no_more_submissions": true}),
+                )?;
+                return Err(error);
+            }
+        };
+        let entry = json!({"group_chunks": chunks, "whole_gpu_ms": whole,
+            "kernel_ms": individual, "sum_kernel_ms": individual.iter().sum::<f64>(),
+            "max_kernel_ms": individual.iter().copied().reduce(f64::max),
+            "wall_seconds": wall.elapsed().as_secs_f64(), "samples": renderer.sample_count(),
+            "completed_paths": progress.completed_paths, "total_paths": progress.total_paths,
+            "within12ms_group_target": whole <= 12.0});
+        println!(
+            "real grouped probe {chunks}:whole{whole:.3}ms,maxkernel{:.3}ms",
+            individual.iter().copied().reduce(f64::max).unwrap()
+        );
+        results.push(entry);
+        write_json(&out.join("progress.json"), &json!({"groups": results}))?;
+        previous = Some((chunks, whole));
+        if progress.batch_finished {
+            break;
+        }
+    }
+    let counts = read_pixel_counts(device, queue, &renderer)?;
+    write_json(
+        &out.join("summary.json"),
+        &json!({"complete": true,"adapter": adapter,
+        "dimensions": [128,72], "cohort": 4, "transitions_per_slot": PREVIEW_WORK_TRANSITIONS,
+        "max_slots_per_kernel": MAX_WORK_PATHS, "group_results": results,
+        "samples_completed": renderer.sample_count(), "visible_pixels": counts.iter().filter(|&&n| n > 0).count(),
+        "visible_sample_sum": counts.iter().sum::<u32>(), "reference_exported": false,
+        "limits": "One measured group per size on a progressing scene, not a statistically stable benchmark; GPU blocks remain fixed and bounded. Group duration governs viewer latency."}),
+    )?;
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let preview_only = args.len() == 2 && args[1] == "--preview-only";
     let work_probe = args.len() == 2 && args[1] == "--preview-work-probe";
-    if args.len() != 1 && !preview_only && !work_probe {
+    let grouped_only = args.len() == 2 && args[1] == "--grouped-preview";
+    let grouped_probe = args.len() == 2 && args[1] == "--grouped-work-probe";
+    if args.len() != 1 && !preview_only && !work_probe && !grouped_only && !grouped_probe {
         return Err(
-            "usage: environment_smoke NEW_OUTPUT_DIRECTORY [--preview-only|--preview-work-probe]"
+            "usage: environment_smoke NEW_OUTPUT_DIRECTORY [--preview-only|--preview-work-probe|--grouped-preview|--grouped-work-probe]"
                 .into(),
         );
     }
@@ -483,6 +748,12 @@ fn main() -> Result<()> {
     }
     if work_probe {
         return preview_work_probe(&device, &queue, &volume, out, &adapter);
+    }
+    if grouped_only {
+        return grouped_preview_qa(&device, &queue, &volume, out, &adapter);
+    }
+    if grouped_probe {
+        return grouped_work_probe(&device, &queue, &volume, out, &adapter);
     }
     let rgb = [0.15f32, 0.3, 0.6];
     let sky = constant_texture(&device, &queue, rgb);

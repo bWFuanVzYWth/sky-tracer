@@ -22,6 +22,8 @@ pub const WORK_TRANSITIONS: u32 = 128;
 /// Preview retains the measured responsive finite budget. Larger 256/512
 /// candidates increased full-frame dispatch latency and were rejected.
 pub const PREVIEW_WORK_TRANSITIONS: u32 = 128;
+pub const MAX_PREVIEW_BATCH: u32 = 4;
+pub const MAX_WORK_GROUP_CHUNKS: u32 = 8;
 pub const WORK_PROGRESS_BYTES: u64 = 32;
 const PATH_STATE_BYTES: u64 = 288;
 const DIRECTIONAL_ENVIRONMENT: u32 = 8;
@@ -97,7 +99,7 @@ impl Diagnostics {
 
 /// One completed bounded submission. Samples advance only at a whole-image
 /// batch boundary; partially updated pixels are for display, not film export.
-/// Preview reports cumulative completed paths for the full current sample;
+/// Preview reports cumulative completed paths for the full current batch;
 /// offline mode reports completed paths within the current bounded tile.
 #[derive(Clone, Copy, Debug)]
 pub struct WorkProgress {
@@ -116,6 +118,11 @@ struct WorkBatch {
     tile_pixels: u32,
     initialized: bool,
 }
+struct WorkTimer {
+    queries: wgpu::QuerySet,
+    resolved: wgpu::Buffer,
+    whole_group: wgpu::Buffer,
+}
 
 pub struct ProgressiveRenderer {
     params: Params,
@@ -130,7 +137,7 @@ pub struct ProgressiveRenderer {
     m2: wgpu::Buffer,
     diagnostics: wgpu::Buffer,
     path_states: wgpu::Buffer,
-    timer: Option<(wgpu::QuerySet, wgpu::Buffer)>,
+    timer: Option<WorkTimer>,
     film_bytes: u64,
     sample_batch_capacity: u32,
     sample_batch_bytes: u64,
@@ -144,6 +151,7 @@ pub struct ProgressiveRenderer {
     epoch: u64,
     serial: u64,
     encoded_work: bool,
+    encoded_chunks: u32,
 }
 
 impl ProgressiveRenderer {
@@ -158,12 +166,12 @@ impl ProgressiveRenderer {
         Self::new_with_schedule(device, queue, volume, camera, settings, config, false)
     }
 
-    /// Interactive estimator with one persistent path per film pixel. Bounded
+    /// Interactive estimator with up to four persistent paths per film pixel. Bounded
     /// submissions visit a fixed permutation of pixels in round-robin order,
     /// spreading each submission over the image and advancing each
     /// slice without waiting for its longest path. Completed pixels commit in
     /// sample order; a completed full frame remains identical to offline mode.
-    /// `sample_batch_size` is ignored: preview uses one sample at a time.
+    /// `sample_batch_size` selects 1..=4 parallel samples; zero retains one.
     /// Insufficient full-frame storage is an error, never a tiled fallback.
     pub fn new_preview(
         device: &wgpu::Device,
@@ -222,13 +230,18 @@ impl ProgressiveRenderer {
         let film_bytes = u64::from(config.width) * u64::from(config.height) * 16;
         let limits = device.limits();
         let sample_batch_capacity = if full_frame_preview {
-            1
+            preview_batch_capacity(config)?
         } else {
             batch_capacity(config, &limits)?
         };
         let work_capacity = work_pool_capacity(&limits)?;
+        if sample_batch_capacity > work_capacity {
+            return Err("cloud sample batch exceeds the bounded dispatch capacity".into());
+        }
         let stored_paths = if full_frame_preview {
-            config.width * config.height
+            (config.width * config.height)
+                .checked_mul(sample_batch_capacity)
+                .ok_or("full-frame cloud path indexing exceeds u32")?
         } else {
             work_capacity
         };
@@ -301,20 +314,24 @@ impl ProgressiveRenderer {
         let timer = device
             .features()
             .contains(wgpu::Features::TIMESTAMP_QUERY)
-            .then(|| {
-                (
-                    device.create_query_set(&wgpu::QuerySetDescriptor {
-                        label: Some("cloud sample or batch timestamps"),
-                        ty: wgpu::QueryType::Timestamp,
-                        count: 2,
-                    }),
-                    device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("cloud timestamp resolve"),
-                        size: 16,
-                        usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
-                        mapped_at_creation: false,
-                    }),
-                )
+            .then(|| WorkTimer {
+                queries: device.create_query_set(&wgpu::QuerySetDescriptor {
+                    label: Some("cloud sample or batch timestamps"),
+                    ty: wgpu::QueryType::Timestamp,
+                    count: MAX_WORK_GROUP_CHUNKS * 2,
+                }),
+                resolved: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("cloud timestamp resolve"),
+                    size: u64::from(MAX_WORK_GROUP_CHUNKS) * 16,
+                    usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                }),
+                whole_group: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("cloud whole work group timestamps"),
+                    size: 16,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                }),
             });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cloud unbiased delta tracking"),
@@ -434,6 +451,7 @@ impl ProgressiveRenderer {
             epoch: 0,
             serial: 0,
             encoded_work: false,
+            encoded_chunks: 0,
         };
         result.clear(device, queue);
         Ok(result)
@@ -446,10 +464,28 @@ impl ProgressiveRenderer {
     pub fn encode_work(
         &mut self,
         device: &wgpu::Device,
-        _queue: &wgpu::Queue,
+        queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         count: u32,
     ) -> Result<()> {
+        self.encode_work_group(device, queue, encoder, count, 1)
+    }
+
+    /// Encode 1..=8 bounded preview chunks into one submission and await only
+    /// its final progress ticket. Every kernel still advances at most 4096
+    /// paths by 128 transitions. Uniform snapshots are copied in encoder order.
+    /// A group never starts another logical batch: if all paths finish early,
+    /// the remaining chunks only revisit completed states and commit nothing.
+    /// Offline mode permits only one chunk, retaining its original scheduling.
+    pub fn encode_work_group(
+        &mut self,
+        device: &wgpu::Device,
+        _queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        count: u32,
+        chunks: u32,
+    ) -> Result<()> {
+        validate_work_group(chunks, self.full_frame_preview)?;
         if self.poisoned.get() {
             return Err("cloud film is invalid; reset before rendering again".into());
         }
@@ -490,83 +526,102 @@ impl ProgressiveRenderer {
             .checked_add(1)
             .ok_or("cloud work serial exhausted")?;
         self.params.image[2] = self.samples;
-        self.params.batch = [
-            count,
-            active.tile_start,
-            active.tile_pixels,
-            if self.full_frame_preview {
-                PREVIEW_WORK_TRANSITIONS
-            } else {
-                WORK_TRANSITIONS
-            },
-        ];
         self.params.work = [
             self.epoch as u32,
             (self.epoch >> 32) as u32,
             self.serial as u32,
             (self.serial >> 32) as u32,
         ];
-        let upload = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("cloud chunk constants and epoch ticket"),
-            contents: bytemuck::bytes_of(&self.params),
-            usage: wgpu::BufferUsages::COPY_SRC,
-        });
-        encoder.copy_buffer_to_buffer(
-            &upload,
-            0,
-            &self.uniform,
-            0,
-            std::mem::size_of::<Params>() as u64,
-        );
-        // Preview accumulates each newly finished pixel exactly once across
-        // all slices; offline counts the current tile's terminal paths anew.
-        if !self.full_frame_preview || initialize {
-            encoder.clear_buffer(&self.diagnostics, 12, Some(4));
-        }
-        encoder.copy_buffer_to_buffer(
-            &upload,
-            std::mem::offset_of!(Params, work) as u64,
-            &self.diagnostics,
-            16,
-            16,
-        );
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("cloud bounded continuation"),
-                timestamp_writes: self.timer.as_ref().map(|(query_set, _)| {
-                    wgpu::ComputePassTimestampWrites {
-                        query_set,
-                        beginning_of_pass_write_index: Some(0),
-                        end_of_pass_write_index: None,
-                    }
-                }),
+        for chunk in 0..chunks {
+            let active = self.active.as_ref().unwrap();
+            self.params.batch = [
+                count,
+                active.tile_start,
+                active.tile_pixels,
+                if self.full_frame_preview {
+                    PREVIEW_WORK_TRANSITIONS
+                } else {
+                    WORK_TRANSITIONS
+                },
+            ];
+            let upload = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("cloud chunk constants and epoch ticket"),
+                contents: bytemuck::bytes_of(&self.params),
+                usage: wgpu::BufferUsages::COPY_SRC,
             });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.dispatch_workgroups((count * active.tile_pixels).div_ceil(64), 1, 1);
+            encoder.copy_buffer_to_buffer(
+                &upload,
+                0,
+                &self.uniform,
+                0,
+                std::mem::size_of::<Params>() as u64,
+            );
+            // Preview accumulates each newly finished pixel exactly once across
+            // all slices; offline counts the current tile's terminal paths anew.
+            if chunk == 0 && (!self.full_frame_preview || initialize) {
+                encoder.clear_buffer(&self.diagnostics, 12, Some(4));
+            }
+            encoder.copy_buffer_to_buffer(
+                &upload,
+                std::mem::offset_of!(Params, work) as u64,
+                &self.diagnostics,
+                16,
+                16,
+            );
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("cloud bounded continuation"),
+                    timestamp_writes: self.timer.as_ref().map(|timer| {
+                        wgpu::ComputePassTimestampWrites {
+                            query_set: &timer.queries,
+                            beginning_of_pass_write_index: Some(chunk * 2),
+                            end_of_pass_write_index: None,
+                        }
+                    }),
+                });
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.dispatch_workgroups((count * active.tile_pixels).div_ceil(64), 1, 1);
+            }
+            {
+                // Always execute this pass, including pending tiles, to initialize
+                // timestamp1. Each pixel commits only its completed sample prefix.
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("cloud completed sample-prefix reduction"),
+                    timestamp_writes: self.timer.as_ref().map(|timer| {
+                        wgpu::ComputePassTimestampWrites {
+                            query_set: &timer.queries,
+                            beginning_of_pass_write_index: None,
+                            end_of_pass_write_index: Some(chunk * 2 + 1),
+                        }
+                    }),
+                });
+                pass.set_pipeline(&self.reduce_pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.dispatch_workgroups(active.tile_pixels.div_ceil(64), 1, 1);
+            }
+            if chunk + 1 < chunks {
+                advance_preview_slice(
+                    self.active.as_mut().unwrap(),
+                    self.params.image[0] * self.params.image[1],
+                    self.work_capacity,
+                );
+            }
         }
-        {
-            // Always execute this pass, including pending tiles, to initialize
-            // timestamp1. Each pixel commits only its completed sample prefix.
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("cloud completed sample-prefix reduction"),
-                timestamp_writes: self.timer.as_ref().map(|(query_set, _)| {
-                    wgpu::ComputePassTimestampWrites {
-                        query_set,
-                        beginning_of_pass_write_index: None,
-                        end_of_pass_write_index: Some(1),
-                    }
-                }),
-            });
-            pass.set_pipeline(&self.reduce_pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.dispatch_workgroups(active.tile_pixels.div_ceil(64), 1, 1);
-        }
-        if let Some((queries, resolved)) = &self.timer {
-            encoder.resolve_query_set(queries, 0..2, resolved, 0);
+        if let Some(timer) = &self.timer {
+            encoder.resolve_query_set(&timer.queries, 0..chunks * 2, &timer.resolved, 0);
+            encoder.copy_buffer_to_buffer(&timer.resolved, 0, &timer.whole_group, 0, 8);
+            encoder.copy_buffer_to_buffer(
+                &timer.resolved,
+                u64::from(chunks) * 16 - 8,
+                &timer.whole_group,
+                8,
+                8,
+            );
         }
         self.in_flight = Some(self.params.work);
         self.encoded_work = true;
+        self.encoded_chunks = chunks;
         Ok(())
     }
     /// Compatibility alias for one bounded chunk of a one-sample batch. This
@@ -594,7 +649,7 @@ impl ProgressiveRenderer {
     pub fn sample_batch_capacity(&self) -> u32 {
         self.sample_batch_capacity
     }
-    /// Persistent continuation storage. Preview keeps one state per pixel;
+    /// Persistent continuation storage. Preview keeps batch-capacity states per pixel;
     /// offline mode uses the fixed bounded pool.
     pub fn sample_batch_storage_bytes(&self) -> u64 {
         self.sample_batch_bytes
@@ -625,7 +680,7 @@ impl ProgressiveRenderer {
         let active = self.active.as_mut().ok_or("missing cloud active batch")?;
         let total_pixels = self.params.image[0] * self.params.image[1];
         let total_paths = if self.full_frame_preview {
-            total_pixels
+            active.count * total_pixels
         } else {
             active.count * active.tile_pixels
         };
@@ -772,6 +827,7 @@ impl ProgressiveRenderer {
         self.epoch = epoch;
         self.active = None;
         self.encoded_work = false;
+        self.encoded_chunks = 0;
         self.poisoned.set(false);
         self.clear(device, queue);
     }
@@ -806,21 +862,22 @@ impl ProgressiveRenderer {
         Ok(value)
     }
 
-    /// GPU compute time for the latest bounded chunk (trace + conditional
-    /// reduction), excluding setup/readbacks. Sum chunks for a complete batch.
+    /// GPU time for the latest submitted work group, including every bounded
+    /// trace/reduction pair and the ordered uniform copies between them.
+    /// Setup and readbacks are excluded. Sum groups for a complete batch.
     /// Absent when timestamp queries are unsupported by the selected device.
     pub fn read_sample_milliseconds(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) -> Result<Option<f64>> {
-        let Some((_, resolved)) = &self.timer else {
+        let Some(timer) = &self.timer else {
             return Ok(None);
         };
         if !self.encoded_work {
             return Err("no cloud work was submitted for timing".into());
         }
-        let bytes = read_buffers(device, queue, &[(resolved, 16)])?;
+        let bytes = read_buffers(device, queue, &[(&timer.whole_group, 16)])?;
         let ticks: &[u64] = bytemuck::cast_slice(&bytes[0]);
         let elapsed = ticks[1]
             .checked_sub(ticks[0])
@@ -836,6 +893,54 @@ impl ProgressiveRenderer {
         queue: &wgpu::Queue,
     ) -> Result<Option<f64>> {
         self.read_sample_milliseconds(device, queue)
+    }
+
+    /// Two u64 GPU ticks (group start, group end), ready for an asynchronous
+    /// copy alongside `progress_buffer` after encoding the group. Use the
+    /// queue's timestamp period to convert their difference to milliseconds.
+    pub fn work_timing_buffer(&self) -> Option<&wgpu::Buffer> {
+        self.timer.as_ref().map(|timer| &timer.whole_group)
+    }
+    pub fn work_group_size(&self) -> u32 {
+        self.encoded_chunks
+    }
+    /// Ordered per-chunk timestamp pairs and their valid byte count. Copy them
+    /// in the same encoder as final progress and decode after its completion.
+    pub fn work_chunk_timing_buffer(&self) -> Option<(&wgpu::Buffer, u64)> {
+        self.timer
+            .as_ref()
+            .map(|timer| (&timer.resolved, u64::from(self.encoded_chunks) * 16))
+    }
+    /// Blocking headless diagnostic for the individual dispatch-pair durations.
+    /// Interactive callers should read `work_timing_buffer` asynchronously.
+    pub fn read_work_chunk_milliseconds(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<Option<Vec<f64>>> {
+        let Some(timer) = &self.timer else {
+            return Ok(None);
+        };
+        if !self.encoded_work {
+            return Err("no cloud work was submitted for timing".into());
+        }
+        let bytes = read_buffers(
+            device,
+            queue,
+            &[(&timer.resolved, u64::from(self.encoded_chunks) * 16)],
+        )?;
+        let ticks: &[u64] = bytemuck::cast_slice(&bytes[0]);
+        let period = f64::from(queue.get_timestamp_period()) * 1e-6;
+        ticks
+            .chunks_exact(2)
+            .map(|pair| {
+                pair[1]
+                    .checked_sub(pair[0])
+                    .map(|elapsed| elapsed as f64 * period)
+                    .ok_or_else(|| "cloud GPU timestamp ordering is invalid".into())
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Some)
     }
 
     /// Checks the fatal flags before converting statistics into a reference.
@@ -964,6 +1069,28 @@ fn batch_capacity(config: &RenderConfig, limits: &wgpu::Limits) -> Result<u32> {
     }
     Ok(requested)
 }
+fn preview_batch_capacity(config: &RenderConfig) -> Result<u32> {
+    let requested = config.sample_batch_size.max(1);
+    if requested > MAX_PREVIEW_BATCH {
+        return Err(format!(
+            "preview sample batch must be in1..={MAX_PREVIEW_BATCH}; zero selects1"
+        )
+        .into());
+    }
+    Ok(requested.min(config.spp))
+}
+fn validate_work_group(chunks: u32, preview: bool) -> Result<()> {
+    if chunks == 0 || chunks > MAX_WORK_GROUP_CHUNKS {
+        return Err(format!(
+            "cloud work group must contain1..={MAX_WORK_GROUP_CHUNKS} bounded chunks"
+        )
+        .into());
+    }
+    if !preview && chunks != 1 {
+        return Err("multi-chunk work groups require full-frame preview scheduling".into());
+    }
+    Ok(())
+}
 fn tile_pixels(total: u32, start: u32, samples: u32, pool: u32) -> u32 {
     (total - start).min(pool / samples)
 }
@@ -981,7 +1108,7 @@ fn advance_preview_slice(active: &mut WorkBatch, total_pixels: u32, pool: u32) {
     if active.tile_start == total_pixels {
         active.tile_start = 0;
     }
-    active.tile_pixels = (total_pixels - active.tile_start).min(pool);
+    active.tile_pixels = (total_pixels - active.tile_start).min(pool / active.count);
     // The full-image path state persists across slices and sweeps.
     debug_assert!(active.initialized);
 }
@@ -1621,6 +1748,78 @@ mod tests {
             rows.iter().all(|&n| n > 0),
             "the first chunk must span every image row"
         );
+    }
+    #[test]
+    fn preview_cohorts_keep_every_sample_unique_and_bounded() {
+        let mut config = RenderConfig::default();
+        assert_eq!(preview_batch_capacity(&config).unwrap(), 1);
+        config.sample_batch_size = 4;
+        assert_eq!(preview_batch_capacity(&config).unwrap(), 4);
+        config.spp = 3;
+        assert_eq!(preview_batch_capacity(&config).unwrap(), 3);
+        config.sample_batch_size = 5;
+        assert!(preview_batch_capacity(&config).is_err());
+        for count in 1..=4 {
+            let pixels = 128 * 72;
+            let stride = preview_pixel_stride(pixels);
+            let mut active = WorkBatch {
+                count,
+                tile_start: 0,
+                tile_pixels: tile_pixels(pixels, 0, count, MAX_WORK_PATHS),
+                initialized: true,
+            };
+            let mut seen = vec![false; (pixels * count) as usize];
+            loop {
+                assert!(active.tile_pixels * count <= MAX_WORK_PATHS);
+                for local in 0..active.tile_pixels * count {
+                    let pixel_slot = active.tile_start + local % active.tile_pixels;
+                    let z = local / active.tile_pixels;
+                    let pixel = pixel_slot * stride % pixels;
+                    let canonical = (pixel * count + z) as usize;
+                    assert!(!seen[canonical]);
+                    seen[canonical] = true;
+                    let state = pixel_slot * count + z;
+                    assert!(state < pixels * count);
+                }
+                advance_preview_slice(&mut active, pixels, MAX_WORK_PATHS);
+                if active.tile_start == 0 {
+                    break;
+                }
+            }
+            assert!(seen.iter().all(|&v| v));
+        }
+    }
+    #[test]
+    fn work_groups_advance_each_snapshot_without_crossing_a_batch() {
+        assert!(validate_work_group(0, true).is_err());
+        assert!(validate_work_group(9, true).is_err());
+        assert!(validate_work_group(2, false).is_err());
+        assert!(validate_work_group(1, false).is_ok());
+        for chunks in [1, 4, 8] {
+            assert!(validate_work_group(chunks, true).is_ok());
+            let mut active = WorkBatch {
+                count: 4,
+                tile_start: 0,
+                tile_pixels: 1024,
+                initialized: true,
+            };
+            let mut cursors = Vec::new();
+            for i in 0..chunks {
+                cursors.push(active.tile_start);
+                assert_eq!(active.count, 4);
+                assert!(active.initialized);
+                if i + 1 < chunks {
+                    advance_preview_slice(&mut active, 2305, MAX_WORK_PATHS);
+                }
+            }
+            assert_eq!(
+                &cursors,
+                &[0, 1024, 2048, 0, 1024, 2048, 0, 1024][..chunks as usize]
+            );
+            // Host completion advances only once after the last encoded slice.
+            advance_preview_slice(&mut active, 2305, MAX_WORK_PATHS);
+            assert_eq!(active.tile_start, [0, 1024, 2048][(chunks % 3) as usize]);
+        }
     }
     #[test]
     fn gpu_precision_guards_are_checked_on_cpu() {

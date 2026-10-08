@@ -1,4 +1,6 @@
 //! Explicit GPU viewer with bounded work, asynchronous readbacks and idle time.
+#[path = "work_metrics.rs"]
+mod work_metrics;
 use crate::controller::{Controller, MoveKey, same_pose, sun_angles, sun_direction};
 use crate::output::{self, Record};
 use crate::sky_bridge::{COMPOSITE_SHADER, SkyBackground};
@@ -33,9 +35,9 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowId},
 };
+use work_metrics::{Performance, WorkScheduler, decode_gpu_times};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(1);
-const MIN_WORK_REST: Duration = Duration::from_millis(1);
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -44,6 +46,8 @@ pub struct ViewOptions {
     pub exit_after: Option<Duration>,
     pub smoke_frames: Option<u64>,
     pub capture_preview: Option<PathBuf>,
+    pub gpu_budget_percent: Option<u32>,
+    pub work_group_size: Option<u32>,
 }
 impl ViewOptions {
     fn diagnostic(&self) -> bool {
@@ -63,9 +67,19 @@ pub fn run(
     camera.basis()?;
     settings.validate()?;
     config.validate()?;
-    // Interactive accumulation keeps one persistent path per film pixel. The
-    // offline renderer retains its independently configured logical batching.
-    config.sample_batch_size = 1;
+    // Interactive cohorts occupy the entire frame. Explicit 1..4 sizes are
+    // respected; automatic selects four independent samples per pixel.
+    if config.sample_batch_size == 0 {
+        config.sample_batch_size = 4;
+    }
+    if config.sample_batch_size > 4 {
+        return Err("preview sample batch size must be 1..=4 (0 selects 4)".into());
+    }
+    let gpu_budget_percent = options.gpu_budget_percent.unwrap_or(80);
+    let work_group_size = options.work_group_size.unwrap_or(4);
+    if !(10..=100).contains(&gpu_budget_percent) || !(1..=8).contains(&work_group_size) {
+        return Err("GPU budget must be 10..=100 percent and work group size 1..=8".into());
+    }
     if !exposure_ev.is_finite() {
         return Err("display exposure must be finite".into());
     }
@@ -107,6 +121,9 @@ pub fn run(
         control_pressed: false,
         controller: Controller::default(),
         sky_enabled: true,
+        gpu_budget_percent,
+        work_group_size,
+        metrics_emitted: false,
         last_motion: Instant::now(),
         next_motion: Instant::now(),
         cursor: None,
@@ -123,10 +140,13 @@ pub fn run(
         Ok(result) => result?,
         Err(payload) => {
             let error = panic_message(payload);
+            app.fatal = Some(error.clone());
+            app.emit_metrics();
             let log = write_error_log(&error, &app.record);
             return Err(format!("cloud viewer failed: {error}; log: {}", log.display()).into());
         }
     }
+    app.emit_metrics();
     if let Some(job) = app.save_job.take() {
         let _ = job.thread.join();
     }
@@ -293,6 +313,8 @@ enum Pending {
     Work {
         readback: AsyncReadback,
         started: Instant,
+        timed: bool,
+        chunks: u32,
     },
     Display {
         receiver: Receiver<()>,
@@ -379,6 +401,8 @@ struct View {
     batch_active: bool,
     progress: Option<WorkProgress>,
     last_work_ms: f64,
+    performance: Performance,
+    scheduler: WorkScheduler,
     frames: u64,
     chunks: u64,
     adapter_name: String,
@@ -592,6 +616,7 @@ impl View {
             ],
         });
         let now = Instant::now();
+        let performance = Performance::new(renderer.work_timing_buffer().is_some());
         let (sender, receiver) = mpsc::channel();
         queue.on_submitted_work_done(move || {
             let _ = sender.send(());
@@ -629,6 +654,8 @@ impl View {
             batch_active: false,
             progress: None,
             last_work_ms: 0.0,
+            performance,
+            scheduler: WorkScheduler::default(),
             frames: 0,
             chunks: 0,
             adapter_name,
@@ -645,7 +672,7 @@ impl View {
             self.occluded = false;
         }
     }
-    fn check_completion(&mut self, now: Instant) -> Result<Option<Completion>> {
+    fn check_completion(&mut self, now: Instant, budget: u32) -> Result<Option<Completion>> {
         if now >= self.next_poll {
             self.device
                 .poll(wgpu::PollType::Poll)
@@ -698,11 +725,43 @@ impl View {
                     path,
                 }))
             }
-            Pending::Work { started, .. } => {
-                let p = self.renderer.complete_work(&bytes)?;
-                let elapsed = now.duration_since(started);
+            Pending::Work {
+                started,
+                timed,
+                chunks,
+                ..
+            } => {
+                let expected = WORK_PROGRESS_BYTES as usize
+                    + if timed { (chunks as usize + 1) * 16 } else { 0 };
+                if bytes.len() != expected {
+                    return Err("cloud work/timestamp readback length mismatch".into());
+                }
+                let gpu = if timed {
+                    Some(decode_gpu_times(
+                        &bytes[WORK_PROGRESS_BYTES as usize..],
+                        self.queue.get_timestamp_period(),
+                        chunks,
+                    )?)
+                } else {
+                    None
+                };
+                let p = self
+                    .renderer
+                    .complete_work(&bytes[..WORK_PROGRESS_BYTES as usize])?;
+                let completed = Instant::now();
+                let elapsed = completed.duration_since(started);
                 self.last_work_ms = elapsed.as_secs_f64() * 1000.0;
-                self.next_work = now + work_rest(elapsed);
+                self.next_work = completed
+                    + self
+                        .performance
+                        .completed(completed, elapsed, gpu.as_ref(), chunks, budget);
+                if p.batch_finished {
+                    // A cohort's fast tail cannot predict the cost of the
+                    // next cohort's newly initialized camera paths.
+                    self.scheduler.reset();
+                } else {
+                    self.scheduler.completed(gpu.as_ref());
+                }
                 self.batch_active = !p.batch_finished;
                 if progress_updates_film(&p)
                     && self.progress.as_ref().is_none_or(|old| {
@@ -744,10 +803,13 @@ impl View {
             }
         }
     }
-    fn submit_work(&mut self) -> Result<()> {
+    fn submit_work(&mut self, group_size: u32) -> Result<()> {
         if self.pending.is_some() {
             return Err("cloud viewer attempted overlapping GPU work".into());
         }
+        let encoding_started = Instant::now();
+        let group_size = self.scheduler.next(group_size);
+        self.performance.settle_throttle(encoding_started);
         let count = self
             .renderer
             .sample_batch_capacity()
@@ -757,18 +819,43 @@ impl View {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("cloud bounded work"),
             });
-        self.renderer
-            .encode_work(&self.device, &self.queue, &mut encoder, count)?;
-        let mut readback = AsyncReadback::encode(
+        self.renderer.encode_work_group(
             &self.device,
+            &self.queue,
             &mut encoder,
-            &[(self.renderer.progress_buffer(), WORK_PROGRESS_BYTES as u64)],
+            count,
+            group_size,
         )?;
-        self.queue.submit([encoder.finish()]);
+        let chunks = self.renderer.work_group_size();
+        let mut sources = vec![(self.renderer.progress_buffer(), WORK_PROGRESS_BYTES as u64)];
+        let timed = if let Some(buffer) = self.renderer.work_timing_buffer() {
+            sources.push((buffer, 16));
+            let (buffer, size) = self
+                .renderer
+                .work_chunk_timing_buffer()
+                .ok_or("cloud group timing buffer is incomplete")?;
+            if size != u64::from(chunks) * 16 {
+                return Err("cloud per-chunk timestamp size mismatch".into());
+            }
+            sources.push((buffer, size));
+            true
+        } else {
+            false
+        };
+        let mut readback = AsyncReadback::encode(&self.device, &mut encoder, &sources)?;
+        let commands = encoder.finish();
+        let started = Instant::now();
+        self.performance.submitted(
+            started,
+            started.duration_since(encoding_started).as_secs_f64() * 1000.0,
+        );
+        self.queue.submit([commands]);
         readback.arm();
         self.pending = Some(Pending::Work {
             readback,
-            started: Instant::now(),
+            started,
+            timed,
+            chunks,
         });
         self.batch_active = true;
         Ok(())
@@ -987,11 +1074,6 @@ impl View {
         Ok(actions)
     }
 }
-fn work_rest(elapsed: Duration) -> Duration {
-    // Conservatively target at most 25% GPU duty using observed completion wall
-    // time (including callback polling), and always provide a real idle gap.
-    elapsed.saturating_mul(3).max(MIN_WORK_REST)
-}
 fn progress_updates_film(progress: &WorkProgress) -> bool {
     progress.batch_finished || progress.completed_paths > 0
 }
@@ -1015,6 +1097,9 @@ struct App {
     control_pressed: bool,
     controller: Controller,
     sky_enabled: bool,
+    gpu_budget_percent: u32,
+    work_group_size: u32,
+    metrics_emitted: bool,
     last_motion: Instant,
     next_motion: Instant,
     cursor: Option<PhysicalPosition<f64>>,
@@ -1028,6 +1113,44 @@ struct App {
     message: Option<String>,
 }
 impl App {
+    fn emit_metrics(&mut self) {
+        if self.metrics_emitted {
+            return;
+        }
+        self.metrics_emitted = true;
+        let now = Instant::now();
+        let Some(view) = &mut self.view else {
+            return;
+        };
+        view.performance.settle_throttle(now);
+        let mut metrics = view.performance.json(now);
+        let partial = view
+            .progress
+            .as_ref()
+            .filter(|p| !p.batch_finished)
+            .map_or(0, |p| p.completed_paths);
+        let pixels = u64::from(self.config.width) * u64::from(self.config.height);
+        let fields = serde_json::json!({
+            "schema_version":1,"valid":self.fatal.is_none(),"error":self.fatal,
+            "viewer_elapsed_ms":now.duration_since(self.started).as_secs_f64()*1000.0,
+            "presents":view.frames,"completed_work_groups":view.chunks,
+            "film_width":self.config.width,"film_height":self.config.height,"target_spp":self.config.spp,
+            "completed_spp":view.renderer.sample_count(),
+            "current_batch_completed_paths":partial,
+            "current_batch_total_paths":view.progress.as_ref().filter(|p|!p.batch_finished).map_or(0,|p|p.total_paths),
+            "current_batch_finished":view.progress.as_ref().is_some_and(|p|p.batch_finished),
+            "complete_sample_paths":u64::from(view.renderer.sample_count())*pixels+u64::from(partial),
+            "budget_percent":self.gpu_budget_percent,"group_dispatches_requested":self.work_group_size,
+            "group_dispatches_maximum":self.work_group_size,
+            "sample_cohort_capacity":view.renderer.sample_batch_capacity(),
+            "gpu_submission_in_flight":view.pending.is_some(),"scene_reset_pending":self.reset_pending,
+        });
+        metrics
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        println!("CLOUD_VIEW_METRICS {metrics}");
+    }
     fn stop(&mut self, error: impl ToString) {
         let error = error.to_string();
         let path = write_error_log(&error, &self.record);
@@ -1036,6 +1159,7 @@ impl App {
             path.display()
         );
         self.fatal = Some(format!("{error}; log: {}", path.display()));
+        self.emit_metrics();
         self.paused = true;
         self.save_requested = false;
         // Release a lost/invalid device; never reset or submit to it again.
@@ -1077,7 +1201,7 @@ impl App {
             .as_ref()
             .map(|p| {
                 format!(
-                    " | current pass pixels completed {} / {}",
+                    " | current batch paths completed {} / {}",
                     p.completed_paths, p.total_paths
                 )
             })
@@ -1153,6 +1277,8 @@ impl App {
             exposure: self.exposure_ev,
             speed: self.controller.speed,
             sky_enabled: self.sky_enabled,
+            gpu_budget_percent: self.gpu_budget_percent,
+            work_group_size: self.work_group_size,
             local_ground: self.initial_settings.ground.unwrap_or(GroundPlane {
                 height: -1000.0,
                 albedo: glam::DVec3::splat(0.2),
@@ -1167,12 +1293,31 @@ impl App {
             completed_paths: p.map_or(0, |p| p.completed_paths),
             total_paths: p.map_or(0, |p| p.total_paths),
             message: self.message.clone(),
+            gpu_ms: if view.performance.timestamps_supported {
+                Some(view.performance.gpu_chunk_ms)
+            } else {
+                None
+            },
+            gpu_duty_percent: view.performance.duty_percent(Instant::now()),
+            gpu_chunk_max_ms: if view.performance.timestamps_supported {
+                Some(view.performance.gpu_chunk_max_ms)
+            } else {
+                None
+            },
+            work_groups: view.performance.groups,
+            actual_group_size: view.scheduler.actual(),
         };
         let actions = view.redraw(&mut model, &progress, self.reset_pending)?;
         self.record.environment = view.sky.metadata();
         self.paused = model.paused;
         self.exposure_ev = model.exposure;
         self.controller.speed = model.speed;
+        if model.gpu_budget_percent != self.gpu_budget_percent {
+            self.gpu_budget_percent = model.gpu_budget_percent;
+            view.performance.settle_throttle(Instant::now());
+            view.next_work = Instant::now();
+        }
+        self.work_group_size = model.work_group_size;
         if actions.physical_changed || actions.target_changed {
             model.camera.basis()?;
             model.transport.validate()?;
@@ -1307,7 +1452,7 @@ impl App {
             }
         }
         let completion = if let Some(view) = &mut self.view {
-            view.check_completion(now)?
+            view.check_completion(now, self.gpu_budget_percent)?
         } else {
             None
         };
@@ -1389,7 +1534,9 @@ impl App {
                 view.progress = None;
                 view.sky_dirty = true;
                 view.needs_redraw = true;
-                view.next_work = now + MIN_WORK_REST;
+                view.performance.settle_throttle(now);
+                view.scheduler.reset();
+                view.next_work = now;
                 self.reset_pending = false;
                 self.record.camera = self.camera.clone();
                 self.record.transport = self.settings.clone();
@@ -1410,7 +1557,7 @@ impl App {
                 record.environment = view.sky.metadata();
                 view.snapshot(record, self.exposure_ev)?;
                 self.save_requested = false;
-            } else if view.needs_redraw && view.drawable() && now >= view.next_frame {
+            } else if view.needs_redraw && view.drawable() && Instant::now() >= view.next_frame {
                 if !view.redraw_requested {
                     view.window.request_redraw();
                     view.redraw_requested = true;
@@ -1420,9 +1567,9 @@ impl App {
                 && !view.sky_dirty
                 && (!self.paused || self.save_requested)
                 && view.renderer.sample_count() < view.renderer.target_samples()
-                && now >= view.next_work
+                && Instant::now() >= view.next_work
             {
-                view.submit_work()?;
+                view.submit_work(self.work_group_size)?;
             }
         }
         self.title();
@@ -1874,22 +2021,6 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
     #[test]
-    fn idle_gap_is_positive_and_scales_with_observed_work() {
-        assert_eq!(work_rest(Duration::ZERO), Duration::from_millis(1));
-        assert_eq!(
-            work_rest(Duration::from_millis(1)),
-            Duration::from_millis(3)
-        );
-        assert_eq!(
-            work_rest(Duration::from_millis(10)),
-            Duration::from_millis(30)
-        );
-        assert_eq!(
-            work_rest(Duration::from_millis(100)),
-            Duration::from_millis(300)
-        );
-    }
-    #[test]
     fn automatic_exit_is_explicit_diagnostic_mode() {
         assert!(!ViewOptions::default().diagnostic());
         assert!(
@@ -1897,6 +2028,8 @@ mod tests {
                 exit_after: Some(Duration::from_secs(1)),
                 smoke_frames: None,
                 capture_preview: None,
+                gpu_budget_percent: None,
+                work_group_size: None,
             }
             .diagnostic()
         );
@@ -1905,6 +2038,8 @@ mod tests {
                 exit_after: None,
                 smoke_frames: Some(2),
                 capture_preview: None,
+                gpu_budget_percent: None,
+                work_group_size: None,
             }
             .diagnostic()
         );
